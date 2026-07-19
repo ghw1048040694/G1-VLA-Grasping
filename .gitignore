@@ -1,4 +1,5 @@
 outputs/
+third_party/
 *.log
 __pycache__/
 *.pyc
