@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import imageio.v2 as imageio
@@ -94,6 +95,10 @@ def apply_regularized_dynamics(model: mujoco.MjModel) -> None:
         model.dof_armature[dof_id] = armature
 
 
+def object_name(model: mujoco.MjModel, object_type: mujoco.mjtObj, object_id: int) -> str:
+    return mujoco.mj_id2name(model, object_type, object_id) or f"unnamed_{object_id}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--asset", type=Path, required=True)
@@ -161,9 +166,21 @@ def main() -> None:
     hold_errors = {name: [] for name in joint_ids}
     contact_counts = []
     saturated_actuators = 0
+    actuator_saturation_counts = defaultdict(int)
     actuator_samples = 0
     joint_limit_violations = 0
+    joint_limit_violation_counts = defaultdict(int)
     joint_samples = 0
+    samples_per_joint = 0
+    contact_pair_stats = defaultdict(
+        lambda: {
+            "contact_samples": 0,
+            "active_steps": set(),
+            "normal_force_sum_n": 0.0,
+            "maximum_normal_force_n": 0.0,
+            "maximum_penetration_m": 0.0,
+        }
+    )
     final_frame = None
 
     for step in range(total_steps):
@@ -197,17 +214,46 @@ def main() -> None:
             data.qvel[:6] = 0.0
         mujoco.mj_forward(model, data)
         contact_counts.append(int(data.ncon))
+        for contact_index in range(data.ncon):
+            contact = data.contact[contact_index]
+            geom1_id = int(contact.geom1)
+            geom2_id = int(contact.geom2)
+            geom1_name = object_name(model, mujoco.mjtObj.mjOBJ_GEOM, geom1_id)
+            geom2_name = object_name(model, mujoco.mjtObj.mjOBJ_GEOM, geom2_id)
+            body1_name = object_name(
+                model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[geom1_id])
+            )
+            body2_name = object_name(
+                model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[geom2_id])
+            )
+            pair = tuple(sorted(((geom1_name, body1_name), (geom2_name, body2_name))))
+            contact_force = np.zeros(6, dtype=np.float64)
+            mujoco.mj_contactForce(model, data, contact_index, contact_force)
+            normal_force = abs(float(contact_force[0]))
+            stats = contact_pair_stats[pair]
+            stats["contact_samples"] += 1
+            stats["active_steps"].add(step)
+            stats["normal_force_sum_n"] += normal_force
+            stats["maximum_normal_force_n"] = max(
+                stats["maximum_normal_force_n"], normal_force
+            )
+            stats["maximum_penetration_m"] = max(
+                stats["maximum_penetration_m"], max(0.0, -float(contact.dist))
+            )
         for name, actuator_id in actuator_ids.items():
             joint_id = joint_ids[name]
             force_limit = max(abs(float(value)) for value in model.jnt_actfrcrange[joint_id])
             if force_limit > 0 and abs(float(data.actuator_force[actuator_id])) >= 0.98 * force_limit:
                 saturated_actuators += 1
+                actuator_saturation_counts[name] += 1
             actuator_samples += 1
             low, high = model.jnt_range[joint_id]
             position = float(data.qpos[qpos_ids[name]])
             if position < low - 1e-6 or position > high + 1e-6:
                 joint_limit_violations += 1
+                joint_limit_violation_counts[name] += 1
             joint_samples += 1
+        samples_per_joint += 1
 
         if 4.5 <= time_s < 5.0:
             for name, target in targets.items():
@@ -253,6 +299,27 @@ def main() -> None:
     joint_hold_rmse = {
         name: float(np.sqrt(np.mean(np.square(errors)))) for name, errors in hold_errors.items()
     }
+    ranked_contact_pairs = []
+    for pair, stats in contact_pair_stats.items():
+        ranked_contact_pairs.append(
+            {
+                "geom1": pair[0][0],
+                "body1": pair[0][1],
+                "geom2": pair[1][0],
+                "body2": pair[1][1],
+                "contact_samples": stats["contact_samples"],
+                "active_step_fraction": len(stats["active_steps"]) / total_steps,
+                "mean_normal_force_n": (
+                    stats["normal_force_sum_n"] / stats["contact_samples"]
+                ),
+                "maximum_normal_force_n": stats["maximum_normal_force_n"],
+                "maximum_penetration_m": stats["maximum_penetration_m"],
+            }
+        )
+    ranked_contact_pairs.sort(
+        key=lambda item: (item["active_step_fraction"], item["maximum_normal_force_n"]),
+        reverse=True,
+    )
     report = {
         "experiment": args.experiment_name,
         "asset": str(args.asset.resolve()),
@@ -285,7 +352,15 @@ def main() -> None:
         "mean_contact_count": float(np.mean(contact_counts)),
         "maximum_contact_count": max(contact_counts),
         "actuator_saturation_fraction": saturated_actuators / actuator_samples,
+        "actuator_saturation_fraction_by_joint": {
+            name: actuator_saturation_counts[name] / samples_per_joint for name in joint_ids
+        },
         "joint_limit_violation_fraction": joint_limit_violations / joint_samples,
+        "joint_limit_violation_fraction_by_joint": {
+            name: joint_limit_violation_counts[name] / samples_per_joint for name in joint_ids
+        },
+        "contact_pair_count": len(ranked_contact_pairs),
+        "contact_pairs_ranked": ranked_contact_pairs,
         "video": str(video_path),
         "final_pose": str(final_image_path),
         "trajectory_metrics": str(trajectory_path),

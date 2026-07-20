@@ -289,3 +289,20 @@ joint-limit violations, and one video per stage.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_08.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-08.log
 ```
+
+G1WH-08 shows that gravity raises body RMSE from 0.00016 to 0.01276 rad while
+remaining below the 0.10 rad stage threshold. Enabling contacts leaves body
+RMSE nearly unchanged at 0.01282 rad but raises hand RMSE from 0.00811 to
+0.07597 rad, a 9.37x ratio. The controller never saturates, so contact
+interaction rather than insufficient actuator limits is the next target.
+
+## G1WH-09 Contact-Pair Attribution
+
+G1WH-09 repeats the gravity-and-contact stage without changing the controller
+or target motion. It ranks individual geometry contact pairs by active time,
+normal force, and penetration, and reports joint-limit violations per joint.
+This identifies which hand collision geometry should be corrected next.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_09.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-09.log
+```
