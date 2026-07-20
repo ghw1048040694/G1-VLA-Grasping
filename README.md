@@ -219,3 +219,20 @@ hold RMSE, so the larger body-joint group cannot hide poor finger control.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_04.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-04.log
 ```
+
+G1WH-04 selected the original gain set. Its combined body/hand RMSE is 0.402
+rad. More damping worsened it by 25.4%, more stiffness worsened it by 6.0%, and
+the balanced candidate worsened it by 28.3%. A single shared body gain pair and
+single shared hand gain pair cannot explain or fix the joint-specific errors.
+
+## G1WH-05 Isolated Joint Response
+
+G1WH-05 resets the same model and commands one actuator at a time while all
+other joints hold their initial positions. For every one of the 43 joints it
+measures direction, rise time, steady-state error, overshoot, and motion leaked
+into other joints. This separates individual actuator behavior from
+simultaneous multi-joint coupling.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_05.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-05.log
+```
