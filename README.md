@@ -183,3 +183,21 @@ The report checks both camera registration and nonblank pixels.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_02.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-02.log
 ```
+
+G1WH-02 passed all camera checks. The head and both wrist cameras render at
+640x480, all images are nonblank, and the blue calibration tote is visible in
+every view. The wrist cameras are mounted above the hands so the target remains
+visible rather than being occluded by the palm geometry.
+
+## G1WH-03 Bimanual Actuation Smoke Test
+
+G1WH-03 commands all 29 body joints and 14 hand joints through their named
+MuJoCo actuators. The legs hold their initial angles while the waist, arms, and
+hands follow a visible motion. A simple proportional-derivative controller
+tracks safe targets while gravity, contact, and floating-base motion are
+disabled for this interface-only test. It writes an MP4, final pose, trajectory
+metrics, and per-joint hold errors.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_03.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-03.log
+```
