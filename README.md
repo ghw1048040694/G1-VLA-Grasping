@@ -167,3 +167,19 @@ by MuJoCo.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_01.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-01.log
 ```
+
+G1WH-01 passed six of seven interface checks. The 29 body joints, 14 hand
+joints, 43 unique actuators, complete action mapping, and hand collision
+geometry are present. The source asset has no task camera, so it is not yet a
+valid visual-manipulation environment.
+
+## G1WH-02 Three-Camera Interface
+
+G1WH-02 creates a derived asset without modifying the third-party Unitree
+source. It adds one head camera and two wrist cameras, places a calibration
+tote and colored markers in front of the robot, and renders all three views.
+The report checks both camera registration and nonblank pixels.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_02.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-02.log
+```
