@@ -43,6 +43,9 @@ def main() -> None:
     parser.add_argument("--gravity-compensation", action="store_true")
     parser.add_argument("--kp-scale", type=float, default=1.0)
     parser.add_argument("--kd-scale", type=float, default=1.0)
+    parser.add_argument("--initial-pose-report", type=Path)
+    parser.add_argument("--record-demonstration", action="store_true")
+    parser.add_argument("--pregrasp-clearance-m", type=float, default=PREGRASP_CLEARANCE_M)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -83,6 +86,11 @@ def main() -> None:
                 "qpos_id": int(model.jnt_qposadr[joint_id]),
                 "qvel_id": int(model.jnt_dofadr[joint_id]),
             }
+    if args.initial_pose_report:
+        initial_pose = json.loads(args.initial_pose_report.read_text())["joint_positions_rad"]
+        for name, value in initial_pose.items():
+            if name in controlled:
+                data.qpos[controlled[name]["qpos_id"]] = float(value)
     initial_targets = {
         name: float(data.qpos[item["qpos_id"]]) for name, item in controlled.items()
     }
@@ -100,8 +108,8 @@ def main() -> None:
     mujoco.mj_forward(model, data)
     initial_tote_qpos = data.qpos[tote_qpos_adr : tote_qpos_adr + 7].copy()
     target_positions = np.stack([data.site_xpos[site_id].copy() for site_id in tote_site_ids])
-    target_positions[0, 1] += PREGRASP_CLEARANCE_M
-    target_positions[1, 1] -= PREGRASP_CLEARANCE_M
+    target_positions[0, 1] += args.pregrasp_clearance_m
+    target_positions[1, 1] -= args.pregrasp_clearance_m
 
     renderer = mujoco.Renderer(model, height=480, width=640)
     camera = mujoco.MjvCamera()
@@ -111,6 +119,21 @@ def main() -> None:
     camera.elevation = -10
     video_path = args.output_dir / "pregrasp_trajectory.mp4"
     writer = imageio.get_writer(video_path, fps=args.video_fps, codec="libx264", quality=8)
+    task_camera_names = ("head_camera", "left_wrist_camera", "right_wrist_camera")
+    task_camera_writers = {}
+    if args.record_demonstration:
+        for camera_name in task_camera_names:
+            task_camera_writers[camera_name] = imageio.get_writer(
+                args.output_dir / f"{camera_name}.mp4",
+                fps=args.video_fps,
+                codec="libx264",
+                quality=8,
+            )
+    demonstration_times = []
+    demonstration_qpos = []
+    demonstration_qvel = []
+    demonstration_actions = []
+    controlled_names = tuple(controlled)
 
     dt = float(model.opt.timestep)
     total_steps = int(args.duration / dt)
@@ -124,6 +147,7 @@ def main() -> None:
     selected_minimum_margin = math.inf
     joint_limit_violations = 0
     joint_samples = 0
+    joint_limit_violation_counts = defaultdict(int)
 
     for step in range(total_steps):
         time_s = step * dt
@@ -155,7 +179,9 @@ def main() -> None:
             actuator_samples += 1
             low, high = model.jnt_range[joint_id]
             position = float(data.qpos[item["qpos_id"]])
-            joint_limit_violations += int(position < low - 1e-6 or position > high + 1e-6)
+            violated = position < low - 1e-6 or position > high + 1e-6
+            joint_limit_violations += int(violated)
+            joint_limit_violation_counts[name] += int(violated)
             joint_samples += 1
             if name in selected_targets:
                 selected_minimum_margin = min(
@@ -203,8 +229,24 @@ def main() -> None:
         if step % render_interval == 0:
             renderer.update_scene(data, camera=camera)
             writer.append_data(renderer.render())
+            if args.record_demonstration:
+                demonstration_times.append(time_s)
+                demonstration_qpos.append(
+                    [float(data.qpos[controlled[name]["qpos_id"]]) for name in controlled_names]
+                )
+                demonstration_qvel.append(
+                    [float(data.qvel[controlled[name]["qvel_id"]]) for name in controlled_names]
+                )
+                demonstration_actions.append(
+                    [float(commanded_targets[name]) for name in controlled_names]
+                )
+                for camera_name, camera_writer in task_camera_writers.items():
+                    renderer.update_scene(data, camera=camera_name)
+                    camera_writer.append_data(renderer.render())
 
     writer.close()
+    for camera_writer in task_camera_writers.values():
+        camera_writer.close()
     renderer.close()
     mujoco.mj_forward(model, data)
     palm_positions = np.stack([data.site_xpos[site_id].copy() for site_id in palm_site_ids])
@@ -238,6 +280,7 @@ def main() -> None:
         "experiment": "G1WH-15-continuous-pregrasp-trajectory",
         "shoulder_lead_seconds": args.shoulder_lead_seconds,
         "selected_tote_x_m": selected_x,
+        "pregrasp_clearance_m": args.pregrasp_clearance_m,
         "gravity_compensation_enabled": args.gravity_compensation,
         "kp_scale": args.kp_scale,
         "kd_scale": args.kd_scale,
@@ -246,6 +289,13 @@ def main() -> None:
         "selected_joint_hold_rmse_rad": selected_rmse,
         "minimum_selected_joint_margin_rad": selected_minimum_margin,
         "joint_limit_violation_fraction": joint_limit_violations / joint_samples,
+        "joint_limit_violation_counts": {
+            name: count
+            for name, count in sorted(
+                joint_limit_violation_counts.items(), key=lambda item: item[1], reverse=True
+            )
+            if count
+        },
         "actuator_saturation_fraction": saturated_samples / actuator_samples,
         "unexpected_contact_pair_count": len(contacts),
         "unexpected_contacts": contacts,
@@ -266,6 +316,29 @@ def main() -> None:
         and tote_orientation_change < 0.02
         and tote_final_speed < 0.01
     )
+    if args.record_demonstration:
+        dataset_path = args.output_dir / "expert_episode.npz"
+        np.savez_compressed(
+            dataset_path,
+            timestamp_s=np.asarray(demonstration_times, dtype=np.float32),
+            joint_names=np.asarray(controlled_names),
+            observation_joint_position_rad=np.asarray(demonstration_qpos, dtype=np.float32),
+            observation_joint_velocity_rad_s=np.asarray(demonstration_qvel, dtype=np.float32),
+            action_joint_position_rad=np.asarray(demonstration_actions, dtype=np.float32),
+        )
+        metadata = {
+            "task": "bimanual_tote_pregrasp",
+            "language_instruction": "move both hands to the tote pre-grasp pose",
+            "episode_success": report["passed"],
+            "frames": len(demonstration_times),
+            "fps": args.video_fps,
+            "joint_count": len(controlled_names),
+            "task_cameras": list(task_camera_names),
+            "dataset": str(dataset_path),
+        }
+        (args.output_dir / "episode_metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
     report_path = args.output_dir / "pregrasp_trajectory_audit.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))

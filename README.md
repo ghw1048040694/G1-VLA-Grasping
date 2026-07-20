@@ -470,3 +470,19 @@ holding the IK target and simultaneous one-second trajectory fixed.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_19.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-19.log
 ```
+
+G1WH-19 shows that gravity compensation fixes most terminal tracking error but
+does not make the old trajectory safe. The corrected controller still starts
+from a reset configuration whose open fingers intersect the tote, producing
+5.18% joint-limit violations, eight contact pairs, and 53.25 mm tote drift.
+
+## G1WH-20 Safe Reset Expert Demonstration
+
+G1WH-20 replaces the invalid reset with a collision-free IK home pose, solves a
+14 cm clearance pre-grasp target, executes it with the selected controller, and
+records joint observations, joint-target actions, a language instruction, and
+head/left-wrist/right-wrist camera videos as the first expert episode.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_20.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-20.log
+```
