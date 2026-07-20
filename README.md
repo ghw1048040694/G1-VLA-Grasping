@@ -201,3 +201,21 @@ metrics, and per-joint hold errors.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_03.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-03.log
 ```
+
+G1WH-03 completed and confirmed that all 43 commands are within joint limits
+and reach their named actuators. Tracking quality is not yet acceptable: body
+hold RMSE is 0.322 rad and hand hold RMSE is 0.482 rad. Fourteen joints are
+below 0.10 rad, nine are between 0.10 and 0.25 rad, and twenty exceed 0.25 rad.
+The largest errors concentrate in wrist roll/yaw, shoulder yaw, ankle roll, and
+distal finger joints.
+
+## G1WH-04 PD Gain Sweep
+
+G1WH-04 repeats exactly the same motion with four proportional-derivative gain
+sets. Asset, targets, timing, disabled gravity/contact, and fixed-base handling
+remain unchanged. It selects the lowest equally weighted mean of body and hand
+hold RMSE, so the larger body-joint group cannot hide poor finger control.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_04.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-04.log
+```

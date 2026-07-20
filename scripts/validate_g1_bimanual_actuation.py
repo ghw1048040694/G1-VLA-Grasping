@@ -75,6 +75,10 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=6.0)
     parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--body-kp", type=float, default=80.0)
+    parser.add_argument("--body-kd", type=float, default=4.0)
+    parser.add_argument("--hand-kp", type=float, default=8.0)
+    parser.add_argument("--hand-kd", type=float, default=0.30)
     args = parser.parse_args()
 
     model = mujoco.MjModel.from_xml_path(str(args.asset.resolve()))
@@ -137,7 +141,11 @@ def main() -> None:
             qpos = data.qpos[qpos_ids[name]]
             qvel = data.qvel[qvel_ids[name]]
             is_hand = name in HAND_TARGETS
-            kp, kd = (8.0, 0.30) if is_hand else (80.0, 4.0)
+            kp, kd = (
+                (args.hand_kp, args.hand_kd)
+                if is_hand
+                else (args.body_kp, args.body_kd)
+            )
             data.ctrl[actuator_ids[name]] = kp * (target - qpos) - kd * qvel
 
         mujoco.mj_step(model, data)
@@ -197,6 +205,12 @@ def main() -> None:
         "all_targets_within_joint_limits": all(target_ranges_valid.values()),
         "gravity_disabled": True,
         "contacts_disabled": True,
+        "controller": {
+            "body_kp": args.body_kp,
+            "body_kd": args.body_kd,
+            "hand_kp": args.hand_kp,
+            "hand_kd": args.hand_kd,
+        },
         "body_hold_rmse_rad": float(np.sqrt(np.mean(np.square(body_errors)))),
         "hand_hold_rmse_rad": float(np.sqrt(np.mean(np.square(hand_errors)))),
         "joint_hold_rmse_rad": joint_hold_rmse,
