@@ -389,3 +389,19 @@ position is selected for the manipulation scene.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_14.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-14.log
 ```
+
+G1WH-14 passes at 0.45 and 0.55 m and selects 0.55 m as the farthest passing
+distance. At 0.55 m, maximum palm position/orientation error is 0.01493 m and
+0.195 rad with zero unexpected contact. At 0.65 m, errors rise to 0.0853 m and
+0.366 rad and both thumbs contact the tote, establishing the reach boundary.
+
+## G1WH-15 Continuous Pre-Grasp Trajectory
+
+G1WH-15 executes a 2x2 dynamic transfer audit at the two kinematically passing
+distances, 0.45 and 0.55 m, with either simultaneous motion or a 0.25 second
+shoulder lead. It checks final palm error, tracking, collisions, joint margin,
+saturation, and tote disturbance under gravity and torque PD control.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_15.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-15.log
+```
