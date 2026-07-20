@@ -323,3 +323,20 @@ contact exclusions.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_10.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-10.log
 ```
+
+G1WH-10 selects 80% as the largest collision-safe finger closure. Relative to
+100%, hand RMSE falls from 0.07597 to 0.00662 rad and the two sustained
+finger-to-finger contacts disappear. The remaining right-thumb-to-hip contact
+and 0.663% limit-violation rate are identical at every closure. Inspection
+shows eight finger joints start exactly on their zero-angle hard limit, so the
+limit issue is independent of closure amplitude.
+
+## G1WH-11 Hand-Open Limit Margin
+
+G1WH-11 fixes closure at the selected 80% and sweeps open-pose margins of 0,
+0.01, 0.03, and 0.05 rad inside the finger joint limits. It tests whether the
+reported violations are caused by starting exactly on a hard-limit boundary.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_11.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-11.log
+```

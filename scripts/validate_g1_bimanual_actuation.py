@@ -110,6 +110,7 @@ def main() -> None:
     parser.add_argument("--hand-kp", type=float, default=8.0)
     parser.add_argument("--hand-kd", type=float, default=0.30)
     parser.add_argument("--hand-target-scale", type=float, default=1.0)
+    parser.add_argument("--hand-open-margin", type=float, default=0.0)
     parser.add_argument("--gain-profile", choices=("custom", "unitree"), default="custom")
     parser.add_argument("--dynamics-profile", choices=("raw", "both"), default="raw")
     parser.add_argument("--enable-gravity", action="store_true")
@@ -119,6 +120,8 @@ def main() -> None:
     args = parser.parse_args()
     if not 0.0 <= args.hand_target_scale <= 1.0:
         raise ValueError("--hand-target-scale must be between 0 and 1")
+    if args.hand_open_margin < 0.0:
+        raise ValueError("--hand-open-margin must be non-negative")
 
     model = mujoco.MjModel.from_xml_path(str(args.asset.resolve()))
     if not args.enable_gravity:
@@ -146,14 +149,27 @@ def main() -> None:
     if any(actuator_id < 0 for actuator_id in actuator_ids.values()):
         raise RuntimeError("A commanded joint has no same-named actuator")
 
+    open_hand_targets = {
+        name: float(np.sign(target) * args.hand_open_margin)
+        for name, target in HAND_TARGETS.items()
+    }
     target_ranges_valid = {}
     scaled_hand_targets = {
         name: target * args.hand_target_scale for name, target in HAND_TARGETS.items()
     }
-    for name, target in (BODY_TARGETS | scaled_hand_targets).items():
+    for name, target in BODY_TARGETS.items():
         joint_id = joint_ids[name]
         low, high = model.jnt_range[joint_id]
         target_ranges_valid[name] = bool(low <= target <= high)
+    for name, target in scaled_hand_targets.items():
+        joint_id = joint_ids[name]
+        low, high = model.jnt_range[joint_id]
+        target_ranges_valid[name] = bool(
+            low <= open_hand_targets[name] <= high and low <= target <= high
+        )
+    for name, target in open_hand_targets.items():
+        data.qpos[qpos_ids[name]] = target
+    mujoco.mj_forward(model, data)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     renderer = mujoco.Renderer(model, height=480, width=640)
@@ -198,7 +214,11 @@ def main() -> None:
 
         targets = {
             **{name: value * body_scale for name, value in BODY_TARGETS.items()},
-            **{name: value * hand_scale for name, value in scaled_hand_targets.items()},
+            **{
+                name: open_hand_targets[name]
+                + hand_scale * (value - open_hand_targets[name])
+                for name, value in scaled_hand_targets.items()
+            },
         }
         for name, target in targets.items():
             qpos = data.qpos[qpos_ids[name]]
@@ -335,6 +355,7 @@ def main() -> None:
         "gain_profile": args.gain_profile,
         "dynamics_profile": args.dynamics_profile,
         "hand_target_scale": args.hand_target_scale,
+        "hand_open_margin_rad": args.hand_open_margin,
         "gravity_enabled": args.enable_gravity,
         "contacts_enabled": args.enable_contacts,
         "base_mode": args.base_mode,
