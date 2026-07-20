@@ -37,17 +37,45 @@ def gains_for_joint(name: str, profile: str) -> tuple[float, float]:
     return (80.0, 3.0) if weak_body else (300.0, 3.0)
 
 
+def apply_dynamics_profile(model: mujoco.MjModel, profile: str) -> dict[str, list[float]]:
+    settings = {
+        "body_damping_armature": [0.2, 0.01],
+        "wrist_damping_armature": [0.1, 0.005],
+        "hand_damping_armature": [0.02, 0.0005],
+    }
+    if profile == "raw":
+        return settings
+    for joint_id in range(model.njnt):
+        name = joint_name(model, joint_id)
+        if not name or name == "floating_base_joint":
+            continue
+        dof_id = int(model.jnt_dofadr[joint_id])
+        group = "hand" if "hand_" in name else "wrist" if "wrist_" in name else "body"
+        damping, armature = settings[f"{group}_damping_armature"]
+        if profile in ("damping", "both"):
+            model.dof_damping[dof_id] = damping
+        if profile in ("armature", "both"):
+            model.dof_armature[dof_id] = armature
+    return settings
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--asset", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=2.0)
     parser.add_argument("--gain-profile", choices=("uniform", "unitree"), default="uniform")
+    parser.add_argument(
+        "--dynamics-profile",
+        choices=("raw", "damping", "armature", "both"),
+        default="raw",
+    )
     args = parser.parse_args()
 
     model = mujoco.MjModel.from_xml_path(str(args.asset.resolve()))
     model.opt.gravity[:] = 0.0
     model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    dynamics_settings = apply_dynamics_profile(model, args.dynamics_profile)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     initial_qpos = data.qpos.copy()
@@ -151,11 +179,12 @@ def main() -> None:
     axis.invert_yaxis()
     axis.axvline(0.10, color="#202020", linestyle="--", linewidth=1)
     axis.set_xlabel("Steady-state RMSE (rad), lower is better")
-    experiment_name = (
-        "G1WH-05-isolated-joint-response"
-        if args.gain_profile == "uniform"
-        else "G1WH-06-unitree-gain-profile"
-    )
+    if args.dynamics_profile != "raw":
+        experiment_name = "G1WH-07-joint-dynamics-ablation"
+    elif args.gain_profile == "uniform":
+        experiment_name = "G1WH-05-isolated-joint-response"
+    else:
+        experiment_name = "G1WH-06-unitree-gain-profile"
     axis.set_title(experiment_name)
     figure.tight_layout()
     chart_path = args.output_dir / "joint_response_errors.png"
@@ -168,6 +197,8 @@ def main() -> None:
     report = {
         "experiment": experiment_name,
         "gain_profile": args.gain_profile,
+        "dynamics_profile": args.dynamics_profile,
+        "dynamics_settings": dynamics_settings,
         "controller": (
             {"body_kp": 80.0, "body_kd": 4.0, "hand_kp": 8.0, "hand_kd": 0.30}
             if args.gain_profile == "uniform"

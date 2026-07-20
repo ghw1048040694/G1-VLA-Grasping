@@ -254,3 +254,20 @@ profile against the failed uniform-gain baseline.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_06.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-06.log
 ```
+
+G1WH-06 improves body mean RMSE from 0.139 to 0.090 rad, but hand mean RMSE
+worsens from 0.637 to 0.826 rad. No joint passes because median leakage grows
+from 1.557 to 1.773 rad. Source-backed real-robot gains do not transfer to an
+MJCF whose 43 joints all have zero passive damping, zero reflected rotor
+inertia, and zero friction loss.
+
+## G1WH-07 Joint Dynamics Ablation
+
+G1WH-07 keeps the Unitree gains and isolated test fixed, then compares the raw
+model, passive damping only, reflected motor armature only, and both. The added
+values are diagnostic hypotheses rather than identified real-robot parameters;
+the experiment tests which missing dynamics term causes numerical instability.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_07.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-07.log
+```
