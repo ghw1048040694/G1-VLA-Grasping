@@ -1,15 +1,67 @@
-# G1 Upper-Body Control
+# G1 Warehouse Loco-Manipulation
 
-Independent project for high-dynamic Unitree G1 upper-body skills with active
-whole-body balance.
+An engineering project for language-conditioned warehouse tote handling with a
+Unitree G1 humanoid. The final system must identify a requested tote, approach
+the shelf, grasp it with both hands, maintain whole-body balance while carrying
+it, and place it in the requested destination bin.
 
-## System Boundary
+## Engineering Scenario
+
+The target deployment is a human-designed warehouse or flexible production
+cell where fixed robot arms cannot cover multiple shelves and stations. A work
+order such as `Move the blue tote from shelf B to outbound bin 2` supplies the
+language goal. Head and wrist cameras provide visual observations. The robot
+must execute the complete pick, carry, and place sequence without falling,
+dropping the tote, colliding with the shelf, or selecting the wrong destination.
+
+CR7 motion tracking is not the product task. Experiments G1UB-01 through
+G1UB-05 are Phase 0 infrastructure calibration: simulator reliability, GPU
+parallel scaling, PPO training, and whole-body tracking. After G1UB-05, the CR7
+route is frozen and retained only as reproducible engineering evidence.
+
+## Acceptance Targets
+
+These are project targets, not current results:
+
+- At least 80% closed-loop success over 100 in-distribution episodes.
+- At least 60% success with randomized tote pose, mass, friction, and lighting.
+- At most 5% robot falls and at most 10% object drops.
+- Final tote placement error at most 10 cm.
+- Language target-selection accuracy at least 90% across object/bin commands.
+- MuJoCo Sim2Sim success-rate loss no greater than 15 percentage points.
+
+## System Architecture
+
+- VLA: maps camera observations and a language work order to a skill or action
+  chunk at low frequency.
+- World model: predicts short-horizon robot/object state, contact, drop, and
+  fall risk for candidate action chunks.
+- Whole-body controller: tracks arm, waist, and locomotion targets while
+  maintaining balance at high frequency.
+- Genesis: source simulator for parallel policy training and data generation.
+- MuJoCo: independent target simulator for Sim2Sim evaluation.
+- LeRobot: dataset and VLA training interface, not the low-level torque-control
+  framework.
+
+## Delivery Stages
+
+1. Integrate the local G1 29-DoF body plus 14-DoF hand asset and validate joint,
+   contact, camera, and action mappings.
+2. Build a fixed-base bimanual reach, grasp, lift, and place task with scripted
+   inverse-kinematics demonstrations.
+3. Enable active whole-body balance and one-to-three-meter tote carrying.
+4. Fine-tune a VLA on multi-object, multi-bin language-conditioned episodes.
+5. Train a world model and use risk-aware model-predictive action selection.
+6. Run unchanged policy weights in MuJoCo and publish Sim2Sim metrics, videos,
+   failure taxonomy, and ablation results.
+
+## Software Boundary
 
 - Isaac Gym: source simulator for GPU-parallel reinforcement learning.
 - ASAP/HumanoidVerse: G1 motion tracking and PPO training framework.
 - MuJoCo: target simulator for Sim2Sim evaluation with unchanged policy weights.
-- World model: later predicts balance, contact, tracking failure, and fall risk.
-- VLA: later maps visual and language commands to high-level skills or action chunks.
+- World model: predicts balance, contact, object-drop, collision, and fall risk.
+- VLA: maps visual and language commands to high-level skills or action chunks.
 - LeRobot: optional VLA component only; it is not the low-level control framework.
 
 ## Layout
@@ -85,7 +137,8 @@ headroom while sustaining about 1321 steps per second. G1UB-05 keeps the 200
 PPO updates and all task settings from G1UB-02, changing only the environment
 count from 32 to 1024. This raises total samples from 153,600 to 4,915,200 and
 tests whether the earlier tracking failure was primarily caused by insufficient
-experience per policy update.
+experience per policy update. This is the final CR7 calibration experiment;
+subsequent experiments implement the warehouse task above.
 
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1ub_05.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1UB-05.log
