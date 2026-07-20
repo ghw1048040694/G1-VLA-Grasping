@@ -356,3 +356,19 @@ right-thumb-to-hip collision without changing the final target pose.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_12.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-12.log
 ```
+
+G1WH-12 selects a 0.25 second shoulder lead as the minimum collision-free
+timing. It removes the right-thumb-to-hip contact while preserving zero joint
+limit violations and body/hand RMSE of 0.01282/0.00662 rad. Longer delays add
+no safety or tracking benefit.
+
+## G1WH-13 Dynamic Tote Scene Contract
+
+G1WH-13 replaces the static blue calibration block with a hollow five-wall,
+2 kg dynamic tote. The tote has a free joint and left/right grasp sites. The
+experiment checks table settling, drift, penetration, final speed, and tote
+visibility from the head and both wrist cameras before manipulation begins.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_13.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-13.log
+```
