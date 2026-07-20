@@ -123,10 +123,17 @@ def main() -> None:
         for name, (_, qpos_id, _) in controlled_joints.items()
     }
     for name, (_, qpos_id, _) in controlled_joints.items():
-        if "hand_" in name and ("middle_" in name or "index_" in name):
-            direction = -1.0 if name.startswith("left_") else 1.0
-            data.qpos[qpos_id] = direction * HAND_OPEN_MARGIN_RAD
-            target_qpos[name] = direction * HAND_OPEN_MARGIN_RAD
+        if "hand_" not in name:
+            continue
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        low, high = model.jnt_range[joint_id]
+        if abs(float(low)) < 1e-9:
+            target_qpos[name] = HAND_OPEN_MARGIN_RAD
+        elif abs(float(high)) < 1e-9:
+            target_qpos[name] = -HAND_OPEN_MARGIN_RAD
+        else:
+            continue
+        data.qpos[qpos_id] = target_qpos[name]
     mujoco.mj_forward(model, data)
 
     initial_penetration = max(

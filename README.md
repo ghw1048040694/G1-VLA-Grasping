@@ -405,3 +405,20 @@ saturation, and tote disturbance under gravity and torque PD control.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_15.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-15.log
 ```
+
+G1WH-15 rejects all four dynamic transfers. Changing distance or shoulder
+timing does not remove 6-8% joint-limit violations or sustained hand contacts;
+the tote moves 3.64-6.94 cm despite near-zero actuator saturation. The static
+target remains collision-free when inspected directly, so the failure is
+introduced by gravity-loaded torque execution rather than the target itself.
+
+## G1WH-16 Pre-Grasp Hold Control Ablation
+
+G1WH-16 removes path effects by initializing directly at the 0.55 m IK pose.
+It compares no-gravity PD, gravity-loaded PD, and gravity-loaded PD with bias
+force feedforward. This isolates whether missing gravity compensation creates
+the dynamic pose drift, limit overshoot, and object contacts seen in G1WH-15.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_16.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-16.log
+```
