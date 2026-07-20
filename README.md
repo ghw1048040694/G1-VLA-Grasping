@@ -340,3 +340,19 @@ reported violations are caused by starting exactly on a hard-limit boundary.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_11.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-11.log
 ```
+
+G1WH-11 confirms that a 0.01 rad open-pose margin is sufficient to reduce
+joint-limit violations from 0.663% to zero. Larger margins do not materially
+change tracking error and do not remove the transient right-thumb-to-hip
+contact, so 0.01 rad is selected as the minimum effective margin.
+
+## G1WH-12 Shoulder-Lead Timing Sweep
+
+G1WH-12 fixes the selected 80% closure and 0.01 rad open margin, then lets the
+shoulders move 0, 0.25, 0.5, or 1.0 seconds before the elbows, wrists, waist,
+and lower body. It tests whether sequencing the arm motion removes the transient
+right-thumb-to-hip collision without changing the final target pose.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_12.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-12.log
+```

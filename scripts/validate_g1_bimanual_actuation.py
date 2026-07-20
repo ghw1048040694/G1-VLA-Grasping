@@ -111,6 +111,7 @@ def main() -> None:
     parser.add_argument("--hand-kd", type=float, default=0.30)
     parser.add_argument("--hand-target-scale", type=float, default=1.0)
     parser.add_argument("--hand-open-margin", type=float, default=0.0)
+    parser.add_argument("--shoulder-lead-seconds", type=float, default=0.0)
     parser.add_argument("--gain-profile", choices=("custom", "unitree"), default="custom")
     parser.add_argument("--dynamics-profile", choices=("raw", "both"), default="raw")
     parser.add_argument("--enable-gravity", action="store_true")
@@ -122,6 +123,8 @@ def main() -> None:
         raise ValueError("--hand-target-scale must be between 0 and 1")
     if args.hand_open_margin < 0.0:
         raise ValueError("--hand-open-margin must be non-negative")
+    if args.shoulder_lead_seconds < 0.0:
+        raise ValueError("--shoulder-lead-seconds must be non-negative")
 
     model = mujoco.MjModel.from_xml_path(str(args.asset.resolve()))
     if not args.enable_gravity:
@@ -201,19 +204,25 @@ def main() -> None:
             "normal_force_sum_n": 0.0,
             "maximum_normal_force_n": 0.0,
             "maximum_penetration_m": 0.0,
+            "first_contact_time_s": None,
+            "last_contact_time_s": None,
         }
     )
     final_frame = None
 
     for step in range(total_steps):
         time_s = step * dt
-        body_scale = smoothstep((time_s - 1.0) / 1.0)
+        shoulder_scale = smoothstep((time_s - 1.0) / 1.0)
+        body_scale = smoothstep((time_s - 1.0 - args.shoulder_lead_seconds) / 1.0)
         hand_scale = smoothstep((time_s - 3.0) / 1.0)
         if time_s > 5.0:
             hand_scale = 1.0 - smoothstep((time_s - 5.0) / 1.0)
 
         targets = {
-            **{name: value * body_scale for name, value in BODY_TARGETS.items()},
+            **{
+                name: value * (shoulder_scale if "shoulder_" in name else body_scale)
+                for name, value in BODY_TARGETS.items()
+            },
             **{
                 name: open_hand_targets[name]
                 + hand_scale * (value - open_hand_targets[name])
@@ -266,6 +275,9 @@ def main() -> None:
             stats["maximum_penetration_m"] = max(
                 stats["maximum_penetration_m"], max(0.0, -float(contact.dist))
             )
+            if stats["first_contact_time_s"] is None:
+                stats["first_contact_time_s"] = time_s
+            stats["last_contact_time_s"] = time_s
         for name, actuator_id in actuator_ids.items():
             joint_id = joint_ids[name]
             force_limit = max(abs(float(value)) for value in model.jnt_actfrcrange[joint_id])
@@ -340,6 +352,8 @@ def main() -> None:
                 ),
                 "maximum_normal_force_n": stats["maximum_normal_force_n"],
                 "maximum_penetration_m": stats["maximum_penetration_m"],
+                "first_contact_time_s": stats["first_contact_time_s"],
+                "last_contact_time_s": stats["last_contact_time_s"],
             }
         )
     ranked_contact_pairs.sort(
@@ -356,6 +370,7 @@ def main() -> None:
         "dynamics_profile": args.dynamics_profile,
         "hand_target_scale": args.hand_target_scale,
         "hand_open_margin_rad": args.hand_open_margin,
+        "shoulder_lead_seconds": args.shoulder_lead_seconds,
         "gravity_enabled": args.enable_gravity,
         "contacts_enabled": args.enable_contacts,
         "base_mode": args.base_mode,
