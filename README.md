@@ -65,3 +65,15 @@ CUDA/WSL state from a repeatable Genesis scaling limit.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1ub_03.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1UB-03.log
 ```
+
+## G1UB-04 Genesis Saturation Audit
+
+G1UB-03 passed 64 through 512 environments and scaled from about 100 to 707
+steps per second. G1UB-04 probes 768, 1024, and 1280 environments for 10 PPO
+iterations each. It records one-second GPU utilization, memory, power, and
+temperature telemetry so the saturation decision is not based on temperature
+alone.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1ub_04.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1UB-04.log
+```
