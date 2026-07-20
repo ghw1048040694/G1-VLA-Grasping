@@ -77,3 +77,16 @@ alone.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1ub_04.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1UB-04.log
 ```
+
+## G1UB-05 1024-Environment CR7 Baseline
+
+G1UB-04 passed 1280 environments, but 1024 retains about 2.3 GiB of VRAM
+headroom while sustaining about 1321 steps per second. G1UB-05 keeps the 200
+PPO updates and all task settings from G1UB-02, changing only the environment
+count from 32 to 1024. This raises total samples from 153,600 to 4,915,200 and
+tests whether the earlier tracking failure was primarily caused by insufficient
+experience per policy update.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1ub_05.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1UB-05.log
+```
