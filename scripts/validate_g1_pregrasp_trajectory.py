@@ -40,6 +40,9 @@ def main() -> None:
     parser.add_argument("--shoulder-lead-seconds", type=float, required=True)
     parser.add_argument("--duration", type=float, default=6.0)
     parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--gravity-compensation", action="store_true")
+    parser.add_argument("--kp-scale", type=float, default=1.0)
+    parser.add_argument("--kd-scale", type=float, default=1.0)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,9 +137,14 @@ def main() -> None:
             )
         for name, item in controlled.items():
             kp, kd = unitree_gains(name)
+            kp *= args.kp_scale
+            kd *= args.kd_scale
             qpos = data.qpos[item["qpos_id"]]
             qvel = data.qvel[item["qvel_id"]]
-            data.ctrl[item["actuator_id"]] = kp * (commanded_targets[name] - qpos) - kd * qvel
+            torque = kp * (commanded_targets[name] - qpos) - kd * qvel
+            if args.gravity_compensation:
+                torque += float(data.qfrc_bias[item["qvel_id"]])
+            data.ctrl[item["actuator_id"]] = torque
         mujoco.mj_step(model, data)
 
         for name, item in controlled.items():
@@ -230,6 +238,9 @@ def main() -> None:
         "experiment": "G1WH-15-continuous-pregrasp-trajectory",
         "shoulder_lead_seconds": args.shoulder_lead_seconds,
         "selected_tote_x_m": selected_x,
+        "gravity_compensation_enabled": args.gravity_compensation,
+        "kp_scale": args.kp_scale,
+        "kd_scale": args.kd_scale,
         "maximum_palm_position_error_m": float(np.max(palm_errors)),
         "maximum_palm_orientation_error_rad": float(np.max(palm_orientation_errors)),
         "selected_joint_hold_rmse_rad": selected_rmse,

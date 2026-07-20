@@ -454,3 +454,19 @@ It selects the lowest gain scale that satisfies every hold criterion.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_18.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-18.log
 ```
+
+G1WH-18 selects a 1.5 proportional-gain scale with a 1.225 derivative-gain
+scale as the lowest passing controller. It lowers palm position error from
+32.67 to 29.17 mm and joint RMSE from 0.00154 to 0.00097 rad without contact,
+joint-limit violations, tote drift, or actuator saturation.
+
+## G1WH-19 Continuous Control Transfer
+
+G1WH-19 transfers the corrected hold controller back to the 0.55 m continuous
+pre-grasp motion. It compares baseline PD, gravity compensation alone, and
+gravity compensation with the selected 1.5/1.225 feedback-gain scales while
+holding the IK target and simultaneous one-second trajectory fixed.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_19.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-19.log
+```
