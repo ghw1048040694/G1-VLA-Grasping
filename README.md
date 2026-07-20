@@ -422,3 +422,19 @@ the dynamic pose drift, limit overshoot, and object contacts seen in G1WH-15.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_16.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-16.log
 ```
+
+G1WH-16 confirms gravity-loaded steady-state error as the primary failure
+source. Gravity compensation reduces joint RMSE by 93.9% and removes contacts,
+limit violations, and tote drift. Maximum palm position error falls from 75.50
+to 32.67 mm but remains 2.67 mm above the fixed acceptance threshold.
+
+## G1WH-17 IK Task-Weight Dynamic Sweep
+
+G1WH-17 keeps gravity compensation and sweeps the IK orientation weight through
+0.08, 0.06, 0.04, and 0.02 m/rad. Each static solution is then held under
+gravity. This tests the position-orientation tradeoff and selects the highest
+orientation priority that still passes every dynamic criterion.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_17.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-17.log
+```
