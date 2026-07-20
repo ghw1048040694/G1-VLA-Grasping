@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize G1UB-02 TensorBoard scalars into reproducible artifacts."""
+"""Summarize a 200-iteration G1 motion-tracking run."""
 
 from __future__ import annotations
 
@@ -32,6 +32,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("event_file", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--total-timesteps", type=int, required=True)
+    parser.add_argument("--selected-checkpoint", type=int, required=True)
+    parser.add_argument("--selection-reason", required=True)
     args = parser.parse_args()
 
     accumulator = EventAccumulator(str(args.event_file), size_guidance={"scalars": 0})
@@ -63,14 +66,11 @@ def main() -> None:
 
     summary = {
         "iterations": 200,
-        "total_timesteps": 153600,
+        "total_timesteps": args.total_timesteps,
         "trailing_window_iterations": 20,
         "checkpoint_trailing_means": checkpoints,
-        "selected_checkpoint": 100,
-        "selection_reason": (
-            "model_100 has the lowest trailing-20 upper-body, VR three-point, and joint error "
-            "among saved non-initial checkpoints; model_200 survives longer but tracks worse."
-        ),
+        "selected_checkpoint": args.selected_checkpoint,
+        "selection_reason": args.selection_reason,
     }
     summary_path = args.output_dir / "analysis_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
