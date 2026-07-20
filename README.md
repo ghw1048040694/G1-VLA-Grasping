@@ -236,3 +236,21 @@ simultaneous multi-joint coupling.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_05.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-05.log
 ```
+
+G1WH-05 found that 19 body joints meet the isolated 0.10 rad error threshold
+and 40 of 43 joints finish in the commanded direction, but no joint passes the
+complete rule because all runs leak at least 0.893 rad into another joint. Body
+mean error improves to 0.139 rad in isolation while hand mean error worsens to
+0.637 rad. The uniform torque PD loop is underdamped and cannot hold the full
+mechanism stable.
+
+## G1WH-06 Unitree Joint-Specific Gain Profile
+
+G1WH-06 repeats the identical 43-joint isolation test with gains taken from the
+local Unitree control implementation: strong body 300/3, weak body 80/3,
+wrists 40/1.5, and Dex3 hands 1.5/0.2. This tests a source-backed per-joint
+profile against the failed uniform-gain baseline.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_06.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-06.log
+```

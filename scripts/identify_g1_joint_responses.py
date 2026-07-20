@@ -22,11 +22,27 @@ def smoothstep(value: float) -> float:
     return value * value * (3.0 - 2.0 * value)
 
 
+def gains_for_joint(name: str, profile: str) -> tuple[float, float]:
+    if profile == "uniform":
+        return (8.0, 0.30) if "hand_" in name else (80.0, 4.0)
+    if "hand_" in name:
+        return 1.5, 0.2
+    if "wrist_" in name:
+        return 40.0, 1.5
+    weak_body = (
+        "ankle_pitch" in name
+        or "shoulder_" in name
+        or "elbow_" in name
+    )
+    return (80.0, 3.0) if weak_body else (300.0, 3.0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--asset", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=2.0)
+    parser.add_argument("--gain-profile", choices=("uniform", "unitree"), default="uniform")
     args = parser.parse_args()
 
     model = mujoco.MjModel.from_xml_path(str(args.asset.resolve()))
@@ -77,8 +93,7 @@ def main() -> None:
             for actuator_id, name in enumerate(actuator_names):
                 current = data.qpos[qpos_ids[name]]
                 velocity = data.qvel[qvel_ids[name]]
-                is_hand = "hand_" in name
-                kp, kd = (8.0, 0.30) if is_hand else (80.0, 4.0)
+                kp, kd = gains_for_joint(name, args.gain_profile)
                 data.ctrl[actuator_id] = kp * (targets[name] - current) - kd * velocity
 
             mujoco.mj_step(model, data)
@@ -136,7 +151,12 @@ def main() -> None:
     axis.invert_yaxis()
     axis.axvline(0.10, color="#202020", linestyle="--", linewidth=1)
     axis.set_xlabel("Steady-state RMSE (rad), lower is better")
-    axis.set_title("G1WH-05 isolated joint response")
+    experiment_name = (
+        "G1WH-05-isolated-joint-response"
+        if args.gain_profile == "uniform"
+        else "G1WH-06-unitree-gain-profile"
+    )
+    axis.set_title(experiment_name)
     figure.tight_layout()
     chart_path = args.output_dir / "joint_response_errors.png"
     figure.savefig(chart_path, dpi=160)
@@ -146,8 +166,18 @@ def main() -> None:
     body_errors = [float(item["steady_rmse_rad"]) for item in rows if item["group"] == "body"]
     hand_errors = [float(item["steady_rmse_rad"]) for item in rows if item["group"] == "hand"]
     report = {
-        "experiment": "G1WH-05-isolated-joint-response",
-        "controller": {"body_kp": 80.0, "body_kd": 4.0, "hand_kp": 8.0, "hand_kd": 0.30},
+        "experiment": experiment_name,
+        "gain_profile": args.gain_profile,
+        "controller": (
+            {"body_kp": 80.0, "body_kd": 4.0, "hand_kp": 8.0, "hand_kd": 0.30}
+            if args.gain_profile == "uniform"
+            else {
+                "strong_body_kp_kd": [300.0, 3.0],
+                "weak_body_kp_kd": [80.0, 3.0],
+                "wrist_kp_kd": [40.0, 1.5],
+                "hand_kp_kd": [1.5, 0.2],
+            }
+        ),
         "pass_rule": "Correct direction, steady RMSE < 0.10 rad, leakage < 0.10 rad",
         "tested_joints": len(rows),
         "passed_joints": len(passed_rows),
