@@ -372,3 +372,20 @@ visibility from the head and both wrist cameras before manipulation begins.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_13.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-13.log
 ```
+
+G1WH-13 passes the dynamic scene contract. The 2 kg tote has zero initial
+penetration, remains in table contact for 99.93% of steps, settles 0.216 mm,
+has effectively zero horizontal drift and final speed, and remains visible in
+all three task cameras.
+
+## G1WH-14 Bimanual Reachability Scan
+
+G1WH-14 uses inverse kinematics to place both palm centers 12 cm outside the
+tote grasp sites while sweeping tote distance from 0.45 to 0.95 m. A candidate
+passes only if both palms are within 3 cm, selected joints remain at least 0.05
+rad from their limits, and no unexpected collision occurs. The farthest passing
+position is selected for the manipulation scene.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_14.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-14.log
+```
