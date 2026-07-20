@@ -69,6 +69,31 @@ def smoothstep(value: float) -> float:
     return value * value * (3.0 - 2.0 * value)
 
 
+def unitree_gains(name: str) -> tuple[float, float]:
+    if "hand_" in name:
+        return 1.5, 0.2
+    if "wrist_" in name:
+        return 40.0, 1.5
+    weak_body = "ankle_pitch" in name or "shoulder_" in name or "elbow_" in name
+    return (80.0, 3.0) if weak_body else (300.0, 3.0)
+
+
+def apply_regularized_dynamics(model: mujoco.MjModel) -> None:
+    for joint_id in range(model.njnt):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id) or ""
+        if not name or name == "floating_base_joint":
+            continue
+        dof_id = int(model.jnt_dofadr[joint_id])
+        if "hand_" in name:
+            damping, armature = 0.02, 0.0005
+        elif "wrist_" in name:
+            damping, armature = 0.1, 0.005
+        else:
+            damping, armature = 0.2, 0.01
+        model.dof_damping[dof_id] = damping
+        model.dof_armature[dof_id] = armature
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--asset", type=Path, required=True)
@@ -79,11 +104,21 @@ def main() -> None:
     parser.add_argument("--body-kd", type=float, default=4.0)
     parser.add_argument("--hand-kp", type=float, default=8.0)
     parser.add_argument("--hand-kd", type=float, default=0.30)
+    parser.add_argument("--gain-profile", choices=("custom", "unitree"), default="custom")
+    parser.add_argument("--dynamics-profile", choices=("raw", "both"), default="raw")
+    parser.add_argument("--enable-gravity", action="store_true")
+    parser.add_argument("--enable-contacts", action="store_true")
+    parser.add_argument("--base-mode", choices=("clamp", "model"), default="clamp")
+    parser.add_argument("--experiment-name", default="G1WH-03-bimanual-actuation-smoke-test")
     args = parser.parse_args()
 
     model = mujoco.MjModel.from_xml_path(str(args.asset.resolve()))
-    model.opt.gravity[:] = 0.0
-    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    if not args.enable_gravity:
+        model.opt.gravity[:] = 0.0
+    if not args.enable_contacts:
+        model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    if args.dynamics_profile == "both":
+        apply_regularized_dynamics(model)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     base_qpos = data.qpos[:7].copy()
@@ -124,6 +159,11 @@ def main() -> None:
     render_interval = max(1, round(1.0 / (args.video_fps * dt)))
     rows = []
     hold_errors = {name: [] for name in joint_ids}
+    contact_counts = []
+    saturated_actuators = 0
+    actuator_samples = 0
+    joint_limit_violations = 0
+    joint_samples = 0
     final_frame = None
 
     for step in range(total_steps):
@@ -141,17 +181,33 @@ def main() -> None:
             qpos = data.qpos[qpos_ids[name]]
             qvel = data.qvel[qvel_ids[name]]
             is_hand = name in HAND_TARGETS
-            kp, kd = (
-                (args.hand_kp, args.hand_kd)
-                if is_hand
-                else (args.body_kp, args.body_kd)
-            )
+            if args.gain_profile == "unitree":
+                kp, kd = unitree_gains(name)
+            else:
+                kp, kd = (
+                    (args.hand_kp, args.hand_kd)
+                    if is_hand
+                    else (args.body_kp, args.body_kd)
+                )
             data.ctrl[actuator_ids[name]] = kp * (target - qpos) - kd * qvel
 
         mujoco.mj_step(model, data)
-        data.qpos[:7] = base_qpos
-        data.qvel[:6] = 0.0
+        if args.base_mode == "clamp":
+            data.qpos[:7] = base_qpos
+            data.qvel[:6] = 0.0
         mujoco.mj_forward(model, data)
+        contact_counts.append(int(data.ncon))
+        for name, actuator_id in actuator_ids.items():
+            joint_id = joint_ids[name]
+            force_limit = max(abs(float(value)) for value in model.jnt_actfrcrange[joint_id])
+            if force_limit > 0 and abs(float(data.actuator_force[actuator_id])) >= 0.98 * force_limit:
+                saturated_actuators += 1
+            actuator_samples += 1
+            low, high = model.jnt_range[joint_id]
+            position = float(data.qpos[qpos_ids[name]])
+            if position < low - 1e-6 or position > high + 1e-6:
+                joint_limit_violations += 1
+            joint_samples += 1
 
         if 4.5 <= time_s < 5.0:
             for name, target in targets.items():
@@ -198,22 +254,38 @@ def main() -> None:
         name: float(np.sqrt(np.mean(np.square(errors)))) for name, errors in hold_errors.items()
     }
     report = {
-        "experiment": "G1WH-03-bimanual-actuation-smoke-test",
+        "experiment": args.experiment_name,
         "asset": str(args.asset.resolve()),
         "commanded_body_joints": len(BODY_TARGETS),
         "commanded_hand_joints": len(HAND_TARGETS),
         "all_targets_within_joint_limits": all(target_ranges_valid.values()),
-        "gravity_disabled": True,
-        "contacts_disabled": True,
-        "controller": {
-            "body_kp": args.body_kp,
-            "body_kd": args.body_kd,
-            "hand_kp": args.hand_kp,
-            "hand_kd": args.hand_kd,
-        },
+        "gain_profile": args.gain_profile,
+        "dynamics_profile": args.dynamics_profile,
+        "gravity_enabled": args.enable_gravity,
+        "contacts_enabled": args.enable_contacts,
+        "base_mode": args.base_mode,
+        "controller": (
+            {
+                "strong_body_kp_kd": [300.0, 3.0],
+                "weak_body_kp_kd": [80.0, 3.0],
+                "wrist_kp_kd": [40.0, 1.5],
+                "hand_kp_kd": [1.5, 0.2],
+            }
+            if args.gain_profile == "unitree"
+            else {
+                "body_kp": args.body_kp,
+                "body_kd": args.body_kd,
+                "hand_kp": args.hand_kp,
+                "hand_kd": args.hand_kd,
+            }
+        ),
         "body_hold_rmse_rad": float(np.sqrt(np.mean(np.square(body_errors)))),
         "hand_hold_rmse_rad": float(np.sqrt(np.mean(np.square(hand_errors)))),
         "joint_hold_rmse_rad": joint_hold_rmse,
+        "mean_contact_count": float(np.mean(contact_counts)),
+        "maximum_contact_count": max(contact_counts),
+        "actuator_saturation_fraction": saturated_actuators / actuator_samples,
+        "joint_limit_violation_fraction": joint_limit_violations / joint_samples,
         "video": str(video_path),
         "final_pose": str(final_image_path),
         "trajectory_metrics": str(trajectory_path),

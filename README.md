@@ -271,3 +271,21 @@ the experiment tests which missing dynamics term causes numerical instability.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_07.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-07.log
 ```
+
+G1WH-07 identifies reflected motor armature as the dominant missing dynamics
+term. Raw and damping-only profiles pass zero joints; armature-only and the
+combined profile pass all 43. The combined diagnostic profile reaches 0.00020
+rad body RMSE and 0.00120 rad maximum leakage. These values are not physical
+calibration: they only pass the fixed-base, zero-gravity, zero-contact test.
+
+## G1WH-08 Staged Realism Validation
+
+G1WH-08 writes a derived MJCF with a real pelvis-to-world weld instead of
+resetting the floating base after each step. It then runs the same simultaneous
+bimanual motion under three stages: no gravity/no contact, gravity/no contact,
+and gravity/contact. It records errors, contact counts, actuator saturation,
+joint-limit violations, and one video per stage.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_08.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-08.log
+```
