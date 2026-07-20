@@ -438,3 +438,19 @@ orientation priority that still passes every dynamic criterion.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_17.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-17.log
 ```
+
+G1WH-17 rejects all four weights. Lowering orientation weight improves static
+position error from 14.93 to 3.61 mm, but dynamic error worsens from 32.67 to
+42.25 mm. The 0.02 m/rad solution also exceeds the orientation threshold and
+contacts the tote. The original 0.08 m/rad target remains the best dynamic pose.
+
+## G1WH-18 Feedback-Gain Hold Sweep
+
+G1WH-18 fixes the 0.08 m/rad IK target and gravity compensation, then sweeps
+proportional gain scales of 1.0, 1.25, 1.5, and 2.0. Derivative gain scales by
+the square root of proportional gain to approximately preserve damping ratio.
+It selects the lowest gain scale that satisfies every hold criterion.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_18.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-18.log
+```

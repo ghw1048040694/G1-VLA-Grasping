@@ -35,6 +35,8 @@ def main() -> None:
     parser.add_argument("--gravity-compensation", action="store_true")
     parser.add_argument("--duration", type=float, default=4.0)
     parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--kp-scale", type=float, default=1.0)
+    parser.add_argument("--kd-scale", type=float, default=1.0)
     args = parser.parse_args()
     if args.gravity_compensation and not args.enable_gravity:
         raise ValueError("Gravity compensation requires gravity to be enabled")
@@ -136,6 +138,8 @@ def main() -> None:
     for step in range(total_steps):
         for name, item in controlled.items():
             kp, kd = unitree_gains(name)
+            kp *= args.kp_scale
+            kd *= args.kd_scale
             qpos = data.qpos[item["qpos_id"]]
             qvel = data.qvel[item["qvel_id"]]
             torque = kp * (targets[name] - qpos) - kd * qvel
@@ -221,6 +225,8 @@ def main() -> None:
         "experiment": "G1WH-16-pregrasp-hold-control-ablation",
         "gravity_enabled": args.enable_gravity,
         "gravity_compensation_enabled": args.gravity_compensation,
+        "kp_scale": args.kp_scale,
+        "kd_scale": args.kd_scale,
         "initial_unexpected_contact_count": initial_unexpected_contacts,
         "maximum_palm_position_error_m": float(np.max(palm_errors)),
         "maximum_palm_orientation_error_rad": float(np.max(orientation_errors)),
