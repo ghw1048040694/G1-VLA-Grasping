@@ -306,3 +306,20 @@ This identifies which hand collision geometry should be corrected next.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_09.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-09.log
 ```
+
+G1WH-09 attributes the sustained hand contacts to the left thumb-tip versus
+middle-finger link and the right index-finger link versus thumb-tip. Both are
+active for about 23.5% of simulation steps with about 4.1 N mean normal force.
+Six finger joints account for every joint-limit violation. A brief right-thumb
+versus right-hip contact reaches 13.87 N and also exposes an unsafe arm path.
+
+## G1WH-10 Hand Closure Sweep
+
+G1WH-10 keeps physically meaningful contacts enabled and sweeps hand target
+amplitude through 100%, 80%, 60%, and 40%. It tests whether a collision-safe
+pre-grasp can remove self-contact and limit violations without hiding them via
+contact exclusions.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_10.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-10.log
+```

@@ -109,6 +109,7 @@ def main() -> None:
     parser.add_argument("--body-kd", type=float, default=4.0)
     parser.add_argument("--hand-kp", type=float, default=8.0)
     parser.add_argument("--hand-kd", type=float, default=0.30)
+    parser.add_argument("--hand-target-scale", type=float, default=1.0)
     parser.add_argument("--gain-profile", choices=("custom", "unitree"), default="custom")
     parser.add_argument("--dynamics-profile", choices=("raw", "both"), default="raw")
     parser.add_argument("--enable-gravity", action="store_true")
@@ -116,6 +117,8 @@ def main() -> None:
     parser.add_argument("--base-mode", choices=("clamp", "model"), default="clamp")
     parser.add_argument("--experiment-name", default="G1WH-03-bimanual-actuation-smoke-test")
     args = parser.parse_args()
+    if not 0.0 <= args.hand_target_scale <= 1.0:
+        raise ValueError("--hand-target-scale must be between 0 and 1")
 
     model = mujoco.MjModel.from_xml_path(str(args.asset.resolve()))
     if not args.enable_gravity:
@@ -144,7 +147,10 @@ def main() -> None:
         raise RuntimeError("A commanded joint has no same-named actuator")
 
     target_ranges_valid = {}
-    for name, target in (BODY_TARGETS | HAND_TARGETS).items():
+    scaled_hand_targets = {
+        name: target * args.hand_target_scale for name, target in HAND_TARGETS.items()
+    }
+    for name, target in (BODY_TARGETS | scaled_hand_targets).items():
         joint_id = joint_ids[name]
         low, high = model.jnt_range[joint_id]
         target_ranges_valid[name] = bool(low <= target <= high)
@@ -192,7 +198,7 @@ def main() -> None:
 
         targets = {
             **{name: value * body_scale for name, value in BODY_TARGETS.items()},
-            **{name: value * hand_scale for name, value in HAND_TARGETS.items()},
+            **{name: value * hand_scale for name, value in scaled_hand_targets.items()},
         }
         for name, target in targets.items():
             qpos = data.qpos[qpos_ids[name]]
@@ -328,6 +334,7 @@ def main() -> None:
         "all_targets_within_joint_limits": all(target_ranges_valid.values()),
         "gain_profile": args.gain_profile,
         "dynamics_profile": args.dynamics_profile,
+        "hand_target_scale": args.hand_target_scale,
         "gravity_enabled": args.enable_gravity,
         "contacts_enabled": args.enable_contacts,
         "base_mode": args.base_mode,
