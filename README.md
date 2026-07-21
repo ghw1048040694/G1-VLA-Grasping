@@ -521,3 +521,16 @@ but fails task-semantic review. The reset already places both arms wide, the IK
 motion changes waist pitch by 0.871 rad, and the final palms remain 16 cm from
 the tote. These episodes are retained as pre-grasp reach diagnostics and must
 not be presented as grasp/lift demonstrations or used for the final policy.
+
+## G1WH-22 Assisted Bimanual Tote Lift
+
+G1WH-22 replaces the coordinate-only pre-grasp with a complete semantic task:
+approach from a neutral pose, establish bilateral contact, close both hands,
+lift the tote by at least 10 cm, and hold it off the table. Tote distance is
+0.45 m and waist pitch is bounded to +/-0.10 rad. Two runtime site constraints
+assist the grasp after contact; this assistance is reported explicitly and
+must later be removed in a physical-grasp control experiment.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_22.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-22.log
+```
