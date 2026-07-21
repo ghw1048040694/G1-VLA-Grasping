@@ -157,6 +157,20 @@ def convert_split(
         )
     dataset.stop_image_writer()
     metadata = LeRobotDatasetMetadata(repo_id, root=root)
+    decoded_dataset = LeRobotDataset(repo_id, root=root, video_backend="pyav")
+    decoded_samples = 0
+    offset = 0
+    for episode in per_episode:
+        for index in (offset, offset + episode["frames"] - 1):
+            item = decoded_dataset[index]
+            for key in CAMERAS:
+                image = item[key]
+                if tuple(image.shape) != (3, 240, 320) or not bool(
+                    np.isfinite(image.numpy()).all()
+                ):
+                    raise ValueError(f"PyAV decode failed for {key} at dataset index {index}")
+            decoded_samples += 1
+        offset += episode["frames"]
     return {
         "repo_id": repo_id,
         "root": str(root),
@@ -167,6 +181,8 @@ def convert_split(
         "state_dim": metadata.features["observation.state"]["shape"][0],
         "action_dim": metadata.features["action"]["shape"][0],
         "camera_keys": metadata.camera_keys,
+        "video_decode_backend": "pyav",
+        "decoded_endpoint_samples": decoded_samples,
         "episode_records": per_episode,
     }
 
@@ -210,6 +226,10 @@ def main() -> None:
         and report["validation"]["action_dim"] == 31
         and len(report["train"]["camera_keys"]) == 3
         and len(report["validation"]["camera_keys"]) == 3
+        and report["train"]["decoded_endpoint_samples"]
+        == 2 * report["train"]["episodes"]
+        and report["validation"]["decoded_endpoint_samples"]
+        == 2 * report["validation"]["episodes"]
     )
     path = args.output_dir / "conversion_summary.json"
     path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

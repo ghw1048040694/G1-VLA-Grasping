@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Adapt local SmolVLA weights to the G1 upper-body dataset feature contract."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+from pathlib import Path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-policy", type=Path, required=True)
+    parser.add_argument("--dataset-repo-id", required=True)
+    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    source = args.base_policy.resolve()
+    output = args.output_dir.resolve()
+    if output.exists():
+        if not args.overwrite:
+            raise FileExistsError(f"Adapted policy already exists: {output}")
+        shutil.rmtree(output)
+    source_config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+    dataset_info = json.loads(
+        (args.dataset_root / "meta/info.json").read_text(encoding="utf-8")
+    )
+    state_shape = dataset_info["features"]["observation.state"]["shape"]
+    action_shape = dataset_info["features"]["action"]["shape"]
+    cameras = {}
+    for key, feature in dataset_info["features"].items():
+        if feature["dtype"] not in {"video", "image"}:
+            continue
+        shape = list(feature["shape"])
+        names = feature["names"]
+        if names[2] in {"channel", "channels"}:
+            shape = [shape[2], shape[0], shape[1]]
+        cameras[key] = {"type": "VISUAL", "shape": shape}
+    if state_shape[0] > source_config["max_state_dim"]:
+        raise ValueError(
+            f"State dimension {state_shape[0]} exceeds {source_config['max_state_dim']}"
+        )
+    if action_shape[0] > source_config["max_action_dim"]:
+        raise ValueError(
+            f"Action dimension {action_shape[0]} exceeds {source_config['max_action_dim']}"
+        )
+    if len(cameras) != 3:
+        raise ValueError(f"Expected three task cameras, found {sorted(cameras)}")
+
+    adapted = dict(source_config)
+    adapted["input_features"] = {
+        "observation.state": {"type": "STATE", "shape": state_shape},
+        **cameras,
+    }
+    adapted["output_features"] = {
+        "action": {"type": "ACTION", "shape": action_shape}
+    }
+    adapted["push_to_hub"] = False
+    adapted["repo_id"] = None
+    output.mkdir(parents=True)
+    (output / "config.json").write_text(
+        json.dumps(adapted, indent=2) + "\n", encoding="utf-8"
+    )
+    os.symlink((source / "model.safetensors").resolve(), output / "model.safetensors")
+
+    report = {
+        "experiment": "G1WH-25-smolvla-upper-body-finetune",
+        "source_policy": str(source),
+        "weights_reused_without_modification": True,
+        "processors_managed_by_training_stack": True,
+        "dataset_repo_id": args.dataset_repo_id,
+        "state_dim": state_shape[0],
+        "action_dim": action_shape[0],
+        "camera_keys": sorted(cameras),
+        "max_state_dim": source_config["max_state_dim"],
+        "max_action_dim": source_config["max_action_dim"],
+        "freeze_vision_encoder": source_config["freeze_vision_encoder"],
+        "train_expert_only": source_config["train_expert_only"],
+    }
+    (output / "adaptation_summary.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == "__main__":
+    main()

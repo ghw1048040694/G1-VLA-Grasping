@@ -591,3 +591,20 @@ streams and the natural-language task string.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_24.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-24.log
 ```
+
+The formal conversion produces 16 training episodes (2,432 frames) and four
+held-out episodes (608 frames). Default TorchCodec decoding fails for the AV1
+files under the current WSL2 environment, while the explicit PyAV backend
+successfully decodes the first and last frame of every episode and camera.
+All subsequent training commands therefore fix `dataset.video_backend=pyav`.
+
+## G1WH-25 SmolVLA Upper-Body Fine-Tuning
+
+G1WH-25 adapts the local pretrained SmolVLA feature contract to three cameras
+and 31 upper-body dimensions, then performs 1,000 real parameter updates with
+batch size two. The vision-language backbone remains frozen and the action
+expert is trained; this is partial-parameter fine-tuning rather than LoRA.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_25.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-25.log
+```
