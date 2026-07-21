@@ -52,6 +52,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-summary", type=Path, required=True)
     parser.add_argument("--checkpoint-500", type=Path, required=True)
     parser.add_argument("--checkpoint-1000", type=Path, required=True)
+    parser.add_argument(
+        "--policy-selection",
+        choices=("both", "step500", "step1000"),
+        default="both",
+    )
+    parser.add_argument(
+        "--experiment-id", default="G1WH-27-smolvla-closed-loop-validation"
+    )
     parser.add_argument("--train-root", type=Path, required=True)
     parser.add_argument("--train-repo-id", default="local/g1_assisted_lift_train")
     parser.add_argument("--validation-start", type=int, default=16)
@@ -512,6 +520,8 @@ def main() -> None:
         "step500": args.checkpoint_500,
         "step1000": args.checkpoint_1000,
     }
+    if args.policy_selection != "both":
+        specs = {args.policy_selection: specs[args.policy_selection]}
     all_reports = {}
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for policy_name, checkpoint in specs.items():
@@ -532,7 +542,7 @@ def main() -> None:
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
     report = {
-        "experiment": "G1WH-27-smolvla-closed-loop-validation",
+        "experiment": args.experiment_id,
         "device": device,
         "validation_source_episodes": [item["episode_index"] for item in episodes],
         "control_fps": args.control_fps,

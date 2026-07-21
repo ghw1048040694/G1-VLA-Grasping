@@ -643,3 +643,19 @@ safety metrics, and task success.
 ```bash
 set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_27.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-27.log
 ```
+
+G1WH-27 fails the final-hold criterion at 0/4 success for both checkpoints.
+Step 500 nevertheless reaches a mean maximum lift of 0.151 m and exceeds the
+0.10 m task height in three episodes before returning the tote to the table.
+Step 1000 reaches only 0.078 m mean maximum lift. This selects step 500 for the
+next controller ablation rather than motivating more training steps.
+
+## G1WH-28 One-Step Replanning Ablation
+
+G1WH-28 changes only the step-500 execution horizon from five actions to one.
+The policy observes the new simulation state after every 1/15 second action,
+testing whether more frequent feedback prevents the lift-and-return behavior.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_28.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-28.log
+```
