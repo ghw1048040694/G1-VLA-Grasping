@@ -17,7 +17,6 @@ from scipy.spatial.transform import Rotation
 
 PALM_NAMES = ("left_palm_center", "right_palm_center")
 SAFE_HOME_POSITIONS_M = np.array(((0.25, 0.38, 1.0), (0.25, -0.38, 1.0)))
-SAFE_PREGRASP_CLEARANCE_M = 0.14
 
 
 def name(model: mujoco.MjModel, kind: mujoco.mjtObj, index: int) -> str:
@@ -49,6 +48,12 @@ def main() -> None:
     parser.add_argument("--asset", type=Path, required=True)
     parser.add_argument("--reachability-report", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--tote-x", type=float, default=0.55)
+    parser.add_argument("--pregrasp-clearance-m", type=float, default=0.16)
+    parser.add_argument(
+        "--language-instruction",
+        default="move both hands to the tote pre-grasp pose",
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,8 +145,8 @@ def main() -> None:
     ]
     mujoco.mj_forward(model, data)
     pregrasp_positions = np.stack([data.site_xpos[item].copy() for item in tote_ids])
-    pregrasp_positions[0, 1] += SAFE_PREGRASP_CLEARANCE_M
-    pregrasp_positions[1, 1] -= SAFE_PREGRASP_CLEARANCE_M
+    pregrasp_positions[0, 1] += args.pregrasp_clearance_m
+    pregrasp_positions[1, 1] -= args.pregrasp_clearance_m
 
     def pregrasp_residual(values: np.ndarray) -> np.ndarray:
         data.qpos[qpos_ids] = values
@@ -180,11 +185,11 @@ def main() -> None:
     )
     pregrasp_contacts = unexpected_contacts(model, data)
     pregrasp_report = {
-        "selected_tote_x_m": 0.55,
-        "pregrasp_clearance_m": SAFE_PREGRASP_CLEARANCE_M,
+        "selected_tote_x_m": args.tote_x,
+        "pregrasp_clearance_m": args.pregrasp_clearance_m,
         "candidates": [
             {
-                "tote_x_m": 0.55,
+                "tote_x_m": args.tote_x,
                 "passed": bool(
                     pregrasp_solution.success
                     and pregrasp_position_error < 0.03
@@ -218,7 +223,7 @@ def main() -> None:
             "--output-dir",
             str(args.output_dir),
             "--tote-x",
-            "0.55",
+            str(args.tote_x),
             "--shoulder-lead-seconds",
             "0.0",
             "--duration",
@@ -229,8 +234,16 @@ def main() -> None:
             "--kd-scale",
             str(np.sqrt(1.5)),
             "--record-demonstration",
+            "--video-fps",
+            "15",
+            "--render-width",
+            "320",
+            "--render-height",
+            "240",
             "--pregrasp-clearance-m",
-            str(SAFE_PREGRASP_CLEARANCE_M),
+            str(args.pregrasp_clearance_m),
+            "--language-instruction",
+            args.language_instruction,
         ],
         check=True,
         env={**os.environ, "MUJOCO_GL": "egl"},

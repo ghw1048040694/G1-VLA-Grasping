@@ -486,3 +486,18 @@ head/left-wrist/right-wrist camera videos as the first expert episode.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_20.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-20.log
 ```
+
+G1WH-20 passes and records 177 frames across 43 controlled joints. The safe
+reset has 0.15 mm position error; the executed pre-grasp has 27.39 mm position
+error, zero contact, zero limit violation, and effectively zero tote drift.
+
+## G1WH-21 Randomized Expert Dataset
+
+G1WH-21 collects 20 successful expert episodes with a fixed seed. It randomizes
+tote depth from 0.52 to 0.58 m, cycles four language instructions, uses a 16 cm
+pre-grasp clearance, and records 320x240 camera streams at 15 FPS. Lateral tote
+randomization remains disabled until a collision-aware path is available.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_21.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-21.log
+```

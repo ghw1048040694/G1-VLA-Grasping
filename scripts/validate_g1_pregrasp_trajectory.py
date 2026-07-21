@@ -40,12 +40,18 @@ def main() -> None:
     parser.add_argument("--shoulder-lead-seconds", type=float, required=True)
     parser.add_argument("--duration", type=float, default=6.0)
     parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--render-width", type=int, default=640)
+    parser.add_argument("--render-height", type=int, default=480)
     parser.add_argument("--gravity-compensation", action="store_true")
     parser.add_argument("--kp-scale", type=float, default=1.0)
     parser.add_argument("--kd-scale", type=float, default=1.0)
     parser.add_argument("--initial-pose-report", type=Path)
     parser.add_argument("--record-demonstration", action="store_true")
     parser.add_argument("--pregrasp-clearance-m", type=float, default=PREGRASP_CLEARANCE_M)
+    parser.add_argument(
+        "--language-instruction",
+        default="move both hands to the tote pre-grasp pose",
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -111,7 +117,9 @@ def main() -> None:
     target_positions[0, 1] += args.pregrasp_clearance_m
     target_positions[1, 1] -= args.pregrasp_clearance_m
 
-    renderer = mujoco.Renderer(model, height=480, width=640)
+    renderer = mujoco.Renderer(
+        model, height=args.render_height, width=args.render_width
+    )
     camera = mujoco.MjvCamera()
     camera.lookat[:] = (0.50, 0.0, 0.9)
     camera.distance = 2.4
@@ -328,10 +336,12 @@ def main() -> None:
         )
         metadata = {
             "task": "bimanual_tote_pregrasp",
-            "language_instruction": "move both hands to the tote pre-grasp pose",
+            "language_instruction": args.language_instruction,
             "episode_success": report["passed"],
             "frames": len(demonstration_times),
             "fps": args.video_fps,
+            "image_width": args.render_width,
+            "image_height": args.render_height,
             "joint_count": len(controlled_names),
             "task_cameras": list(task_camera_names),
             "dataset": str(dataset_path),
