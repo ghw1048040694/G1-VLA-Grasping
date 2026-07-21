@@ -515,3 +515,9 @@ aborting the remaining episodes.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_21r.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-21R.log
 ```
+
+G1WH-21R passes its original data contract with 20/20 collision-free episodes,
+but fails task-semantic review. The reset already places both arms wide, the IK
+motion changes waist pitch by 0.871 rad, and the final palms remain 16 cm from
+the tote. These episodes are retained as pre-grasp reach diagnostics and must
+not be presented as grasp/lift demonstrations or used for the final policy.
