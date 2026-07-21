@@ -694,3 +694,30 @@ hold instruction is latched for the remainder of the episode.
 ```bash
 set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_30.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-30.log
 ```
+
+The step-500 policy is the clear closed-loop winner. It ends above the 0.10 m
+task height in 3/4 held-out episodes, with 0.102 m mean final lift and 0.244 m
+mean maximum lift. Relative to G1WH-27 step 500, mean maximum lift improves by
+61.76%, action clipping falls from 3.74% to 0.82%, and final lift changes from
+approximately zero to 0.102 m. Strict success remains 0/4 because final tote
+speed is 0.125-0.283 m/s and maximum waist pitch is 0.121-0.155 rad. Step 1000
+reaches only 0.072 m mean maximum lift and is rejected. Phase language solves
+task progression for step 500, but not safe stabilization after the lift.
+
+## G1WH-31 Hold-Phase Action Smoothing
+
+G1WH-31 keeps the selected step-500 policy, validation episodes, phase-language
+scheduler, and five-action execution horizon fixed. It changes only phase 5:
+each commanded joint target uses 20% of the new policy output and 80% of the
+previous command. This low-pass filter tests whether the high final tote speed
+comes from abrupt hold-stage commands without hiding approach or lift behavior.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_31.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-31.log
+```
+
+The primary comparison is against G1WH-30 step 500: final speed should move
+toward the strict `<0.05 m/s` limit while at least 3/4 episodes retain a final
+lift of 0.10 m. Action-delta RMSE should fall below the 0.0628 rad baseline.
+Waist pitch and joint-limit violations remain safety guardrails rather than the
+variable changed in this ablation.

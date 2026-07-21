@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assist-distance-m", type=float, default=0.08)
     parser.add_argument("--align-distance-m", type=float, default=0.12)
     parser.add_argument("--phase-language-scheduler", action="store_true")
+    parser.add_argument(
+        "--hold-action-blend-alpha",
+        type=float,
+        default=1.0,
+        help=(
+            "Blend factor for new policy actions during phase 5. "
+            "1.0 disables smoothing; smaller values retain more of the previous command."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=2707)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -337,6 +346,7 @@ def run_episode(
     hold_latched = False
     phase_history = []
     phase_transitions = []
+    previous_action = initial_targets[LOWER_BODY_JOINTS:].copy()
     started = time.perf_counter()
 
     for frame in range(control_frames):
@@ -396,6 +406,10 @@ def run_episode(
         action = np.clip(raw_action, upper_lower, upper_upper)
         action_clip_values += int(np.count_nonzero(np.abs(action - raw_action) > 1e-8))
         action_values += action.size
+        if scheduler_phase == 5 and args.hold_action_blend_alpha < 1.0:
+            alpha = args.hold_action_blend_alpha
+            action = previous_action + alpha * (action - previous_action)
+        previous_action = action.copy()
         targets = initial_targets.copy()
         targets[LOWER_BODY_JOINTS:] = action
 
@@ -491,6 +505,7 @@ def run_episode(
         "tote_x_m": float(episode["tote_x_m"]),
         "control_fps": args.control_fps,
         "replan_steps": args.replan_steps,
+        "hold_action_blend_alpha": args.hold_action_blend_alpha,
         "action_chunk_size": int(policy.config.chunk_size),
         "assisted_grasp_activation_distance_m": args.assist_distance_m,
         "assisted_grasp_activated": assist_activation_s is not None,
@@ -503,6 +518,9 @@ def run_episode(
         "bilateral_hand_contact_seen": bilateral_seen,
         "final_table_contact": final_table_contact,
         "action_clip_fraction": action_clip_values / action_values,
+        "action_delta_rmse_rad": float(
+            np.sqrt(np.mean(np.diff(np.asarray(commands), axis=0) ** 2))
+        ),
         "joint_limit_violation_fraction": joint_limit_violations / joint_samples,
         "actuator_saturation_fraction": saturated_samples / actuator_samples,
         "mean_inference_s": float(np.mean(inference_times)),
@@ -560,6 +578,26 @@ def aggregate(reports: list[dict]) -> dict:
         "mean_action_clip_fraction": float(
             np.mean([report["action_clip_fraction"] for report in reports])
         ),
+        "mean_action_delta_rmse_rad": float(
+            np.mean([report["action_delta_rmse_rad"] for report in reports])
+        ),
+        "mean_final_tote_linear_speed_m_s": float(
+            np.mean([report["final_tote_linear_speed_m_s"] for report in reports])
+        ),
+        "mean_maximum_abs_waist_pitch_rad": float(
+            np.mean([report["maximum_abs_waist_pitch_rad"] for report in reports])
+        ),
+        "mean_joint_limit_violation_fraction": float(
+            np.mean([report["joint_limit_violation_fraction"] for report in reports])
+        ),
+        "mean_actuator_saturation_fraction": float(
+            np.mean([report["actuator_saturation_fraction"] for report in reports])
+        ),
+        "functional_final_lift_rate": sum(
+            report["tote_lift_height_m"] >= report["required_lift_height_m"]
+            for report in reports
+        )
+        / len(reports),
         "mean_inference_s": float(
             np.mean([report["mean_inference_s"] for report in reports])
         ),
@@ -572,6 +610,8 @@ def main() -> None:
         raise ValueError("episodes, control-fps, and replan-steps must be positive")
     if args.align_distance_m <= args.assist_distance_m:
         raise ValueError("align-distance-m must be larger than assist-distance-m")
+    if not 0.0 < args.hold_action_blend_alpha <= 1.0:
+        raise ValueError("hold-action-blend-alpha must be in (0, 1]")
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     source = json.loads(args.source_summary.read_text(encoding="utf-8"))
     episodes = source["episodes"][
@@ -613,6 +653,7 @@ def main() -> None:
         "control_fps": args.control_fps,
         "replan_steps": args.replan_steps,
         "phase_language_scheduler": args.phase_language_scheduler,
+        "hold_action_blend_alpha": args.hold_action_blend_alpha,
         "executed_chunk_duration_s": args.replan_steps / args.control_fps,
         "policies": {
             name: {"aggregate": aggregate(reports), "episodes": reports}
