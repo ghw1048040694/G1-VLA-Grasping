@@ -659,3 +659,21 @@ testing whether more frequent feedback prevents the lift-and-return behavior.
 ```bash
 set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_28.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-28.log
 ```
+
+G1WH-28 remains at 0/4 final success. All four episodes now cross the 0.10 m
+height threshold, but action-delta RMSE rises by 39.15%, mean action jumps rise
+by 48.33%, and the tote is not held. More frequent stochastic replanning adds
+oscillation rather than solving task progress.
+
+## G1WH-29 Phase-Conditioned Language Fine-Tuning
+
+G1WH-29 keeps the same images, joint states, actions, source episodes, and
+train/val split, but changes the language target from one episode-level
+instruction to six phase-specific instructions: ready, approach, align, close,
+lift, and hold. Each source episode is split at phase boundaries so a 50-step
+action chunk cannot mix commands. It rebuilds the data contract and trains a
+new SmolVLA baseline for 1,000 steps.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_29.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-29.log
+```

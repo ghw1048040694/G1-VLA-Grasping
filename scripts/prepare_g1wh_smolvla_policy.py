@@ -16,6 +16,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-repo-id", required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--experiment-id", default="G1WH-25-smolvla-upper-body-finetune"
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -71,7 +74,7 @@ def main() -> None:
     os.symlink((source / "model.safetensors").resolve(), output / "model.safetensors")
 
     report = {
-        "experiment": "G1WH-25-smolvla-upper-body-finetune",
+        "experiment": args.experiment_id,
         "source_policy": str(source),
         "weights_reused_without_modification": True,
         "processors_managed_by_training_stack": True,
