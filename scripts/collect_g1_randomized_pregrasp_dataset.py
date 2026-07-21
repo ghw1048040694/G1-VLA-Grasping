@@ -46,20 +46,25 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2107)
+    parser.add_argument("--tote-x-min", type=float, default=0.52)
+    parser.add_argument("--tote-x-max", type=float, default=0.58)
+    parser.add_argument("--experiment-id", default="G1WH-21-randomized-expert-dataset")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
     episodes = []
     for episode_index in range(args.episodes):
-        tote_x = float(rng.uniform(0.52, 0.58))
+        tote_x = float(rng.uniform(args.tote_x_min, args.tote_x_max))
         tote_y = 0.0
         instruction = INSTRUCTIONS[episode_index % len(INSTRUCTIONS)]
         episode_dir = args.output_dir / f"episode_{episode_index:04d}"
         episode_dir.mkdir(parents=True, exist_ok=True)
         scene_path = episode_dir / "scene.xml"
         build_scene(args.asset.resolve(), scene_path, tote_x, tote_y)
-        subprocess.run(
+        episode_summary_path = episode_dir / "safe_reset_expert_summary.json"
+        episode_summary_path.unlink(missing_ok=True)
+        result = subprocess.run(
             [
                 str(args.python),
                 str(args.collector),
@@ -80,17 +85,23 @@ def main() -> None:
                 "--pregrasp-clearance-m",
                 "0.16",
             ],
-            check=True,
+            check=False,
             env={**os.environ, "MUJOCO_GL": "egl"},
         )
-        summary = json.loads((episode_dir / "safe_reset_expert_summary.json").read_text())
+        summary = (
+            json.loads(episode_summary_path.read_text())
+            if result.returncode == 0 and episode_summary_path.exists()
+            else None
+        )
+        success = bool(summary and summary["experiment_passed"])
         episodes.append(
             {
                 "episode_index": episode_index,
                 "tote_x_m": tote_x,
                 "tote_y_m": tote_y,
                 "language_instruction": instruction,
-                "success": bool(summary["experiment_passed"]),
+                "success": success,
+                "failure_reason": None if success else f"collector_exit_code_{result.returncode}",
                 "episode_dir": str(episode_dir),
                 "dataset": str(episode_dir / "expert_episode.npz"),
             }
@@ -102,12 +113,12 @@ def main() -> None:
         "".join(json.dumps(episode) + "\n" for episode in successful), encoding="utf-8"
     )
     summary = {
-        "experiment": "G1WH-21-randomized-expert-dataset",
+        "experiment": args.experiment_id,
         "seed": args.seed,
         "requested_episodes": args.episodes,
         "successful_episodes": len(successful),
         "success_rate": len(successful) / args.episodes,
-        "tote_x_range_m": [0.52, 0.58],
+        "tote_x_range_m": [args.tote_x_min, args.tote_x_max],
         "tote_y_range_m": [0.0, 0.0],
         "language_variants": list(INSTRUCTIONS),
         "episodes": episodes,

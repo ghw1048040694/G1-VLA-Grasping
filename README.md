@@ -501,3 +501,17 @@ randomization remains disabled until a collision-aware path is available.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_21.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-21.log
 ```
+
+The first G1WH-21 run stops after three successful episodes because episode 3
+samples x=0.57145 m, where the 16 cm clearance target has 41.02 mm position
+error and 0.351 rad orientation error. This is outside the reachable contract.
+
+## G1WH-21R Bounded Randomized Expert Dataset
+
+G1WH-21R preserves the failed G1WH-21 output, narrows tote depth to the verified
+0.52-0.55 m interval, and records individual collection failures without
+aborting the remaining episodes.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_21r.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-21R.log
+```
