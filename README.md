@@ -745,3 +745,35 @@ The target is at least 3/4 episodes at or above 0.10 m final lift while keeping
 mean final speed below 0.10 m/s. Strict task success still requires each episode
 to finish below 0.05 m/s with waist pitch at most 0.11 rad and zero joint-limit
 violations.
+
+G1WH-32 is retained as a reproducible proposal but paused before formal
+execution. After G1WH-31 exposed a height/speed tradeoff, the project stops
+micro-tuning controller blend factors and moves to policy-state recovery data.
+
+## G1WH-33 Policy-State Expert Recovery Dataset
+
+G1WH-33 performs DAgger-style data aggregation. The selected step-500 SmolVLA
+policy runs from each of the 16 training initial conditions with two noise
+seeds. After the policy enters the hold phase, it remains in control for 0.67 s
+so that its actual closed-loop failure state develops. The expert then blends
+from the visited joint state to the verified hold target over 2.0 s. Only this
+expert recovery segment is recorded for training.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_33.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-33.log
+```
+
+The formal contract is 32/32 accepted recovery episodes with synchronized
+head, left-wrist, and right-wrist videos, 43-joint states, expert targets, and
+recovery metadata. Source episodes 16-19 remain untouched held-out validation
+conditions. Data acceptance requires final lift at least 0.10 m, speed below
+0.05 m/s, waist pitch at most 0.11 rad, and zero non-hand joint violations.
+Strict all-joint success is reported separately because the assisted grasp can
+trap the two thumb joints outside their limits in policy-visited failure states.
+
+A one-episode development run passes the recovery-data contract. At expert
+takeover, the tote has fallen to 0.0483 m lift and is moving at 0.2738 m/s. The
+expert recovers it to 0.1263 m and 0.00047 m/s, with safe waist and arm joints.
+All three dataset videos contain exactly the same 64 frames as the state/action
+arrays. The two constrained thumbs remain visible as 4.65% all-joint violation
+and saturation rates, so the development run does not claim strict task success.
