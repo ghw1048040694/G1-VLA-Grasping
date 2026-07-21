@@ -557,3 +557,20 @@ bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_23.sh 2>&1 | tee /home/ubuntu/G1
 The collection passes only when all 20 episodes satisfy the same physical and
 semantic thresholds as G1WH-22. A two-episode development smoke test passed
 2/2, with 152 frames and all six task phases present in each episode.
+
+The formal G1WH-23 run passes 16/20 episodes and therefore fails the full
+dataset contract. All four failures occur at tote depths from 0.4551 to 0.4590
+m and are caused only by maximum waist pitch exceeding 0.11 rad. Every episode
+still passes lift, bilateral contact, table clearance, joint-limit, and
+actuator-saturation checks. This identifies the upper sampling boundary rather
+than a grasp-controller failure.
+
+## G1WH-23R Bounded Assisted-Lift Dataset
+
+G1WH-23R preserves G1WH-23 and changes only the tote-depth range from
+0.43-0.46 m to 0.43-0.45 m. The controller, seed, episode count, language
+variants, recording format, and acceptance thresholds remain fixed.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_23r.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-23R.log
+```

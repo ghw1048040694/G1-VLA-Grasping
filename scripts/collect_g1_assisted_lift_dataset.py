@@ -28,15 +28,22 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2207)
+    parser.add_argument("--tote-x-min", type=float, default=0.43)
+    parser.add_argument("--tote-x-max", type=float, default=0.46)
+    parser.add_argument(
+        "--experiment-id", default="G1WH-23-randomized-assisted-lift-dataset"
+    )
     args = parser.parse_args()
     if args.episodes < 1:
         parser.error("--episodes must be at least 1")
+    if args.tote_x_min >= args.tote_x_max:
+        parser.error("--tote-x-min must be smaller than --tote-x-max")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     episodes = []
 
     for episode_index in range(args.episodes):
-        tote_x = float(rng.uniform(0.43, 0.46))
+        tote_x = float(rng.uniform(args.tote_x_min, args.tote_x_max))
         instruction = INSTRUCTIONS[episode_index % len(INSTRUCTIONS)]
         episode_dir = args.output_dir / f"episode_{episode_index:04d}"
         episode_dir.mkdir(parents=True, exist_ok=True)
@@ -97,12 +104,12 @@ def main() -> None:
         "".join(json.dumps(item) + "\n" for item in successful), encoding="utf-8"
     )
     summary = {
-        "experiment": "G1WH-23-randomized-assisted-lift-dataset",
+        "experiment": args.experiment_id,
         "seed": args.seed,
         "requested_episodes": args.episodes,
         "successful_episodes": len(successful),
         "success_rate": len(successful) / args.episodes,
-        "tote_x_range_m": [0.43, 0.46],
+        "tote_x_range_m": [args.tote_x_min, args.tote_x_max],
         "language_variants": list(INSTRUCTIONS),
         "episodes": episodes,
         "successful_manifest": str(manifest_path),
