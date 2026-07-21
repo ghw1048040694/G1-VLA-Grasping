@@ -608,3 +608,20 @@ expert is trained; this is partial-parameter fine-tuning rather than LoRA.
 ```bash
 set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_25.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-25.log
 ```
+
+G1WH-25 completes all 1,000 updates. Mean logged loss falls from 2.6847 over
+the first 100 steps to 0.1251 over the last 100 steps, a 95.34% reduction.
+Mean gradient norm falls from 13.98 to 2.37, all values remain finite, and both
+step-500 and step-1000 checkpoints are complete. This proves training-set fit,
+not held-out action accuracy or closed-loop task success.
+
+## G1WH-26 Held-Out Action Evaluation
+
+G1WH-26 evaluates the adapted untrained base, step-500, and step-1000 policies
+on the same 128 samples from four held-out episodes with identical inference
+noise. It reports action-chunk and first-action RMSE in joint radians overall
+and separately for waist, left/right arms, and left/right hands.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_26.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-26.log
+```
