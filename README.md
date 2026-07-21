@@ -625,3 +625,21 @@ and separately for waist, left/right arms, and left/right hands.
 ```bash
 set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_26.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-26.log
 ```
+
+G1WH-26 passes the offline generalization screen. Relative to the untrained
+adapted base, step 500 reduces held-out action-chunk RMSE by 56.61% and first
+action RMSE by 61.38%. Step 1000 reduces chunk RMSE by 61.33%, but its first
+action RMSE is 17.04% higher than step 500. Both checkpoints generalize, while
+the best checkpoint now depends on closed-loop execution.
+
+## G1WH-27 Closed-Loop SmolVLA Validation
+
+G1WH-27 runs step 500 and step 1000 in MuJoCo on the four held-out initial
+conditions. The policy observes three live cameras and the current 31-joint
+state, predicts a 50-action chunk, executes five actions at 15 Hz, and replans.
+It records eight videos and reports grasp activation, lift height, contacts,
+safety metrics, and task success.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_27.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-27.log
+```
