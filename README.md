@@ -574,3 +574,20 @@ variants, recording format, and acceptance thresholds remain fixed.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_23r.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-23R.log
 ```
+
+The formal G1WH-23R run passes 20/20 episodes. Every episode contains 152
+frames, all six task phases, and three camera streams. Maximum waist pitch is
+0.10686 rad at the farthest sampled tote position, while all episodes retain
+zero joint-limit violation and less than 0.1% actuator saturation.
+
+## G1WH-24 LeRobot VLA Dataset Contract
+
+G1WH-24 converts the passing assisted-lift trajectories into local LeRobot
+datasets. Episodes 0-15 form the training split and episodes 16-19 form a held-
+out validation split. The 12 fixed lower-body dimensions are removed, leaving
+31 independently controlled waist, arm, and hand dimensions plus three camera
+streams and the natural-language task string.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_24.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-24.log
+```
