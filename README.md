@@ -721,3 +721,27 @@ toward the strict `<0.05 m/s` limit while at least 3/4 episodes retain a final
 lift of 0.10 m. Action-delta RMSE should fall below the 0.0628 rad baseline.
 Waist pitch and joint-limit violations remain safety guardrails rather than the
 variable changed in this ablation.
+
+G1WH-31 reduces mean final tote speed from 0.2186 to 0.0918 m/s and action-delta
+RMSE from 0.0628 to 0.0436 rad. Mean maximum waist pitch also falls from 0.1400
+to 0.1186 rad. The filter is too strong for task retention, however: functional
+final lift falls from 3/4 to 1/4 episodes and mean final lift falls from 0.1017
+to 0.0858 m. Strict success remains 0/4. Alpha 0.20 is therefore rejected as a
+final controller setting, while the speed reduction validates hold smoothing
+as a useful direction.
+
+## G1WH-32 Moderate Hold-Phase Action Smoothing
+
+G1WH-32 changes only the hold-stage blend factor from 0.20 to 0.40. The new
+command therefore uses 40% of the current policy output and 60% of the previous
+command. This tests an intermediate point between G1WH-30's unsmoothed alpha
+1.00 and G1WH-31's over-smoothed alpha 0.20.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_32.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-32.log
+```
+
+The target is at least 3/4 episodes at or above 0.10 m final lift while keeping
+mean final speed below 0.10 m/s. Strict task success still requires each episode
+to finish below 0.05 m/s with waist pitch at most 0.11 rad and zero joint-limit
+violations.
