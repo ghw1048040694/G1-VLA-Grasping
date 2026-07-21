@@ -534,3 +534,26 @@ must later be removed in a physical-grasp control experiment.
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_22.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-22.log
 ```
+
+The formal run passes both the numerical and video-reviewed task contracts. The
+tote is lifted 0.12185 m, final tote speed is 0.00303 m/s, maximum absolute
+waist pitch is 0.10770 rad, bilateral hand contact is observed, final table
+contact is false, joint-limit violation is zero, and actuator saturation is
+0.091%. This remains an assisted-grasp baseline, not a pure friction grasp.
+
+## G1WH-23 Randomized Assisted-Lift Dataset
+
+G1WH-23 turns the validated G1WH-22 task into 20 reproducible expert episodes.
+It randomizes tote depth from 0.43 to 0.46 m, cycles four equivalent language
+instructions, and records 43-joint observations, expert joint targets, task
+phase audit labels, and head/left-wrist/right-wrist videos at 320x240 and 15
+FPS. Task phase and assisted-constraint state are audit fields rather than
+policy inputs.
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_23.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-23.log
+```
+
+The collection passes only when all 20 episodes satisfy the same physical and
+semantic thresholds as G1WH-22. A two-episode development smoke test passed
+2/2, with 152 frames and all six task phases present in each episode.

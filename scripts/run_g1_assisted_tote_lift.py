@@ -26,7 +26,6 @@ from validate_g1_bimanual_actuation import (
 PALM_NAMES = ("left_palm_center", "right_palm_center")
 TOTE_SITE_NAMES = ("tote_left_assist_site", "tote_right_assist_site")
 HOME_POSITIONS_M = np.array(((0.22, 0.32, 1.00), (0.22, -0.32, 1.00)))
-TOTE_X_M = 0.45
 PREGRASP_CLEARANCE_M = 0.06
 LIFT_HEIGHT_M = 0.18
 WAIST_PITCH_LIMIT_RAD = 0.10
@@ -41,7 +40,7 @@ def object_name(model: mujoco.MjModel, kind: mujoco.mjtObj, index: int) -> str:
     return mujoco.mj_id2name(model, kind, index) or f"unnamed_{index}"
 
 
-def build_scene(source: Path, destination: Path) -> None:
+def build_scene(source: Path, destination: Path, tote_x_m: float) -> None:
     tree = ET.parse(source)
     root = tree.getroot()
     tote = root.find(".//body[@name='warehouse_tote']")
@@ -51,8 +50,8 @@ def build_scene(source: Path, destination: Path) -> None:
         raise RuntimeError("Source scene is missing tote, table, or equality section")
     tote_pos = [float(value) for value in tote.get("pos", "").split()]
     table_pos = [float(value) for value in table.get("pos", "").split()]
-    tote_pos[0] = TOTE_X_M
-    table_pos[0] = TOTE_X_M + 0.15
+    tote_pos[0] = tote_x_m
+    table_pos[0] = tote_x_m + 0.15
     tote.set("pos", " ".join(str(value) for value in tote_pos))
     table.set("pos", " ".join(str(value) for value in table_pos))
     ET.SubElement(
@@ -99,10 +98,17 @@ def main() -> None:
     parser.add_argument("--asset", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--render-width", type=int, default=640)
+    parser.add_argument("--render-height", type=int, default=480)
+    parser.add_argument("--tote-x", type=float, default=0.45)
+    parser.add_argument("--record-demonstration", action="store_true")
+    parser.add_argument(
+        "--language-instruction", default="lift the blue tote with both hands"
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     scene_path = args.output_dir / "g1_assisted_tote_lift.xml"
-    build_scene(args.asset.resolve(), scene_path)
+    build_scene(args.asset.resolve(), scene_path, args.tote_x)
 
     model = mujoco.MjModel.from_xml_path(str(scene_path))
     apply_regularized_dynamics(model)
@@ -250,7 +256,9 @@ def main() -> None:
         for item in ("left_assisted_grasp", "right_assisted_grasp")
     ]
 
-    renderer = mujoco.Renderer(model, height=480, width=640)
+    renderer = mujoco.Renderer(
+        model, height=args.render_height, width=args.render_width
+    )
     camera = mujoco.MjvCamera()
     camera.lookat[:] = (0.42, 0.0, 0.95)
     camera.distance = 2.25
@@ -258,6 +266,23 @@ def main() -> None:
     camera.elevation = -8
     video_path = args.output_dir / "assisted_tote_lift.mp4"
     writer = imageio.get_writer(video_path, fps=args.video_fps, codec="libx264", quality=8)
+    task_camera_names = ("head_camera", "left_wrist_camera", "right_wrist_camera")
+    task_camera_writers = {}
+    if args.record_demonstration:
+        for camera_name in task_camera_names:
+            task_camera_writers[camera_name] = imageio.get_writer(
+                args.output_dir / f"{camera_name}.mp4",
+                fps=args.video_fps,
+                codec="libx264",
+                quality=8,
+            )
+    controlled_names = tuple(controlled)
+    demonstration_times = []
+    demonstration_qpos = []
+    demonstration_qvel = []
+    demonstration_actions = []
+    demonstration_phases = []
+    demonstration_assist_active = []
 
     dt = float(model.opt.timestep)
     total_time = 10.0
@@ -278,19 +303,25 @@ def main() -> None:
         time_s = step * dt
         if time_s < 0.5:
             selected_target = home_pose
+            task_phase = 0
         elif time_s < 2.5:
             alpha = smoothstep((time_s - 0.5) / 2.0)
             selected_target = (1.0 - alpha) * home_pose + alpha * pregrasp_pose
+            task_phase = 1
         elif time_s < 4.0:
             alpha = smoothstep((time_s - 2.5) / 1.5)
             selected_target = (1.0 - alpha) * pregrasp_pose + alpha * grasp_pose
+            task_phase = 2
         elif time_s < 4.8:
             selected_target = grasp_pose
+            task_phase = 3
         elif time_s < 7.8:
             alpha = smoothstep((time_s - 4.8) / 3.0)
             selected_target = (1.0 - alpha) * grasp_pose + alpha * lift_pose
+            task_phase = 4
         else:
             selected_target = lift_pose
+            task_phase = 5
 
         if time_s >= 4.0:
             for equality_id in assisted_ids:
@@ -366,8 +397,26 @@ def main() -> None:
         if step % render_interval == 0:
             renderer.update_scene(data, camera=camera)
             writer.append_data(renderer.render())
+            if args.record_demonstration:
+                demonstration_times.append(time_s)
+                demonstration_qpos.append(
+                    [float(data.qpos[controlled[name]["qpos_id"]]) for name in controlled_names]
+                )
+                demonstration_qvel.append(
+                    [float(data.qvel[controlled[name]["qvel_id"]]) for name in controlled_names]
+                )
+                demonstration_actions.append(
+                    [float(commanded_targets[name]) for name in controlled_names]
+                )
+                demonstration_phases.append(task_phase)
+                demonstration_assist_active.append(int(time_s >= 4.0))
+                for camera_name, camera_writer in task_camera_writers.items():
+                    renderer.update_scene(data, camera=camera_name)
+                    camera_writer.append_data(renderer.render())
 
     writer.close()
+    for camera_writer in task_camera_writers.values():
+        camera_writer.close()
     renderer.close()
     mujoco.mj_forward(model, data)
     final_tote_z = float(data.site_xpos[tote_site_ids[0], 2])
@@ -378,7 +427,7 @@ def main() -> None:
         "experiment": "G1WH-22-assisted-bimanual-tote-lift",
         "task_semantics": "approach, bilateral contact, close hands, lift tote, hold",
         "assisted_grasp_constraint": True,
-        "tote_x_m": TOTE_X_M,
+        "tote_x_m": args.tote_x,
         "waist_pitch_limit_rad": WAIST_PITCH_LIMIT_RAD,
         "pose_reports": pose_reports,
         "tote_lift_height_m": tote_lift_height,
@@ -417,6 +466,34 @@ def main() -> None:
         and report["actuator_saturation_fraction"] < 0.05
         and report["assisted_constraints_active"]
     )
+    if args.record_demonstration:
+        dataset_path = args.output_dir / "expert_lift_episode.npz"
+        np.savez_compressed(
+            dataset_path,
+            timestamp_s=np.asarray(demonstration_times, dtype=np.float32),
+            joint_names=np.asarray(controlled_names),
+            observation_joint_position_rad=np.asarray(demonstration_qpos, dtype=np.float32),
+            observation_joint_velocity_rad_s=np.asarray(demonstration_qvel, dtype=np.float32),
+            action_joint_position_rad=np.asarray(demonstration_actions, dtype=np.float32),
+            task_phase=np.asarray(demonstration_phases, dtype=np.int64),
+            assisted_grasp_active=np.asarray(demonstration_assist_active, dtype=np.int8),
+        )
+        metadata = {
+            "task": "assisted_bimanual_tote_lift",
+            "language_instruction": args.language_instruction,
+            "episode_success": report["passed"],
+            "assisted_grasp_constraint": True,
+            "frames": len(demonstration_times),
+            "fps": args.video_fps,
+            "image_width": args.render_width,
+            "image_height": args.render_height,
+            "joint_count": len(controlled_names),
+            "task_cameras": list(task_camera_names),
+            "dataset": str(dataset_path),
+        }
+        (args.output_dir / "episode_metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
     report_path = args.output_dir / "assisted_tote_lift_summary.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
