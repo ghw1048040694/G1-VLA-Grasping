@@ -677,3 +677,20 @@ new SmolVLA baseline for 1,000 steps.
 ```bash
 set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_29.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-29.log
 ```
+
+G1WH-29 passes its data and training contracts: 96 train phase episodes contain
+2,432 frames, 24 validation phase episodes contain 608 frames, and both expose
+six phase instructions. Mean loss falls from 3.0226 in the first 100 steps to
+0.1079 in the last 100 steps, a 96.43% reduction, with finite gradients and
+complete step-500 and step-1000 checkpoints.
+
+## G1WH-30 Phase-Language Closed-Loop Validation
+
+G1WH-30 evaluates both G1WH-29 checkpoints with a monotonic language scheduler.
+It advances from ready to approach, align, close, lift, and hold based on hand
+distance, grasp activation, and tote height. Once the tote crosses 0.10 m, the
+hold instruction is latched for the remainder of the episode.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_30.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-30.log
+```

@@ -43,6 +43,14 @@ TASK_CAMERAS = {
     "observation.images.left_wrist": "left_wrist_camera",
     "observation.images.right_wrist": "right_wrist_camera",
 }
+PHASE_INSTRUCTIONS = {
+    0: "keep both hands at the ready pose",
+    1: "move both hands toward the blue tote",
+    2: "align both hands with the sides of the blue tote",
+    3: "close both hands around the blue tote",
+    4: "lift the blue tote upward with both hands",
+    5: "hold the blue tote steady in the air",
+}
 LOWER_BODY_JOINTS = 12
 
 
@@ -68,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replan-steps", type=int, default=5)
     parser.add_argument("--duration-s", type=float, default=10.0)
     parser.add_argument("--assist-distance-m", type=float, default=0.08)
+    parser.add_argument("--align-distance-m", type=float, default=0.12)
+    parser.add_argument("--phase-language-scheduler", action="store_true")
     parser.add_argument("--seed", type=int, default=2707)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -233,7 +243,7 @@ def run_episode(
     device: str,
 ) -> dict:
     episode_index = int(episode["episode_index"])
-    task = episode["language_instruction"]
+    episode_instruction = episode["language_instruction"]
     output_dir = args.output_dir / policy_name / f"episode_{episode_index:04d}"
     output_dir.mkdir(parents=True, exist_ok=True)
     scene_path = output_dir / "scene.xml"
@@ -323,6 +333,10 @@ def run_episode(
     commands = []
     tote_heights = []
     inference_times = []
+    scheduler_phase = 0
+    hold_latched = False
+    phase_history = []
+    phase_transitions = []
     started = time.perf_counter()
 
     for frame in range(control_frames):
@@ -331,6 +345,35 @@ def run_episode(
         )
         chunk_index = frame % args.replan_steps
         if chunk_index == 0:
+            if args.phase_language_scheduler:
+                distances = [
+                    np.linalg.norm(data.site_xpos[palm] - data.site_xpos[tote])
+                    for palm, tote in zip(palm_ids, tote_site_ids, strict=True)
+                ]
+                if data.time >= 0.5 and scheduler_phase == 0:
+                    scheduler_phase = 1
+                if scheduler_phase in (1, 2):
+                    if max(distances) <= args.assist_distance_m:
+                        scheduler_phase = 3
+                    elif max(distances) <= args.align_distance_m:
+                        scheduler_phase = max(scheduler_phase, 2)
+                if assist_activation_s is not None:
+                    scheduler_phase = max(scheduler_phase, 4)
+                current_lift = float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z
+                if hold_latched or current_lift >= 0.10:
+                    hold_latched = True
+                    scheduler_phase = 5
+                task = PHASE_INSTRUCTIONS[scheduler_phase]
+                transition = {
+                    "frame": frame,
+                    "time_s": float(data.time),
+                    "phase": scheduler_phase,
+                    "task": task,
+                }
+                if not phase_transitions or phase_transitions[-1]["phase"] != scheduler_phase:
+                    phase_transitions.append(transition)
+            else:
+                task = episode_instruction
             batch = render_observation(task_renderer, data, upper_state, task, device)
             inference_started = time.perf_counter()
             current_chunk = (
@@ -362,7 +405,10 @@ def run_episode(
                     np.linalg.norm(data.site_xpos[palm] - data.site_xpos[tote])
                     for palm, tote in zip(palm_ids, tote_site_ids, strict=True)
                 ]
-                if max(distances) <= args.assist_distance_m:
+                phase_allows_assist = (
+                    not args.phase_language_scheduler or scheduler_phase >= 3
+                )
+                if phase_allows_assist and max(distances) <= args.assist_distance_m:
                     for equality_id in assisted_ids:
                         data.eq_active[equality_id] = 1
                     assist_activation_s = float(data.time)
@@ -377,6 +423,11 @@ def run_episode(
                 torque += float(data.qfrc_bias[item["qvel_id"]])
                 data.ctrl[item["actuator_id"]] = torque
             mujoco.mj_step(model, data)
+            if (
+                args.phase_language_scheduler
+                and float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z >= 0.10
+            ):
+                hold_latched = True
 
             for name, item in controlled.items():
                 joint_id = item["joint_id"]
@@ -411,6 +462,7 @@ def run_episode(
         states.append(upper_state.astype(np.float32))
         commands.append(action.astype(np.float32))
         tote_heights.append(float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z)
+        phase_history.append(scheduler_phase if args.phase_language_scheduler else -1)
 
     writer.close()
     task_renderer.close()
@@ -425,7 +477,17 @@ def run_episode(
         "policy": policy_name,
         "checkpoint": str(policy.config.pretrained_path),
         "source_episode": episode_index,
-        "task": task,
+        "episode_instruction": episode_instruction,
+        "task_mode": (
+            "phase_language_scheduler"
+            if args.phase_language_scheduler
+            else "episode_instruction"
+        ),
+        "phase_transitions": phase_transitions,
+        "phase_frame_counts": {
+            str(phase): phase_history.count(phase)
+            for phase in sorted(set(phase_history))
+        },
         "tote_x_m": float(episode["tote_x_m"]),
         "control_fps": args.control_fps,
         "replan_steps": args.replan_steps,
@@ -463,6 +525,7 @@ def run_episode(
         observation_joint_position_rad=np.asarray(states),
         action_joint_position_rad=np.asarray(commands),
         tote_lift_height_m=np.asarray(tote_heights, dtype=np.float32),
+        scheduled_phase=np.asarray(phase_history, dtype=np.int64),
     )
     (output_dir / "summary.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
@@ -507,6 +570,8 @@ def main() -> None:
     args = parse_args()
     if args.episodes < 1 or args.control_fps < 1 or args.replan_steps < 1:
         raise ValueError("episodes, control-fps, and replan-steps must be positive")
+    if args.align_distance_m <= args.assist_distance_m:
+        raise ValueError("align-distance-m must be larger than assist-distance-m")
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     source = json.loads(args.source_summary.read_text(encoding="utf-8"))
     episodes = source["episodes"][
@@ -547,6 +612,7 @@ def main() -> None:
         "validation_source_episodes": [item["episode_index"] for item in episodes],
         "control_fps": args.control_fps,
         "replan_steps": args.replan_steps,
+        "phase_language_scheduler": args.phase_language_scheduler,
         "executed_chunk_duration_s": args.replan_steps / args.control_fps,
         "policies": {
             name: {"aggregate": aggregate(reports), "episodes": reports}
