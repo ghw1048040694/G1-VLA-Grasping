@@ -9,6 +9,12 @@ import os
 import shutil
 from pathlib import Path
 
+import torch
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
+
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -19,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--experiment-id", default="G1WH-25-smolvla-upper-body-finetune"
     )
+    parser.add_argument("--refresh-normalization-stats", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -62,21 +69,66 @@ def main() -> None:
         "observation.state": {"type": "STATE", "shape": state_shape},
         **cameras,
     }
-    adapted["output_features"] = {
-        "action": {"type": "ACTION", "shape": action_shape}
-    }
+    adapted["output_features"] = {"action": {"type": "ACTION", "shape": action_shape}}
     adapted["push_to_hub"] = False
     adapted["repo_id"] = None
     output.mkdir(parents=True)
     (output / "config.json").write_text(
         json.dumps(adapted, indent=2) + "\n", encoding="utf-8"
     )
-    os.symlink((source / "model.safetensors").resolve(), output / "model.safetensors")
+    source_weights = (source / "model.safetensors").resolve()
+    normalization_report = None
+    if args.refresh_normalization_stats:
+        tensors = load_file(source_weights, device="cpu")
+        dataset_meta = LeRobotDatasetMetadata(
+            args.dataset_repo_id, root=args.dataset_root
+        )
+        replacements = {
+            "normalize_inputs.buffer_observation_state.mean": (
+                "observation.state",
+                "mean",
+            ),
+            "normalize_inputs.buffer_observation_state.std": (
+                "observation.state",
+                "std",
+            ),
+            "normalize_targets.buffer_action.mean": ("action", "mean"),
+            "normalize_targets.buffer_action.std": ("action", "std"),
+            "unnormalize_outputs.buffer_action.mean": ("action", "mean"),
+            "unnormalize_outputs.buffer_action.std": ("action", "std"),
+        }
+        changes = {}
+        for key, (feature, statistic) in replacements.items():
+            if key not in tensors:
+                raise KeyError(f"Source policy is missing normalization tensor: {key}")
+            old = tensors[key]
+            new = torch.as_tensor(
+                dataset_meta.stats[feature][statistic], dtype=old.dtype
+            ).reshape(old.shape)
+            tensors[key] = new
+            changes[key] = {
+                "old_min": float(old.min()),
+                "old_max": float(old.max()),
+                "new_min": float(new.min()),
+                "new_max": float(new.max()),
+            }
+        with safe_open(source_weights, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+        save_file(tensors, output / "model.safetensors", metadata=metadata)
+        normalization_report = {
+            "refreshed_from_dataset": True,
+            "tensor_changes": changes,
+        }
+    else:
+        os.symlink(source_weights, output / "model.safetensors")
 
     report = {
         "experiment": args.experiment_id,
         "source_policy": str(source),
-        "weights_reused_without_modification": True,
+        "network_weights_reused_without_modification": True,
+        "all_serialized_tensors_reused_without_modification": (
+            not args.refresh_normalization_stats
+        ),
         "processors_managed_by_training_stack": True,
         "dataset_repo_id": args.dataset_repo_id,
         "state_dim": state_shape[0],
@@ -86,6 +138,7 @@ def main() -> None:
         "max_action_dim": source_config["max_action_dim"],
         "freeze_vision_encoder": source_config["freeze_vision_encoder"],
         "train_expert_only": source_config["train_expert_only"],
+        "normalization": normalization_report,
     }
     (output / "adaptation_summary.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"

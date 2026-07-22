@@ -812,3 +812,34 @@ G1WH-29 step-500 weights, trains 99.9M of 450.0M parameters, and completes with
 finite loss 0.181 and gradient norm 4.812. Formal G1WH-34 must produce the full
 4,140/608-frame split, finish all 3,000 updates without NaN or Inf, and save all
 three checkpoints. Closed-loop improvement is evaluated separately afterward.
+
+The formal G1WH-34 data conversion passes exactly, but the training run is
+rejected. Although all 3,000 updates and checkpoints complete with finite
+values, mean logged loss is 2,769.69 in the first 100 records and 3,826.04 in
+the last 100; 169/300 records exceed 1,000 and the maximum is 29,656.88.
+Gradient norm reaches 406.36. The run neither converges nor operates on the
+expected scale, so its checkpoints are excluded from closed-loop evaluation.
+
+The root cause is stale normalization serialized in the G1WH-29 checkpoint.
+Original waist yaw/roll action standard deviations are only 4.98e-6 and
+3.03e-6 rad, while the augmented dataset expands them to 1.46e-3 and 2.41e-3
+rad. Reusing the old buffers turns valid recovery targets into normalized values
+of several thousand. Data conversion and recovery labels are not the cause.
+
+## G1WH-34R Normalization-Corrected Recovery Fine-Tuning
+
+G1WH-34R preserves every learned network tensor from the selected G1WH-29
+step-500 policy but replaces six normalization buffers: state mean/std, target
+action mean/std, and output action mean/std. Their new values come from the
+4,140-frame augmented dataset. A new optimizer then repeats the 3,000-update
+fine-tuning run without repeating video conversion.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_34r.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-34R.log
+```
+
+A 20-update test on the full formal dataset yields loss 0.096-1.787 and mostly
+3-9 gradient norms, compared with losses in the hundreds to tens of thousands
+before correction. The formal pass contract is finite training with no return
+to the G1WH-34 outlier scale, a decreasing late loss trend, and complete 1,000,
+2,000, and 3,000-step checkpoints. Closed-loop evaluation remains a later step.
