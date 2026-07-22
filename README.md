@@ -777,3 +777,38 @@ expert recovers it to 0.1263 m and 0.00047 m/s, with safe waist and arm joints.
 All three dataset videos contain exactly the same 64 frames as the state/action
 arrays. The two constrained thumbs remain visible as 4.65% all-joint violation
 and saturation rates, so the development run does not claim strict task success.
+
+The formal collection accepts 27/32 episodes and therefore does not satisfy its
+original all-episodes contract. The five failures are one episode with no
+takeover before the 8 s limit and four late takeovers that leave fewer than 30
+recovery frames. All 27 accepted episodes are frame-synchronized, contain 1,708
+recovery frames, and cover every one of the 16 training initial conditions.
+Across accepted episodes, the expert changes mean tote lift from 0.0780 to
+0.1248 m and mean speed from 0.2829 to 0.00272 m/s. Twelve also pass the strict
+all-joint contract; the remainder retain assisted-contact finger violations.
+The 27 valid episodes are sufficient for the first recovery-training iteration,
+so the project proceeds without rerunning solely to reach 32.
+
+## G1WH-34 Recovery-Augmented SmolVLA Fine-Tuning
+
+G1WH-34 merges the 27 accepted G1WH-33 recoveries into the training split only.
+The resulting contract has 123 train episodes and 4,140 frames: 96 original
+phase episodes plus 27 recovery episodes. The held-out split remains the same
+24 episodes and 608 frames from source episodes 16-19. Recovery adds a seventh
+language task, `stabilize and hold the blue tote steady in the air`.
+
+The run initializes from the selected G1WH-29 step-500 weights, creates a new
+optimizer and learning-rate schedule, and trains the 100M learnable action-side
+parameters for 3,000 updates. This is continued fine-tuning, not a training
+state resume. Checkpoints are saved at steps 1,000, 2,000, and 3,000.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_34.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-34.log
+```
+
+A conversion smoke test produces seven train tasks without validation leakage,
+and PyAV decodes every endpoint. A real one-update training smoke test loads the
+G1WH-29 step-500 weights, trains 99.9M of 450.0M parameters, and completes with
+finite loss 0.181 and gradient norm 4.812. Formal G1WH-34 must produce the full
+4,140/608-frame split, finish all 3,000 updates without NaN or Inf, and save all
+three checkpoints. Closed-loop improvement is evaluated separately afterward.

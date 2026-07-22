@@ -13,7 +13,6 @@ import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
-
 CAMERAS = {
     "observation.images.head": "head_camera.mp4",
     "observation.images.left_wrist": "left_wrist_camera.mp4",
@@ -33,12 +32,14 @@ PHASE_INSTRUCTIONS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--recovery-root", type=Path)
     parser.add_argument("--train-root", type=Path, required=True)
     parser.add_argument("--val-root", type=Path, required=True)
     parser.add_argument("--train-repo-id", default="local/g1_assisted_lift_train")
     parser.add_argument("--val-repo-id", default="local/g1_assisted_lift_val")
     parser.add_argument("--train-episodes", type=int, default=16)
     parser.add_argument("--episode-limit", type=int)
+    parser.add_argument("--recovery-limit", type=int)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--phase-conditioned-language", action="store_true")
     parser.add_argument("--split-by-phase", action="store_true")
@@ -136,17 +137,21 @@ def convert_split(
         }
         frame_count = len(arrays["timestamp_s"])
         phases = np.asarray(arrays["task_phase"], dtype=np.int64)
+        is_recovery = metadata.get("task") == "assisted_bimanual_tote_hold_recovery"
         if split_by_phase:
             segments = []
-            for phase_id in PHASE_INSTRUCTIONS:
+            available_phases = sorted(set(phases.tolist()))
+            if not is_recovery and available_phases != sorted(PHASE_INSTRUCTIONS):
+                raise ValueError(f"Source phases are incomplete in {episode_dir}")
+            for phase_id in available_phases:
+                if phase_id not in PHASE_INSTRUCTIONS:
+                    raise ValueError(f"Unknown phase {phase_id} in {episode_dir}")
                 indices = np.flatnonzero(phases == phase_id)
                 if len(indices) == 0 or not np.all(np.diff(indices) == 1):
                     raise ValueError(
                         f"Phase {phase_id} is missing or non-contiguous in {episode_dir}"
                     )
-                segments.append(
-                    (int(indices[0]), int(indices[-1]) + 1, phase_id)
-                )
+                segments.append((int(indices[0]), int(indices[-1]) + 1, phase_id))
         else:
             segments = [(0, frame_count, None)]
         try:
@@ -155,7 +160,11 @@ def convert_split(
                 for frame_index in range(start, end):
                     phase_id = int(phases[frame_index])
                     task = (
-                        PHASE_INSTRUCTIONS[phase_id]
+                        (
+                            metadata["language_instruction"]
+                            if is_recovery
+                            else PHASE_INSTRUCTIONS[phase_id]
+                        )
                         if phase_conditioned_language
                         else metadata["language_instruction"]
                     )
@@ -173,7 +182,8 @@ def convert_split(
                             [phase_id], dtype=np.int64
                         ),
                         "complementary_info.assisted_grasp_active": np.array(
-                            [arrays["assisted_grasp_active"][frame_index]], dtype=np.int64
+                            [arrays["assisted_grasp_active"][frame_index]],
+                            dtype=np.int64,
                         ),
                     }
                     for key, reader in readers.items():
@@ -213,7 +223,9 @@ def convert_split(
                 if tuple(image.shape) != (3, 240, 320) or not bool(
                     np.isfinite(image.numpy()).all()
                 ):
-                    raise ValueError(f"PyAV decode failed for {key} at dataset index {index}")
+                    raise ValueError(
+                        f"PyAV decode failed for {key} at dataset index {index}"
+                    )
             decoded_samples += 1
         offset += episode["frames"]
     return {
@@ -257,6 +269,27 @@ def main() -> None:
         raise ValueError("train-episodes must leave at least one validation episode")
     train_dirs = episode_dirs[: args.train_episodes]
     val_dirs = episode_dirs[args.train_episodes :]
+    recovery_dirs = []
+    recovery_summary = None
+    if args.recovery_root is not None:
+        recovery_summary = json.loads(
+            (args.recovery_root / "assisted_lift_dataset_summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        accepted = [
+            item
+            for item in recovery_summary["episodes"]
+            if item.get("recovery_data_accepted", item.get("passed", False))
+        ]
+        if args.recovery_limit is not None:
+            accepted = accepted[: args.recovery_limit]
+        recovery_dirs = [
+            args.recovery_root / f"episode_{item['collection_episode']:04d}"
+            for item in accepted
+        ]
+        if not recovery_dirs:
+            raise ValueError("Recovery root contains no accepted episodes")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report = {
         "experiment": args.experiment_id,
@@ -269,8 +302,19 @@ def main() -> None:
         "phase_instructions": (
             PHASE_INSTRUCTIONS if args.phase_conditioned_language else None
         ),
+        "recovery_source": (
+            {
+                "root": str(args.recovery_root),
+                "experiment": recovery_summary["experiment"],
+                "accepted_episodes": len(recovery_dirs),
+                "instruction": recovery_summary["recovery_instruction"],
+                "validation_contamination": False,
+            }
+            if recovery_summary is not None
+            else None
+        ),
         "train": convert_split(
-            train_dirs,
+            train_dirs + recovery_dirs,
             args.train_repo_id,
             args.train_root,
             args.fps,
@@ -289,8 +333,11 @@ def main() -> None:
         ),
     }
     episodes_per_source = len(PHASE_INSTRUCTIONS) if args.split_by_phase else 1
+    recovery_dataset_episodes = len(recovery_dirs)
+    expected_train_tasks = len(PHASE_INSTRUCTIONS) + int(bool(recovery_dirs))
     report["passed"] = (
-        report["train"]["episodes"] == args.train_episodes * episodes_per_source
+        report["train"]["episodes"]
+        == args.train_episodes * episodes_per_source + recovery_dataset_episodes
         and report["validation"]["episodes"] == len(val_dirs) * episodes_per_source
         and report["train"]["action_dim"] == 31
         and report["validation"]["action_dim"] == 31
@@ -299,7 +346,7 @@ def main() -> None:
         and (
             not args.phase_conditioned_language
             or (
-                report["train"]["tasks"] == len(PHASE_INSTRUCTIONS)
+                report["train"]["tasks"] == expected_train_tasks
                 and report["validation"]["tasks"] == len(PHASE_INSTRUCTIONS)
             )
         )
