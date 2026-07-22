@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run step-500 and step-1000 G1 SmolVLA checkpoints in MuJoCo closed loop."""
+"""Compare one or more G1 SmolVLA checkpoints in MuJoCo closed loop."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -58,8 +59,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--asset", type=Path, required=True)
     parser.add_argument("--source-summary", type=Path, required=True)
-    parser.add_argument("--checkpoint-500", type=Path, required=True)
-    parser.add_argument("--checkpoint-1000", type=Path, required=True)
+    parser.add_argument("--checkpoint-500", type=Path)
+    parser.add_argument("--checkpoint-1000", type=Path)
+    parser.add_argument(
+        "--checkpoint",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="Named checkpoint to evaluate; repeat for three or more policies.",
+    )
     parser.add_argument(
         "--policy-selection",
         choices=("both", "step500", "step1000"),
@@ -91,6 +99,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
+
+
+def checkpoint_specs(args: argparse.Namespace) -> dict[str, Path]:
+    if args.checkpoint:
+        if args.checkpoint_500 or args.checkpoint_1000:
+            raise ValueError(
+                "Use either repeated --checkpoint NAME=PATH or the legacy "
+                "--checkpoint-500/--checkpoint-1000 pair"
+            )
+        if args.policy_selection != "both":
+            raise ValueError("--policy-selection only applies to legacy checkpoints")
+        specs = {}
+        for value in args.checkpoint:
+            if "=" not in value:
+                raise ValueError(f"Checkpoint must use NAME=PATH syntax: {value}")
+            name, raw_path = value.split("=", 1)
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
+                raise ValueError(f"Invalid checkpoint name: {name}")
+            if name in specs:
+                raise ValueError(f"Duplicate checkpoint name: {name}")
+            specs[name] = Path(raw_path)
+        return specs
+
+    if args.checkpoint_500 is None or args.checkpoint_1000 is None:
+        raise ValueError(
+            "Provide repeated --checkpoint NAME=PATH values or both legacy checkpoints"
+        )
+    specs = {
+        "step500": args.checkpoint_500,
+        "step1000": args.checkpoint_1000,
+    }
+    if args.policy_selection != "both":
+        specs = {args.policy_selection: specs[args.policy_selection]}
+    return specs
 
 
 def load_policy(path: Path, train_meta: LeRobotDatasetMetadata, device: str):
@@ -621,12 +663,10 @@ def main() -> None:
         raise ValueError("Requested validation episodes are missing or failed")
     train_meta = LeRobotDatasetMetadata(args.train_repo_id, root=args.train_root)
     expected_upper_names = train_meta.features["action"]["names"]
-    specs = {
-        "step500": args.checkpoint_500,
-        "step1000": args.checkpoint_1000,
-    }
-    if args.policy_selection != "both":
-        specs = {args.policy_selection: specs[args.policy_selection]}
+    specs = checkpoint_specs(args)
+    missing = [str(path) for path in specs.values() if not path.is_dir()]
+    if missing:
+        raise FileNotFoundError(f"Checkpoint directories do not exist: {missing}")
     all_reports = {}
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for policy_name, checkpoint in specs.items():

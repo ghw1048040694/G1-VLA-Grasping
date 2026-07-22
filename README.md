@@ -849,3 +849,29 @@ A 20-update test on the full formal dataset yields loss 0.096-1.787 and mostly
 before correction. The formal pass contract is finite training with no return
 to the G1WH-34 outlier scale, a decreasing late loss trend, and complete 1,000,
 2,000, and 3,000-step checkpoints. Closed-loop evaluation remains a later step.
+
+The formal G1WH-34R run passes its numerical contract. Across the first, middle,
+and final 100 log records, mean loss decreases 0.1425 -> 0.1106 -> 0.0746 and
+mean gradient norm decreases 2.713 -> 1.894 -> 1.475. The overall median and
+90th-percentile losses are 0.096 and 0.176; no logged loss exceeds 2 and no
+gradient norm exceeds 10. All three planned checkpoints are complete. This
+proves that refreshing normalization corrected the failed training pipeline,
+but it does not yet prove closed-loop task improvement.
+
+## G1WH-35 Recovery Checkpoint Closed-Loop Evaluation
+
+G1WH-35 runs the original G1WH-29 step-500 baseline and all three corrected
+recovery checkpoints on the same four held-out episodes, fixed inference noise,
+phase-language scheduler, five-action execution horizon, and unsmoothed hold
+controller. This isolates policy training from controller changes.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_35.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-35.log
+```
+
+The primary target is lower final tote speed than the 0.2186 m/s baseline while
+retaining at least 3/4 functional final lifts above 0.10 m. Any strict success
+is an improvement over the baseline's 0/4; the screening threshold remains
+3/4 strict successes before scaling to 100 episodes. Comparing recovery steps
+1,000, 2,000, and 3,000 determines whether later supervised fitting improves
+recovery or starts to overfit.
