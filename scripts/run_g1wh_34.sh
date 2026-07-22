@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${ALLOW_ARCHIVED_G1WH34:-0}" != "1" ]]; then
+  cat >&2 <<'EOF'
+G1WH-34 is archived because it reused stale normalization statistics.
+Run the corrected experiment instead:
+  set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_34r.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-34R.log
+
+For failure reproduction only, set ALLOW_ARCHIVED_G1WH34=1.
+EOF
+  exit 2
+fi
+
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LEROBOT_ROOT="${LEROBOT_ROOT:-/home/ubuntu/lerobot}"
 PYTHON="${LEROBOT_PYTHON:-/home/ubuntu/miniconda3/envs/lerobot/bin/python}"

@@ -826,6 +826,12 @@ Original waist yaw/roll action standard deviations are only 4.98e-6 and
 rad. Reusing the old buffers turns valid recovery targets into normalized values
 of several thousand. Data conversion and recovery labels are not the cause.
 
+The old runner is archived and now exits unless
+`ALLOW_ARCHIVED_G1WH34=1` is explicitly set for failure reproduction. An
+accidental rerun on 2026-07-22 repeated conversion and policy preparation, then
+stopped before its first training update because the old output directory
+already existed and `resume=False`. No checkpoint was changed by that attempt.
+
 ## G1WH-34R Normalization-Corrected Recovery Fine-Tuning
 
 G1WH-34R preserves every learned network tensor from the selected G1WH-29
