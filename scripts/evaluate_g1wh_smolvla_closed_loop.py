@@ -69,6 +69,13 @@ def parse_args() -> argparse.Namespace:
         help="Named checkpoint to evaluate; repeat for three or more policies.",
     )
     parser.add_argument(
+        "--hybrid",
+        action="append",
+        default=[],
+        metavar="NAME=BASE,HOLD",
+        help="Policy using BASE before phase 5 and HOLD during phase 5.",
+    )
+    parser.add_argument(
         "--policy-selection",
         choices=("both", "step500", "step1000"),
         default="both",
@@ -132,6 +139,26 @@ def checkpoint_specs(args: argparse.Namespace) -> dict[str, Path]:
     }
     if args.policy_selection != "both":
         specs = {args.policy_selection: specs[args.policy_selection]}
+    return specs
+
+
+def hybrid_specs(
+    values: list[str], checkpoints: dict[str, Path]
+) -> dict[str, tuple[str, str]]:
+    specs = {}
+    for value in values:
+        if "=" not in value or "," not in value:
+            raise ValueError(f"Hybrid must use NAME=BASE,HOLD syntax: {value}")
+        name, policy_names = value.split("=", 1)
+        base_name, hold_name = policy_names.split(",", 1)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
+            raise ValueError(f"Invalid hybrid name: {name}")
+        if name in checkpoints or name in specs:
+            raise ValueError(f"Duplicate policy name: {name}")
+        missing = [item for item in (base_name, hold_name) if item not in checkpoints]
+        if missing:
+            raise ValueError(f"Hybrid {name} references unknown policies: {missing}")
+        specs[name] = (base_name, hold_name)
     return specs
 
 
@@ -278,9 +305,9 @@ def contact_state(
         }
         if "warehouse_tote" not in bodies:
             continue
-        bilateral["left"] = any(name.startswith("left_hand_") for name in bodies)
-        bilateral["right"] = any(name.startswith("right_hand_") for name in bodies)
-        table_contact = "world" in bodies
+        bilateral["left"] |= any(name.startswith("left_hand_") for name in bodies)
+        bilateral["right"] |= any(name.startswith("right_hand_") for name in bodies)
+        table_contact |= "world" in bodies
     return bilateral, table_contact
 
 
@@ -292,6 +319,7 @@ def run_episode(
     args: argparse.Namespace,
     expected_upper_names: list[str],
     device: str,
+    hold_policy=None,
 ) -> dict:
     episode_index = int(episode["episode_index"])
     episode_instruction = episode["language_instruction"]
@@ -366,6 +394,8 @@ def run_episode(
     writer = imageio.get_writer(video_path, fps=args.control_fps, codec="libx264", quality=8)
 
     policy.reset()
+    if hold_policy is not None:
+        hold_policy.reset()
     dt = float(model.opt.timestep)
     physics_per_control = max(1, round(1.0 / (args.control_fps * dt)))
     control_frames = round(args.duration_s * args.control_fps)
@@ -428,11 +458,16 @@ def run_episode(
                 task = episode_instruction
             batch = render_observation(task_renderer, data, upper_state, task, device)
             inference_started = time.perf_counter()
+            active_policy = (
+                hold_policy
+                if hold_policy is not None and scheduler_phase == 5
+                else policy
+            )
             current_chunk = (
-                policy.predict_action_chunk(
+                active_policy.predict_action_chunk(
                     batch,
                     noise=seeded_noise(
-                        policy,
+                        active_policy,
                         args.seed + episode_index * 10_000 + frame,
                         device,
                     ),
@@ -532,6 +567,11 @@ def run_episode(
     report = {
         "policy": policy_name,
         "checkpoint": str(policy.config.pretrained_path),
+        "hold_checkpoint": (
+            str(hold_policy.config.pretrained_path)
+            if hold_policy is not None
+            else None
+        ),
         "source_episode": episode_index,
         "episode_instruction": episode_instruction,
         "task_mode": (
@@ -664,6 +704,7 @@ def main() -> None:
     train_meta = LeRobotDatasetMetadata(args.train_repo_id, root=args.train_root)
     expected_upper_names = train_meta.features["action"]["names"]
     specs = checkpoint_specs(args)
+    hybrids = hybrid_specs(args.hybrid, specs)
     missing = [str(path) for path in specs.values() if not path.is_dir()]
     if missing:
         raise FileNotFoundError(f"Checkpoint directories do not exist: {missing}")
@@ -684,6 +725,30 @@ def main() -> None:
             for episode in episodes
         ]
         del policy
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    for policy_name, (base_name, hold_name) in hybrids.items():
+        print(
+            f"Loading {policy_name}: base={specs[base_name]} hold={specs[hold_name]}",
+            flush=True,
+        )
+        base_policy = load_policy(specs[base_name], train_meta, device)
+        hold_policy = load_policy(specs[hold_name], train_meta, device)
+        if not args.phase_language_scheduler:
+            raise ValueError("Hybrid policies require --phase-language-scheduler")
+        all_reports[policy_name] = [
+            run_episode(
+                base_policy,
+                policy_name,
+                episode,
+                args,
+                expected_upper_names,
+                device,
+                hold_policy=hold_policy,
+            )
+            for episode in episodes
+        ]
+        del base_policy, hold_policy
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
     report = {

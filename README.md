@@ -875,3 +875,40 @@ is an improvement over the baseline's 0/4; the screening threshold remains
 3/4 strict successes before scaling to 100 episodes. Comparing recovery steps
 1,000, 2,000, and 3,000 determines whether later supervised fitting improves
 recovery or starts to overfit.
+
+G1WH-35 completes all 16 rollouts, but no policy passes the strict task contract.
+The corrected recovery series improves monotonically from 1,000 to 3,000 steps:
+functional final lift rises 1/4 -> 2/4 -> 3/4 and mean final tote speed falls
+0.1167 -> 0.0758 -> 0.0459 m/s. Recovery step 3,000 therefore matches the
+baseline's 3/4 functional lift rate and reduces final speed by 79.0%. However,
+mean final lift is 8.9% lower, maximum lift is 42.6% lower, reported bilateral
+contact falls from 100% to 50%, and joint-limit violation fraction rises from
+2.55% to 6.13%. It learns stabilization but degrades earlier task stages.
+
+The contact metric also contained an accumulation bug: later tote contacts in
+the same simulation step could overwrite an already detected hand contact.
+The evaluator now accumulates both hand and table contacts. This can change the
+reported contact rate but cannot retroactively make G1WH-35 pass because its
+waist, speed, and joint-limit constraints also fail.
+
+## G1WH-36 Phase-Routed Recovery Policy
+
+G1WH-36 keeps the original step-500 baseline for ready, approach, align, close,
+and lift, then switches to the recovery step-3,000 policy only after the phase
+scheduler enters hold. It evaluates the two component policies and the hybrid
+under the same corrected contact metric.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_36.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-36.log
+```
+
+The hybrid should retain at least 3/4 functional final lifts, reduce mean final
+speed below 0.10 m/s, and avoid increasing joint-limit violations over the
+baseline. Any strict success is meaningful progress; 3/4 remains the screening
+threshold. This tests whether recovery is a useful phase-specific skill rather
+than a full-task replacement policy.
+
+A real three-second smoke episode loads both 450M-parameter policies on the GPU,
+reaches phase 5, routes inference to the recovery checkpoint, and completes
+without an out-of-memory error. The short rollout loses height after switching,
+so the formal four-episode run must determine whether this is systematic.
