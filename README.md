@@ -912,3 +912,34 @@ A real three-second smoke episode loads both 450M-parameter policies on the GPU,
 reaches phase 5, routes inference to the recovery checkpoint, and completes
 without an out-of-memory error. The short rollout loses height after switching,
 so the formal four-episode run must determine whether this is systematic.
+
+The formal hybrid improves the main task metrics but fails the visual stability
+review and strict contract. It retains 4/4 functional final lifts, reaches
+0.1282 m mean final lift, and reduces final tote speed from the baseline's
+0.2186 to 0.0430 m/s. Joint-limit violations remain near baseline at 2.58%, and
+corrected bilateral contact is 100% for all policies. Strict success remains
+0/4 because every hybrid episode exceeds the 0.11 rad waist limit, while two
+also contain joint-limit violations and one exceeds the 0.05 m/s speed limit.
+
+Trajectory analysis explains the user's visible shaking. Within phase 5, the
+hybrid is smoother than baseline, but its mean action jump exactly at policy
+handoff is 0.1370 rad RMS versus 0.0932 for baseline and 0.0643 for recovery.
+The worst single-joint handoff is 0.7370 rad. Thumb, wrist-pitch, and elbow
+joints dominate the jump, so whole-episode action RMSE hides a severe transient.
+
+## G1WH-37 Smoothed Phase-Routed Recovery Policy
+
+G1WH-37 changes only hold action blend alpha from 1.0 to 0.25. Each executed
+hold target retains 75% of the previous command and applies 25% of the new
+recovery command. It evaluates only the hybrid because G1WH-36 already supplies
+the deterministic component-policy controls.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_37.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-37.log
+```
+
+The evaluator now reports phase-5 action jumps, joint velocity and acceleration,
+and final two-second tote-height variation. G1WH-37 should retain 4/4 functional
+lifts and mean final speed below 0.10 m/s, while reducing handoff action RMSE
+below 0.07 rad and phase-5 joint acceleration RMS below the G1WH-36 value of
+6.14 rad/s^2. Visual review remains mandatory.

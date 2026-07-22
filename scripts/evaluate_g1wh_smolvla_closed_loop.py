@@ -76,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         help="Policy using BASE before phase 5 and HOLD during phase 5.",
     )
     parser.add_argument(
+        "--skip-standalone",
+        action="store_true",
+        help="Evaluate only requested hybrids, not their component policies.",
+    )
+    parser.add_argument(
         "--policy-selection",
         choices=("both", "step500", "step1000"),
         default="both",
@@ -309,6 +314,67 @@ def contact_state(
         bilateral["right"] |= any(name.startswith("right_hand_") for name in bodies)
         table_contact |= "world" in bodies
     return bilateral, table_contact
+
+
+def stability_metrics(
+    states: np.ndarray,
+    commands: np.ndarray,
+    tote_heights: np.ndarray,
+    phases: np.ndarray,
+    control_fps: int,
+) -> dict[str, float | None]:
+    hold_indices = np.flatnonzero(phases == 5)
+    result = {
+        "hold_action_delta_rmse_rad": None,
+        "hold_action_delta_p95_step_norm_rad": None,
+        "hold_action_delta_max_abs_rad": None,
+        "hold_joint_velocity_rmse_rad_s": None,
+        "hold_joint_acceleration_rmse_rad_s2": None,
+        "hold_switch_action_delta_rmse_rad": None,
+        "hold_switch_action_delta_max_abs_rad": None,
+        "hold_final_2s_tote_height_std_m": None,
+        "hold_final_2s_tote_height_range_m": None,
+    }
+    if not len(hold_indices):
+        return result
+
+    first_hold = int(hold_indices[0])
+    if first_hold > 0:
+        switch_delta = commands[first_hold] - commands[first_hold - 1]
+        result["hold_switch_action_delta_rmse_rad"] = float(
+            np.sqrt(np.mean(switch_delta**2))
+        )
+        result["hold_switch_action_delta_max_abs_rad"] = float(
+            np.max(np.abs(switch_delta))
+        )
+
+    hold_pairs = (phases[1:] == 5) & (phases[:-1] == 5)
+    if np.any(hold_pairs):
+        action_delta = np.diff(commands, axis=0)[hold_pairs]
+        joint_velocity = np.diff(states, axis=0)[hold_pairs] * control_fps
+        result["hold_action_delta_rmse_rad"] = float(
+            np.sqrt(np.mean(action_delta**2))
+        )
+        result["hold_action_delta_p95_step_norm_rad"] = float(
+            np.percentile(np.linalg.norm(action_delta, axis=1), 95)
+        )
+        result["hold_action_delta_max_abs_rad"] = float(
+            np.max(np.abs(action_delta))
+        )
+        result["hold_joint_velocity_rmse_rad_s"] = float(
+            np.sqrt(np.mean(joint_velocity**2))
+        )
+        if len(joint_velocity) > 1:
+            acceleration = np.diff(joint_velocity, axis=0) * control_fps
+            result["hold_joint_acceleration_rmse_rad_s2"] = float(
+                np.sqrt(np.mean(acceleration**2))
+            )
+
+    final_window = min(2 * control_fps, len(hold_indices))
+    final_hold = tote_heights[hold_indices[-final_window:]]
+    result["hold_final_2s_tote_height_std_m"] = float(np.std(final_hold))
+    result["hold_final_2s_tote_height_range_m"] = float(np.ptp(final_hold))
+    return result
 
 
 @torch.no_grad()
@@ -564,6 +630,10 @@ def run_episode(
     )
     final_tote_speed = float(np.linalg.norm(data.cvel[tote_body_id, 3:]))
     final_lift = float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z
+    states_array = np.asarray(states)
+    commands_array = np.asarray(commands)
+    tote_heights_array = np.asarray(tote_heights, dtype=np.float32)
+    phase_array = np.asarray(phase_history, dtype=np.int64)
     report = {
         "policy": policy_name,
         "checkpoint": str(policy.config.pretrained_path),
@@ -609,6 +679,13 @@ def run_episode(
         "p95_inference_s": float(np.percentile(inference_times, 95)),
         "wall_time_s": time.perf_counter() - started,
         "video": str(video_path),
+        **stability_metrics(
+            states_array,
+            commands_array,
+            tote_heights_array,
+            phase_array,
+            args.control_fps,
+        ),
     }
     report["passed"] = bool(
         final_lift >= 0.10
@@ -622,10 +699,10 @@ def run_episode(
     )
     np.savez_compressed(
         output_dir / "trajectory.npz",
-        observation_joint_position_rad=np.asarray(states),
-        action_joint_position_rad=np.asarray(commands),
-        tote_lift_height_m=np.asarray(tote_heights, dtype=np.float32),
-        scheduled_phase=np.asarray(phase_history, dtype=np.int64),
+        observation_joint_position_rad=states_array,
+        action_joint_position_rad=commands_array,
+        tote_lift_height_m=tote_heights_array,
+        scheduled_phase=phase_array,
     )
     (output_dir / "summary.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
@@ -639,6 +716,10 @@ def run_episode(
 
 
 def aggregate(reports: list[dict]) -> dict:
+    def mean_available(key: str) -> float | None:
+        values = [report[key] for report in reports if report[key] is not None]
+        return float(np.mean(values)) if values else None
+
     return {
         "episodes": len(reports),
         "successes": sum(report["passed"] for report in reports),
@@ -683,6 +764,33 @@ def aggregate(reports: list[dict]) -> dict:
         "mean_inference_s": float(
             np.mean([report["mean_inference_s"] for report in reports])
         ),
+        "mean_hold_action_delta_rmse_rad": mean_available(
+            "hold_action_delta_rmse_rad"
+        ),
+        "mean_hold_action_delta_p95_step_norm_rad": mean_available(
+            "hold_action_delta_p95_step_norm_rad"
+        ),
+        "mean_hold_action_delta_max_abs_rad": mean_available(
+            "hold_action_delta_max_abs_rad"
+        ),
+        "mean_hold_joint_velocity_rmse_rad_s": mean_available(
+            "hold_joint_velocity_rmse_rad_s"
+        ),
+        "mean_hold_joint_acceleration_rmse_rad_s2": mean_available(
+            "hold_joint_acceleration_rmse_rad_s2"
+        ),
+        "mean_hold_switch_action_delta_rmse_rad": mean_available(
+            "hold_switch_action_delta_rmse_rad"
+        ),
+        "mean_hold_switch_action_delta_max_abs_rad": mean_available(
+            "hold_switch_action_delta_max_abs_rad"
+        ),
+        "mean_hold_final_2s_tote_height_std_m": mean_available(
+            "hold_final_2s_tote_height_std_m"
+        ),
+        "mean_hold_final_2s_tote_height_range_m": mean_available(
+            "hold_final_2s_tote_height_range_m"
+        ),
     }
 
 
@@ -710,23 +818,26 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint directories do not exist: {missing}")
     all_reports = {}
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    for policy_name, checkpoint in specs.items():
-        print(f"Loading {policy_name}: {checkpoint}", flush=True)
-        policy = load_policy(checkpoint, train_meta, device)
-        all_reports[policy_name] = [
-            run_episode(
-                policy,
-                policy_name,
-                episode,
-                args,
-                expected_upper_names,
-                device,
-            )
-            for episode in episodes
-        ]
-        del policy
-        if device.startswith("cuda"):
-            torch.cuda.empty_cache()
+    if args.skip_standalone and not hybrids:
+        raise ValueError("--skip-standalone requires at least one --hybrid")
+    if not args.skip_standalone:
+        for policy_name, checkpoint in specs.items():
+            print(f"Loading {policy_name}: {checkpoint}", flush=True)
+            policy = load_policy(checkpoint, train_meta, device)
+            all_reports[policy_name] = [
+                run_episode(
+                    policy,
+                    policy_name,
+                    episode,
+                    args,
+                    expected_upper_names,
+                    device,
+                )
+                for episode in episodes
+            ]
+            del policy
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
     for policy_name, (base_name, hold_name) in hybrids.items():
         print(
             f"Loading {policy_name}: base={specs[base_name]} hold={specs[hold_name]}",
