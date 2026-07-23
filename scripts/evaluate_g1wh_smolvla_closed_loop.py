@@ -135,6 +135,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-model-candidates", type=int, default=4)
     parser.add_argument("--world-model-horizon", type=int, default=5)
     parser.add_argument(
+        "--world-model-batched-candidates",
+        action="store_true",
+        help="Generate all stochastic VLA candidates in one batched forward pass.",
+    )
+    parser.add_argument(
+        "--planner-body-safety-margin-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of each non-hand joint range reserved as a planner safety margin.",
+    )
+    parser.add_argument(
+        "--planner-hand-safety-margin-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of each hand joint range reserved as a planner safety margin.",
+    )
+    parser.add_argument(
         "--compare-world-model-planner",
         action="store_true",
         help="Evaluate both VLA-only and VLA plus world-model candidate ranking.",
@@ -307,16 +324,31 @@ def render_observation(
     return batch
 
 
-def seeded_noise(policy, seed: int, device: str) -> torch.Tensor:
+def seeded_noise(
+    policy, seed: int, device: str, batch_size: int = 1
+) -> torch.Tensor:
     torch.manual_seed(seed)
     if device.startswith("cuda"):
         torch.cuda.manual_seed_all(seed)
     return torch.randn(
-        1,
+        batch_size,
         policy.config.chunk_size,
         policy.config.max_action_dim,
         device=device,
     )
+
+
+def repeat_policy_batch(batch: dict, count: int) -> dict:
+    repeated = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            repeats = (count,) + (1,) * (value.ndim - 1)
+            repeated[key] = value.repeat(repeats)
+        elif isinstance(value, list):
+            repeated[key] = value * count
+        else:
+            raise TypeError(f"Unsupported policy batch value for {key}: {type(value)}")
+    return repeated
 
 
 def contact_state(
@@ -400,18 +432,35 @@ def select_world_model_candidate(
     candidates = []
     raw_candidates = []
     inference_started = time.perf_counter()
-    for candidate_index in range(planner["candidate_count"]):
-        raw = (
+    candidate_seeds = [
+        base_seed + candidate_index * 1_000_003
+        for candidate_index in range(planner["candidate_count"])
+    ]
+    if planner["batched_candidates"]:
+        noises = torch.cat(
+            [seeded_noise(policy, seed, device) for seed in candidate_seeds], dim=0
+        )
+        raw_batch = (
             policy.predict_action_chunk(
-                batch,
-                noise=seeded_noise(policy, base_seed + candidate_index * 1_000_003, device),
-            )[0]
+                repeat_policy_batch(batch, planner["candidate_count"]), noise=noises
+            )
             .detach()
             .cpu()
             .numpy()
         )
-        raw_candidates.append(raw)
-        candidates.append(np.clip(raw, lower, upper))
+        raw_candidates.extend(raw_batch)
+    else:
+        for seed in candidate_seeds:
+            raw = (
+                policy.predict_action_chunk(
+                    batch, noise=seeded_noise(policy, seed, device)
+                )[0]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            raw_candidates.append(raw)
+    candidates.extend(np.clip(raw, lower, upper) for raw in raw_candidates)
     policy_inference_s = time.perf_counter() - inference_started
     horizon = min(planner["horizon"], min(len(item) for item in candidates))
     stats = planner["stats"]
@@ -498,6 +547,7 @@ def select_world_model_candidate(
         "selected_nonbaseline": selected != 0,
         "score_margin": score_margin,
         "policy_inference_s": policy_inference_s,
+        "batched_candidates": planner["batched_candidates"],
         "world_model_inference_s": world_model_inference_s,
         "candidate_scores": components,
     }
@@ -625,6 +675,17 @@ def run_episode(
             )
         elif name in ("waist_yaw_joint", "waist_roll_joint"):
             upper_lower[index], upper_upper[index] = -0.05, 0.05
+    planner_lower = upper_lower.copy()
+    planner_upper = upper_upper.copy()
+    for index, name in enumerate(upper_names):
+        margin_fraction = (
+            args.planner_hand_safety_margin_fraction
+            if "hand_" in name
+            else args.planner_body_safety_margin_fraction
+        )
+        margin = margin_fraction * (upper_upper[index] - upper_lower[index])
+        planner_lower[index] += margin
+        planner_upper[index] -= margin
 
     palm_ids = [
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
@@ -792,8 +853,8 @@ def run_episode(
                         world_model_planner,
                         planner_state,
                         previous_action,
-                        upper_lower,
-                        upper_upper,
+                        planner_lower,
+                        planner_upper,
                         base_seed,
                         device,
                     )
@@ -1004,6 +1065,21 @@ def run_episode(
         ),
         "world_model_horizon": (
             world_model_planner["horizon"] if world_model_planner else None
+        ),
+        "world_model_batched_candidates": (
+            world_model_planner["batched_candidates"]
+            if world_model_planner
+            else False
+        ),
+        "planner_body_safety_margin_fraction": (
+            args.planner_body_safety_margin_fraction
+            if world_model_planner
+            else 0.0
+        ),
+        "planner_hand_safety_margin_fraction": (
+            args.planner_hand_safety_margin_fraction
+            if world_model_planner
+            else 0.0
         ),
         "mean_world_model_inference_s": (
             float(np.mean(world_model_inference_times))
@@ -1256,6 +1332,13 @@ def main() -> None:
             raise ValueError("world-model-candidates must be at least 2")
         if args.world_model_horizon < 1:
             raise ValueError("world-model-horizon must be positive")
+    for name in (
+        "planner_body_safety_margin_fraction",
+        "planner_hand_safety_margin_fraction",
+    ):
+        value = getattr(args, name)
+        if not 0.0 <= value < 0.5:
+            raise ValueError(f"--{name.replace('_', '-')} must be in [0, 0.5)")
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     source = json.loads(args.source_summary.read_text(encoding="utf-8"))
     episodes = source["episodes"][
@@ -1283,6 +1366,7 @@ def main() -> None:
             "stats": checkpoint["normalizers"],
             "candidate_count": args.world_model_candidates,
             "horizon": args.world_model_horizon,
+            "batched_candidates": args.world_model_batched_candidates,
             "checkpoint": str(args.world_model_checkpoint),
         }
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1361,6 +1445,13 @@ def main() -> None:
         ),
         "world_model_candidates": args.world_model_candidates,
         "world_model_horizon": args.world_model_horizon,
+        "world_model_batched_candidates": args.world_model_batched_candidates,
+        "planner_body_safety_margin_fraction": (
+            args.planner_body_safety_margin_fraction
+        ),
+        "planner_hand_safety_margin_fraction": (
+            args.planner_hand_safety_margin_fraction
+        ),
         "assist_solref_timeconst_s": args.assist_solref_timeconst,
         "executed_chunk_duration_s": args.replan_steps / args.control_fps,
         "policies": {
