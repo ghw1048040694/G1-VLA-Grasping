@@ -119,6 +119,14 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Multiplier applied to the 1.5x PD gain boost during phase 5.",
     )
+    parser.add_argument(
+        "--terminal-hold-controller",
+        action="store_true",
+        help=(
+            "Freeze the last executed joint target when phase 5 starts instead "
+            "of continuing policy inference."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=2707)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -508,6 +516,9 @@ def run_episode(
     phase_history = []
     phase_transitions = []
     previous_action = initial_targets[LOWER_BODY_JOINTS:].copy()
+    terminal_hold_target = None
+    terminal_hold_activation_s = None
+    terminal_hold_capture_error_rmse_rad = None
     previous_hold_substep_velocity = None
     hold_substep_velocity_sq_sum = 0.0
     hold_substep_velocity_count = 0
@@ -561,27 +572,38 @@ def run_episode(
                     phase_transitions.append(transition)
             else:
                 task = episode_instruction
-            batch = render_observation(task_renderer, data, upper_state, task, device)
-            inference_started = time.perf_counter()
-            active_policy = (
-                hold_policy
-                if hold_policy is not None and scheduler_phase == 5
-                else policy
-            )
-            current_chunk = (
-                active_policy.predict_action_chunk(
-                    batch,
-                    noise=seeded_noise(
-                        active_policy,
-                        args.seed + episode_index * 10_000 + frame,
-                        device,
-                    ),
-                )[0]
-                .detach()
-                .cpu()
-                .numpy()
-            )
-            inference_times.append(time.perf_counter() - inference_started)
+            if args.terminal_hold_controller and scheduler_phase == 5:
+                if terminal_hold_target is None:
+                    terminal_hold_target = previous_action.copy()
+                    terminal_hold_activation_s = float(data.time)
+                    terminal_hold_capture_error_rmse_rad = float(
+                        np.sqrt(np.mean((terminal_hold_target - upper_state) ** 2))
+                    )
+                current_chunk = np.repeat(
+                    terminal_hold_target[None, :], args.replan_steps, axis=0
+                )
+            else:
+                batch = render_observation(task_renderer, data, upper_state, task, device)
+                inference_started = time.perf_counter()
+                active_policy = (
+                    hold_policy
+                    if hold_policy is not None and scheduler_phase == 5
+                    else policy
+                )
+                current_chunk = (
+                    active_policy.predict_action_chunk(
+                        batch,
+                        noise=seeded_noise(
+                            active_policy,
+                            args.seed + episode_index * 10_000 + frame,
+                            device,
+                        ),
+                    )[0]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                inference_times.append(time.perf_counter() - inference_started)
         if current_chunk is None or chunk_index >= len(current_chunk):
             raise RuntimeError("Policy did not produce enough actions for replanning")
         raw_action = current_chunk[chunk_index].astype(np.float64)
@@ -749,6 +771,11 @@ def run_episode(
         "replan_steps": args.replan_steps,
         "hold_action_blend_alpha": args.hold_action_blend_alpha,
         "hold_gain_scale": args.hold_gain_scale,
+        "terminal_hold_controller": args.terminal_hold_controller,
+        "terminal_hold_activation_s": terminal_hold_activation_s,
+        "terminal_hold_capture_error_rmse_rad": (
+            terminal_hold_capture_error_rmse_rad
+        ),
         "action_chunk_size": int(policy.config.chunk_size),
         "assisted_grasp_activation_distance_m": args.assist_distance_m,
         "assisted_grasp_solref_timeconst_s": args.assist_solref_timeconst,
@@ -964,6 +991,9 @@ def aggregate(reports: list[dict]) -> dict:
         "mean_hold_assist_position_error_max_m": mean_available(
             "hold_assist_position_error_max_m"
         ),
+        "mean_terminal_hold_capture_error_rmse_rad": mean_available(
+            "terminal_hold_capture_error_rmse_rad"
+        ),
     }
 
 
@@ -979,6 +1009,10 @@ def main() -> None:
         raise ValueError("hold-action-blend-alpha must be in (0, 1]")
     if not 0.0 < args.hold_gain_scale <= 1.0:
         raise ValueError("hold-gain-scale must be in (0, 1]")
+    if args.terminal_hold_controller and not args.phase_language_scheduler:
+        raise ValueError(
+            "--terminal-hold-controller requires --phase-language-scheduler"
+        )
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     source = json.loads(args.source_summary.read_text(encoding="utf-8"))
     episodes = source["episodes"][
@@ -1048,6 +1082,7 @@ def main() -> None:
         "phase_language_scheduler": args.phase_language_scheduler,
         "hold_action_blend_alpha": args.hold_action_blend_alpha,
         "hold_gain_scale": args.hold_gain_scale,
+        "terminal_hold_controller": args.terminal_hold_controller,
         "assist_solref_timeconst_s": args.assist_solref_timeconst,
         "executed_chunk_duration_s": args.replan_steps / args.control_fps,
         "policies": {

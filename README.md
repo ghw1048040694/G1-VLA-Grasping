@@ -986,27 +986,28 @@ videos still shows conspicuous shaking in both groups. The modest acceleration
 reduction is therefore not a usable stability improvement because task retention
 collapses. G1WH-38 fails and the effective 1.5x gain is restored.
 
-## G1WH-39 Assisted-Grasp Constraint Softness Ablation
+## G1WH-39 Terminal Hold Controller
 
-G1WH-39 keeps the selected policies, alpha 0.25, boosted PD gains, validation
-episodes, and random conditions fixed. It changes only the MuJoCo equality
-constraint time constant used by the assisted two-hand grasp. G1WH-38 uses the
-stiff 0.02 s reference; this experiment compares 0.05 s and 0.10 s candidates.
-A larger time constant makes the constraint correct hand-to-tote displacement
-more gradually, reducing conflict with the joint servos at the cost of more
-grasp compliance.
+G1WH-39 is a structural controller change rather than another scalar ablation.
+SmolVLA controls ready, approach, alignment, grasp, and lift. Once tote lift
+crosses 0.10 m, the evaluator captures the last executed joint target, stops
+generative policy inference, and hands phase 5 to a deterministic joint-space
+hold controller. The terminal controller also restores nominal Unitree gains
+and uses a moderately compliant 0.05 s assisted-grasp constraint. This tests a
+practical learned-manipulation architecture: a learned policy handles semantic
+motion, while a deterministic controller handles the safety-critical steady
+state.
 
 ```bash
 set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_39.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-39.log
 ```
 
-The evaluator additionally records assisted-constraint force RMS and peak plus
-hand-to-tote position-error RMS and peak. Episode-16 three-second smoke tests
-show that 0.05 s lowers constraint-force RMS 6.6%, joint-acceleration RMS 11.9%,
-and torso angular velocity 7.9%, while position-error RMS rises from 0.7 mm to
-3.9 mm. The 0.10 s candidate lowers force RMS 19.5%, acceleration RMS 19.1%,
-torso angular velocity 12.7%, and tote angular velocity 24.8%, but position-error
-RMS rises to 16.7 mm and peak error to 30.5 mm. These are short-test directions,
-not a pass. Formal acceptance requires visibly less shaking, at least 3/4
-functional lifts, mean final speed below 0.10 m/s, and no unacceptable hand-tote
-slip; video review remains the primary stability criterion.
+A full ten-second episode-16 smoke test is directionally strong. Relative to the
+G1WH-38 boosted-gain reference, physics-substep joint-acceleration RMS falls from
+11.18 to 1.54 rad/s^2, joint-velocity RMS falls from 0.127 to 0.0375 rad/s, and
+final tote speed reaches 0.00043 m/s. Final-two-second tote-height range is only
+0.26 mm. A same-episode frame-difference proxy over seconds 4-10 falls 71.7%.
+The episode retains 0.186 m final lift but narrowly misses strict success because
+waist pitch reaches 0.11084 rad against the 0.11 rad limit. This one episode is
+not a formal pass; the four validation episodes must retain at least 3/4
+functional lifts, visibly remove sustained shaking, and avoid hand-tote slip.
