@@ -730,6 +730,8 @@ def run_episode(
     action_values = 0
     joint_limit_violations = 0
     joint_samples = 0
+    joint_limit_violations_by_joint = {name: 0 for name in controlled_names}
+    joint_samples_by_joint = {name: 0 for name in controlled_names}
     saturated_samples = 0
     actuator_samples = 0
     maximum_abs_waist_pitch = 0.0
@@ -972,6 +974,10 @@ def run_episode(
                     position < low - 1e-6 or position > high + 1e-6
                 )
                 joint_samples += 1
+                joint_limit_violations_by_joint[name] += int(
+                    position < low - 1e-6 or position > high + 1e-6
+                )
+                joint_samples_by_joint[name] += 1
                 force_limit = max(
                     abs(float(value)) for value in model.jnt_actfrcrange[joint_id]
                 )
@@ -1056,6 +1062,12 @@ def run_episode(
             np.sqrt(np.mean(np.diff(np.asarray(commands), axis=0) ** 2))
         ),
         "joint_limit_violation_fraction": joint_limit_violations / joint_samples,
+        "joint_limit_violation_fraction_by_joint": {
+            name: joint_limit_violations_by_joint[name]
+            / joint_samples_by_joint[name]
+            for name in controlled_names
+            if joint_limit_violations_by_joint[name]
+        },
         "actuator_saturation_fraction": saturated_samples / actuator_samples,
         "mean_inference_s": float(np.mean(inference_times)),
         "p95_inference_s": float(np.percentile(inference_times, 95)),
