@@ -1011,3 +1011,40 @@ The episode retains 0.186 m final lift but narrowly misses strict success becaus
 waist pitch reaches 0.11084 rad against the 0.11 rad limit. This one episode is
 not a formal pass; the four validation episodes must retain at least 3/4
 functional lifts, visibly remove sustained shaking, and avoid hand-tote slip.
+
+The formal four-episode run rejects this architecture. Strict success is 0/4
+and functional final lift falls from the G1WH-38 reference's 3/4 to 1/4. Mean
+final lift is 0.0926 m despite a similar 0.1769 m maximum, showing that the
+controller freezes transient threshold crossings and then settles below the
+required height. Terminal metrics improve strongly: mean phase-5 substep joint
+acceleration RMS falls from 11.18 to 1.17 rad/s^2 and final tote speed falls to
+0.00023 m/s. These metrics only describe the frozen terminal phase. Video review
+still shows severe motion during ready, approach, and lift. At the 15 Hz control
+rate, approach-phase state acceleration is 38.7-55.6 rad/s^2 versus about 0.5
+rad/s^2 in the expert demonstrations. The user therefore correctly rejects the
+videos as shaky; G1WH-39 stabilizes the wrong part of the trajectory.
+
+## G1WH-40 Scaled Data, Fine-Tuning, and 20-Episode Evaluation
+
+G1WH-40 stops adding controller patches and addresses the training regime. The
+current phase-conditioned policy saw only 16 source demonstrations and 1,000
+updates: approximately 2,000 sampled frames, or 0.82 equivalent passes over its
+2,432 training frames. The new end-to-end run collects 120 successful expert
+demonstrations, assigns the first 100 exclusively to training and the final 20
+exclusively to validation, adds 27 previously accepted policy-recovery episodes,
+regenerates normalization statistics through the training stack, and fine-tunes
+a fresh adapted SmolVLA for 20,000 updates. This produces 16,908 training frames
+and 40,000 sampled frames, or about 2.37 equivalent dataset passes.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_40.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-40.log
+```
+
+The same command then runs the 20,000-step checkpoint in closed loop on all 20
+held-out source episodes and writes videos plus a summary under
+`outputs/G1WH-40_scaled_smolvla_closed_loop_20ep`. Collection can resume already
+completed successful episodes after interruption. The decision threshold is at
+least 15/20 strict successes for a promising result; 10-14 is partial, and below
+10 rejects data scaling alone. Visual shaking, per-phase acceleration, final
+height, speed, joint-limit violations, and waist angle remain mandatory review
+dimensions regardless of success count.
