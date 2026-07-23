@@ -975,3 +975,38 @@ Returning to nominal gains reduces physics-substep joint acceleration RMS from
 velocity falls about 7%, while torso angular velocity increases slightly. This
 is directional evidence only, so the formal four-episode paired comparison and
 video review remain required.
+
+The formal comparison rejects the nominal-gain candidate. The boosted reference
+retains 3/4 functional lifts and 1/4 strict successes, whereas nominal gains
+retain 0/4 lifts and 0/4 successes. Nominal gains reduce mean physics-substep
+joint acceleration RMS by 10.8% and its maximum by 22.6%, but joint velocity RMS
+increases 7.0% and torso angular velocity increases 8.0%. Frame-difference
+analysis indicates 17.6% less rendered motion, but direct review of all eight
+videos still shows conspicuous shaking in both groups. The modest acceleration
+reduction is therefore not a usable stability improvement because task retention
+collapses. G1WH-38 fails and the effective 1.5x gain is restored.
+
+## G1WH-39 Assisted-Grasp Constraint Softness Ablation
+
+G1WH-39 keeps the selected policies, alpha 0.25, boosted PD gains, validation
+episodes, and random conditions fixed. It changes only the MuJoCo equality
+constraint time constant used by the assisted two-hand grasp. G1WH-38 uses the
+stiff 0.02 s reference; this experiment compares 0.05 s and 0.10 s candidates.
+A larger time constant makes the constraint correct hand-to-tote displacement
+more gradually, reducing conflict with the joint servos at the cost of more
+grasp compliance.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_39.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-39.log
+```
+
+The evaluator additionally records assisted-constraint force RMS and peak plus
+hand-to-tote position-error RMS and peak. Episode-16 three-second smoke tests
+show that 0.05 s lowers constraint-force RMS 6.6%, joint-acceleration RMS 11.9%,
+and torso angular velocity 7.9%, while position-error RMS rises from 0.7 mm to
+3.9 mm. The 0.10 s candidate lowers force RMS 19.5%, acceleration RMS 19.1%,
+torso angular velocity 12.7%, and tote angular velocity 24.8%, but position-error
+RMS rises to 16.7 mm and peak error to 30.5 mm. These are short-test directions,
+not a pass. Formal acceptance requires visibly less shaking, at least 3/4
+functional lifts, mean final speed below 0.10 m/s, and no unacceptable hand-tote
+slip; video review remains the primary stability criterion.

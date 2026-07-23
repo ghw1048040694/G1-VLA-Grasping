@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replan-steps", type=int, default=5)
     parser.add_argument("--duration-s", type=float, default=10.0)
     parser.add_argument("--assist-distance-m", type=float, default=0.08)
+    parser.add_argument(
+        "--assist-solref-timeconst",
+        type=float,
+        default=0.02,
+        help="MuJoCo equality-constraint time constant for assisted grasping.",
+    )
     parser.add_argument("--align-distance-m", type=float, default=0.12)
     parser.add_argument("--phase-language-scheduler", action="store_true")
     parser.add_argument(
@@ -462,6 +468,8 @@ def run_episode(
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, name)
         for name in ("left_assisted_grasp", "right_assisted_grasp")
     ]
+    for equality_id in assisted_ids:
+        model.eq_solref[equality_id] = (args.assist_solref_timeconst, 1.0)
     initial_tote_z = float(data.site_xpos[tote_site_ids[0], 2])
 
     task_renderer = mujoco.Renderer(model, height=240, width=320)
@@ -510,6 +518,12 @@ def run_episode(
     hold_torso_angular_velocity_sq_sum = 0.0
     hold_tote_angular_velocity_sq_sum = 0.0
     hold_body_velocity_count = 0
+    hold_assist_force_sq_sum = 0.0
+    hold_assist_force_count = 0
+    hold_assist_force_max_abs = 0.0
+    hold_assist_position_error_sq_sum = 0.0
+    hold_assist_position_error_count = 0
+    hold_assist_position_error_max_m = 0.0
     started = time.perf_counter()
 
     for frame in range(control_frames):
@@ -636,6 +650,29 @@ def run_episode(
                     np.sum(data.cvel[tote_body_id, :3] ** 2)
                 )
                 hold_body_velocity_count += 3
+                equality_rows = (data.efc_type == mujoco.mjtConstraint.mjCNSTR_EQUALITY) & np.isin(
+                    data.efc_id, assisted_ids
+                )
+                if np.any(equality_rows):
+                    assist_force = data.efc_force[equality_rows]
+                    hold_assist_force_sq_sum += float(np.sum(assist_force**2))
+                    hold_assist_force_count += assist_force.size
+                    hold_assist_force_max_abs = max(
+                        hold_assist_force_max_abs,
+                        float(np.max(np.abs(assist_force))),
+                    )
+                assist_error = np.asarray(
+                    [
+                        np.linalg.norm(data.site_xpos[palm] - data.site_xpos[tote])
+                        for palm, tote in zip(palm_ids, tote_site_ids, strict=True)
+                    ]
+                )
+                hold_assist_position_error_sq_sum += float(np.sum(assist_error**2))
+                hold_assist_position_error_count += assist_error.size
+                hold_assist_position_error_max_m = max(
+                    hold_assist_position_error_max_m,
+                    float(np.max(assist_error)),
+                )
             if (
                 args.phase_language_scheduler
                 and float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z >= 0.10
@@ -714,6 +751,7 @@ def run_episode(
         "hold_gain_scale": args.hold_gain_scale,
         "action_chunk_size": int(policy.config.chunk_size),
         "assisted_grasp_activation_distance_m": args.assist_distance_m,
+        "assisted_grasp_solref_timeconst_s": args.assist_solref_timeconst,
         "assisted_grasp_activated": assist_activation_s is not None,
         "assisted_grasp_activation_s": assist_activation_s,
         "tote_lift_height_m": final_lift,
@@ -761,6 +799,27 @@ def run_episode(
         "hold_tote_angular_velocity_rmse_rad_s": (
             math.sqrt(hold_tote_angular_velocity_sq_sum / hold_body_velocity_count)
             if hold_body_velocity_count
+            else None
+        ),
+        "hold_assist_constraint_force_rmse": (
+            math.sqrt(hold_assist_force_sq_sum / hold_assist_force_count)
+            if hold_assist_force_count
+            else None
+        ),
+        "hold_assist_constraint_force_max_abs": (
+            hold_assist_force_max_abs if hold_assist_force_count else None
+        ),
+        "hold_assist_position_error_rmse_m": (
+            math.sqrt(
+                hold_assist_position_error_sq_sum
+                / hold_assist_position_error_count
+            )
+            if hold_assist_position_error_count
+            else None
+        ),
+        "hold_assist_position_error_max_m": (
+            hold_assist_position_error_max_m
+            if hold_assist_position_error_count
             else None
         ),
         **stability_metrics(
@@ -893,6 +952,18 @@ def aggregate(reports: list[dict]) -> dict:
         "mean_hold_tote_angular_velocity_rmse_rad_s": mean_available(
             "hold_tote_angular_velocity_rmse_rad_s"
         ),
+        "mean_hold_assist_constraint_force_rmse": mean_available(
+            "hold_assist_constraint_force_rmse"
+        ),
+        "mean_hold_assist_constraint_force_max_abs": mean_available(
+            "hold_assist_constraint_force_max_abs"
+        ),
+        "mean_hold_assist_position_error_rmse_m": mean_available(
+            "hold_assist_position_error_rmse_m"
+        ),
+        "mean_hold_assist_position_error_max_m": mean_available(
+            "hold_assist_position_error_max_m"
+        ),
     }
 
 
@@ -902,6 +973,8 @@ def main() -> None:
         raise ValueError("episodes, control-fps, and replan-steps must be positive")
     if args.align_distance_m <= args.assist_distance_m:
         raise ValueError("align-distance-m must be larger than assist-distance-m")
+    if args.assist_solref_timeconst < 2 * 0.002:
+        raise ValueError("assist-solref-timeconst must be at least 0.004 s")
     if not 0.0 < args.hold_action_blend_alpha <= 1.0:
         raise ValueError("hold-action-blend-alpha must be in (0, 1]")
     if not 0.0 < args.hold_gain_scale <= 1.0:
@@ -975,6 +1048,7 @@ def main() -> None:
         "phase_language_scheduler": args.phase_language_scheduler,
         "hold_action_blend_alpha": args.hold_action_blend_alpha,
         "hold_gain_scale": args.hold_gain_scale,
+        "assist_solref_timeconst_s": args.assist_solref_timeconst,
         "executed_chunk_duration_s": args.replan_steps / args.control_fps,
         "policies": {
             name: {"aggregate": aggregate(reports), "episodes": reports}
