@@ -107,6 +107,12 @@ def parse_args() -> argparse.Namespace:
             "1.0 disables smoothing; smaller values retain more of the previous command."
         ),
     )
+    parser.add_argument(
+        "--hold-gain-scale",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to the 1.5x PD gain boost during phase 5.",
+    )
     parser.add_argument("--seed", type=int, default=2707)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -401,6 +407,9 @@ def run_episode(
     upper_names = controlled_names[LOWER_BODY_JOINTS:]
     if upper_names != expected_upper_names:
         raise ValueError("Simulation and LeRobot upper-body joint order differ")
+    upper_qvel_ids = np.asarray(
+        [controlled[name]["qvel_id"] for name in upper_names], dtype=np.int64
+    )
 
     mujoco.mj_resetData(model, data)
     mujoco.mj_forward(model, data)
@@ -443,6 +452,12 @@ def run_episode(
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
         for name in TOTE_SITE_NAMES
     ]
+    torso_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "torso_link"
+    )
+    tote_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "warehouse_tote"
+    )
     assisted_ids = [
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, name)
         for name in ("left_assisted_grasp", "right_assisted_grasp")
@@ -485,6 +500,16 @@ def run_episode(
     phase_history = []
     phase_transitions = []
     previous_action = initial_targets[LOWER_BODY_JOINTS:].copy()
+    previous_hold_substep_velocity = None
+    hold_substep_velocity_sq_sum = 0.0
+    hold_substep_velocity_count = 0
+    hold_substep_velocity_max_abs = 0.0
+    hold_substep_acceleration_sq_sum = 0.0
+    hold_substep_acceleration_count = 0
+    hold_substep_acceleration_max_abs = 0.0
+    hold_torso_angular_velocity_sq_sum = 0.0
+    hold_tote_angular_velocity_sq_sum = 0.0
+    hold_body_velocity_count = 0
     started = time.perf_counter()
 
     for frame in range(control_frames):
@@ -572,14 +597,45 @@ def run_episode(
             for target, name in zip(targets, controlled_names, strict=True):
                 item = controlled[name]
                 kp, kd = unitree_gains(name)
-                kp *= 1.5
-                kd *= math.sqrt(1.5)
+                gain_scale = 1.5
+                if scheduler_phase == 5:
+                    gain_scale *= args.hold_gain_scale
+                kp *= gain_scale
+                kd *= math.sqrt(gain_scale)
                 qpos = float(data.qpos[item["qpos_id"]])
                 qvel = float(data.qvel[item["qvel_id"]])
                 torque = kp * (target - qpos) - kd * qvel
                 torque += float(data.qfrc_bias[item["qvel_id"]])
                 data.ctrl[item["actuator_id"]] = torque
             mujoco.mj_step(model, data)
+            if scheduler_phase == 5:
+                hold_velocity = data.qvel[upper_qvel_ids].copy()
+                hold_substep_velocity_sq_sum += float(np.sum(hold_velocity**2))
+                hold_substep_velocity_count += hold_velocity.size
+                hold_substep_velocity_max_abs = max(
+                    hold_substep_velocity_max_abs,
+                    float(np.max(np.abs(hold_velocity))),
+                )
+                if previous_hold_substep_velocity is not None:
+                    hold_acceleration = (
+                        hold_velocity - previous_hold_substep_velocity
+                    ) / dt
+                    hold_substep_acceleration_sq_sum += float(
+                        np.sum(hold_acceleration**2)
+                    )
+                    hold_substep_acceleration_count += hold_acceleration.size
+                    hold_substep_acceleration_max_abs = max(
+                        hold_substep_acceleration_max_abs,
+                        float(np.max(np.abs(hold_acceleration))),
+                    )
+                previous_hold_substep_velocity = hold_velocity
+                hold_torso_angular_velocity_sq_sum += float(
+                    np.sum(data.cvel[torso_body_id, :3] ** 2)
+                )
+                hold_tote_angular_velocity_sq_sum += float(
+                    np.sum(data.cvel[tote_body_id, :3] ** 2)
+                )
+                hold_body_velocity_count += 3
             if (
                 args.phase_language_scheduler
                 and float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z >= 0.10
@@ -625,9 +681,6 @@ def run_episode(
     task_renderer.close()
     video_renderer.close()
     mujoco.mj_forward(model, data)
-    tote_body_id = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_BODY, "warehouse_tote"
-    )
     final_tote_speed = float(np.linalg.norm(data.cvel[tote_body_id, 3:]))
     final_lift = float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z
     states_array = np.asarray(states)
@@ -658,6 +711,7 @@ def run_episode(
         "control_fps": args.control_fps,
         "replan_steps": args.replan_steps,
         "hold_action_blend_alpha": args.hold_action_blend_alpha,
+        "hold_gain_scale": args.hold_gain_scale,
         "action_chunk_size": int(policy.config.chunk_size),
         "assisted_grasp_activation_distance_m": args.assist_distance_m,
         "assisted_grasp_activated": assist_activation_s is not None,
@@ -679,6 +733,36 @@ def run_episode(
         "p95_inference_s": float(np.percentile(inference_times, 95)),
         "wall_time_s": time.perf_counter() - started,
         "video": str(video_path),
+        "hold_substep_joint_velocity_rmse_rad_s": (
+            math.sqrt(hold_substep_velocity_sq_sum / hold_substep_velocity_count)
+            if hold_substep_velocity_count
+            else None
+        ),
+        "hold_substep_joint_velocity_max_abs_rad_s": (
+            hold_substep_velocity_max_abs if hold_substep_velocity_count else None
+        ),
+        "hold_substep_joint_acceleration_rmse_rad_s2": (
+            math.sqrt(
+                hold_substep_acceleration_sq_sum / hold_substep_acceleration_count
+            )
+            if hold_substep_acceleration_count
+            else None
+        ),
+        "hold_substep_joint_acceleration_max_abs_rad_s2": (
+            hold_substep_acceleration_max_abs
+            if hold_substep_acceleration_count
+            else None
+        ),
+        "hold_torso_angular_velocity_rmse_rad_s": (
+            math.sqrt(hold_torso_angular_velocity_sq_sum / hold_body_velocity_count)
+            if hold_body_velocity_count
+            else None
+        ),
+        "hold_tote_angular_velocity_rmse_rad_s": (
+            math.sqrt(hold_tote_angular_velocity_sq_sum / hold_body_velocity_count)
+            if hold_body_velocity_count
+            else None
+        ),
         **stability_metrics(
             states_array,
             commands_array,
@@ -791,6 +875,24 @@ def aggregate(reports: list[dict]) -> dict:
         "mean_hold_final_2s_tote_height_range_m": mean_available(
             "hold_final_2s_tote_height_range_m"
         ),
+        "mean_hold_substep_joint_velocity_rmse_rad_s": mean_available(
+            "hold_substep_joint_velocity_rmse_rad_s"
+        ),
+        "mean_hold_substep_joint_velocity_max_abs_rad_s": mean_available(
+            "hold_substep_joint_velocity_max_abs_rad_s"
+        ),
+        "mean_hold_substep_joint_acceleration_rmse_rad_s2": mean_available(
+            "hold_substep_joint_acceleration_rmse_rad_s2"
+        ),
+        "mean_hold_substep_joint_acceleration_max_abs_rad_s2": mean_available(
+            "hold_substep_joint_acceleration_max_abs_rad_s2"
+        ),
+        "mean_hold_torso_angular_velocity_rmse_rad_s": mean_available(
+            "hold_torso_angular_velocity_rmse_rad_s"
+        ),
+        "mean_hold_tote_angular_velocity_rmse_rad_s": mean_available(
+            "hold_tote_angular_velocity_rmse_rad_s"
+        ),
     }
 
 
@@ -802,6 +904,8 @@ def main() -> None:
         raise ValueError("align-distance-m must be larger than assist-distance-m")
     if not 0.0 < args.hold_action_blend_alpha <= 1.0:
         raise ValueError("hold-action-blend-alpha must be in (0, 1]")
+    if not 0.0 < args.hold_gain_scale <= 1.0:
+        raise ValueError("hold-gain-scale must be in (0, 1]")
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     source = json.loads(args.source_summary.read_text(encoding="utf-8"))
     episodes = source["episodes"][
@@ -870,6 +974,7 @@ def main() -> None:
         "replan_steps": args.replan_steps,
         "phase_language_scheduler": args.phase_language_scheduler,
         "hold_action_blend_alpha": args.hold_action_blend_alpha,
+        "hold_gain_scale": args.hold_gain_scale,
         "executed_chunk_duration_s": args.replan_steps / args.control_fps,
         "policies": {
             name: {"aggregate": aggregate(reports), "episodes": reports}

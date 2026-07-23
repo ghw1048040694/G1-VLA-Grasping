@@ -943,3 +943,35 @@ and final two-second tote-height variation. G1WH-37 should retain 4/4 functional
 lifts and mean final speed below 0.10 m/s, while reducing handoff action RMSE
 below 0.07 rad and phase-5 joint acceleration RMS below the G1WH-36 value of
 6.14 rad/s^2. Visual review remains mandatory.
+
+G1WH-37 reduces the metrics sampled at the 15 Hz control rate but still fails
+visual review: the user reports that the robot remains very shaky. Mean handoff
+action RMSE falls 75.0%, from 0.1370 to 0.0343 rad, and sampled phase-5 joint
+acceleration RMS falls from 6.14 to 1.53 rad/s^2. Episode 16 becomes the first
+strict success, but functional final lift falls from 4/4 to 3/4. The mismatch
+between sampled metrics and video means high-frequency physical motion remains
+unmeasured; G1WH-37 is not accepted as a stability fix.
+
+## G1WH-38 Hold-Phase PD Gain Ablation
+
+G1WH-38 keeps alpha at 0.25 and compares the current boosted hold controller
+against nominal Unitree gains. The reference uses the existing 1.5x gain boost;
+the candidate uses hold gain scale 0.67, making the effective multiplier about
+1.0x. Both conditions rerun the same four episodes and produce eight videos.
+
+```bash
+set -o pipefail; bash /home/ubuntu/G1-UpperBody/scripts/run_g1wh_38.sh 2>&1 | tee /home/ubuntu/G1-UpperBody/outputs/G1WH-38.log
+```
+
+The evaluator now records true MuJoCo physics-substep joint velocity and
+acceleration plus torso and tote angular velocity, rather than relying only on
+15 Hz samples. The nominal-gain candidate must visibly reduce shaking and lower
+these substep metrics without reducing functional lift below 3/4 or increasing
+mean final speed above 0.10 m/s. Visual review is the primary stability verdict.
+
+A matched three-second episode smoke comparison validates the instrumentation.
+Returning to nominal gains reduces physics-substep joint acceleration RMS from
+13.52 to 10.07 rad/s^2 and the maximum from 285.6 to 191.2 rad/s^2; tote angular
+velocity falls about 7%, while torso angular velocity increases slightly. This
+is directional evidence only, so the formal four-episode paired comparison and
+video review remain required.
