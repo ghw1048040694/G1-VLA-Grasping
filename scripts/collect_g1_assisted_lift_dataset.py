@@ -18,6 +18,27 @@ INSTRUCTIONS = (
     "raise the tote off the table",
     "grasp both sides of the tote and lift it",
 )
+WORLD_MODEL_KEYS = {
+    "tote_position_m",
+    "tote_quaternion_wxyz",
+    "tote_linear_velocity_m_s",
+    "tote_angular_velocity_rad_s",
+    "palm_position_m",
+    "bilateral_hand_contact",
+    "table_contact",
+    "tote_lift_height_m",
+    "task_progress",
+}
+
+
+def has_world_model_contract(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with np.load(path) as arrays:
+            return WORLD_MODEL_KEYS.issubset(arrays.files)
+    except (OSError, ValueError):
+        return False
 
 
 def main() -> None:
@@ -69,6 +90,7 @@ def main() -> None:
             and abs(float(existing_summary.get("tote_x_m", float("inf"))) - tote_x)
             < 1e-12
             and all(path.is_file() for path in required_outputs)
+            and has_world_model_contract(required_outputs[0])
         )
         if reuse:
             print(f"Reusing successful episode {episode_index:04d}", flush=True)

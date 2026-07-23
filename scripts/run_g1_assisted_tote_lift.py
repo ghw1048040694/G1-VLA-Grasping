@@ -255,6 +255,9 @@ def main() -> None:
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, item)
         for item in ("left_assisted_grasp", "right_assisted_grasp")
     ]
+    tote_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "warehouse_tote"
+    )
 
     renderer = mujoco.Renderer(
         model, height=args.render_height, width=args.render_width
@@ -283,6 +286,15 @@ def main() -> None:
     demonstration_actions = []
     demonstration_phases = []
     demonstration_assist_active = []
+    demonstration_tote_position = []
+    demonstration_tote_quaternion = []
+    demonstration_tote_linear_velocity = []
+    demonstration_tote_angular_velocity = []
+    demonstration_palm_position = []
+    demonstration_bilateral_contact = []
+    demonstration_table_contact = []
+    demonstration_tote_lift_height = []
+    demonstration_task_progress = []
 
     dt = float(model.opt.timestep)
     total_time = 10.0
@@ -369,6 +381,7 @@ def main() -> None:
             actuator_samples += 1
 
         table_contact_now = False
+        bilateral_contact_now = {"left": False, "right": False}
         for contact_index in range(data.ncon):
             contact = data.contact[contact_index]
             bodies = {
@@ -385,8 +398,10 @@ def main() -> None:
             }
             if "warehouse_tote" in bodies:
                 if any(item.startswith("left_hand_") for item in bodies):
+                    bilateral_contact_now["left"] = True
                     bilateral_contact_seen["left"] = True
                 if any(item.startswith("right_hand_") for item in bodies):
+                    bilateral_contact_now["right"] = True
                     bilateral_contact_seen["right"] = True
                 if "world" in bodies:
                     table_contact_now = True
@@ -410,6 +425,34 @@ def main() -> None:
                 )
                 demonstration_phases.append(task_phase)
                 demonstration_assist_active.append(int(time_s >= 4.0))
+                demonstration_tote_position.append(data.xpos[tote_body_id].copy())
+                demonstration_tote_quaternion.append(data.xquat[tote_body_id].copy())
+                demonstration_tote_angular_velocity.append(
+                    data.cvel[tote_body_id, :3].copy()
+                )
+                demonstration_tote_linear_velocity.append(
+                    data.cvel[tote_body_id, 3:].copy()
+                )
+                demonstration_palm_position.append(
+                    np.stack([data.site_xpos[site_id].copy() for site_id in palm_ids])
+                )
+                demonstration_bilateral_contact.append(
+                    [
+                        int(bilateral_contact_now["left"]),
+                        int(bilateral_contact_now["right"]),
+                    ]
+                )
+                demonstration_table_contact.append(int(table_contact_now))
+                current_lift = float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z
+                demonstration_tote_lift_height.append(current_lift)
+                contact_progress = (
+                    int(bilateral_contact_now["left"])
+                    + int(bilateral_contact_now["right"])
+                ) / 2.0
+                lift_progress = float(np.clip(current_lift / 0.10, 0.0, 1.0))
+                demonstration_task_progress.append(
+                    (task_phase / 5.0 + contact_progress + lift_progress) / 3.0
+                )
                 for camera_name, camera_writer in task_camera_writers.items():
                     renderer.update_scene(data, camera=camera_name)
                     camera_writer.append_data(renderer.render())
@@ -421,7 +464,6 @@ def main() -> None:
     mujoco.mj_forward(model, data)
     final_tote_z = float(data.site_xpos[tote_site_ids[0], 2])
     tote_lift_height = final_tote_z - initial_tote_z
-    tote_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "warehouse_tote")
     final_tote_speed = float(np.linalg.norm(data.cvel[tote_body_id, 3:]))
     report = {
         "experiment": "G1WH-22-assisted-bimanual-tote-lift",
@@ -477,6 +519,25 @@ def main() -> None:
             action_joint_position_rad=np.asarray(demonstration_actions, dtype=np.float32),
             task_phase=np.asarray(demonstration_phases, dtype=np.int64),
             assisted_grasp_active=np.asarray(demonstration_assist_active, dtype=np.int8),
+            tote_position_m=np.asarray(demonstration_tote_position, dtype=np.float32),
+            tote_quaternion_wxyz=np.asarray(
+                demonstration_tote_quaternion, dtype=np.float32
+            ),
+            tote_linear_velocity_m_s=np.asarray(
+                demonstration_tote_linear_velocity, dtype=np.float32
+            ),
+            tote_angular_velocity_rad_s=np.asarray(
+                demonstration_tote_angular_velocity, dtype=np.float32
+            ),
+            palm_position_m=np.asarray(demonstration_palm_position, dtype=np.float32),
+            bilateral_hand_contact=np.asarray(
+                demonstration_bilateral_contact, dtype=np.int8
+            ),
+            table_contact=np.asarray(demonstration_table_contact, dtype=np.int8),
+            tote_lift_height_m=np.asarray(
+                demonstration_tote_lift_height, dtype=np.float32
+            ),
+            task_progress=np.asarray(demonstration_task_progress, dtype=np.float32),
         )
         metadata = {
             "task": "assisted_bimanual_tote_lift",
@@ -489,6 +550,17 @@ def main() -> None:
             "image_height": args.render_height,
             "joint_count": len(controlled_names),
             "task_cameras": list(task_camera_names),
+            "world_model_features": {
+                "tote_position_m": 3,
+                "tote_quaternion_wxyz": 4,
+                "tote_linear_velocity_m_s": 3,
+                "tote_angular_velocity_rad_s": 3,
+                "palm_position_m": [2, 3],
+                "bilateral_hand_contact": 2,
+                "table_contact": 1,
+                "tote_lift_height_m": 1,
+                "task_progress": 1,
+            },
             "dataset": str(dataset_path),
         }
         (args.output_dir / "episode_metadata.json").write_text(

@@ -1048,3 +1048,20 @@ least 15/20 strict successes for a promising result; 10-14 is partial, and below
 10 rejects data scaling alone. Visual shaking, per-phase acceleration, final
 height, speed, joint-limit violations, and waist angle remain mandatory review
 dimensions regardless of success count.
+
+G1WH-40 also establishes the shared VLA/world-model data contract. Every expert
+frame now stores tote position and quaternion, linear and angular velocity, both
+palm positions, bilateral contact flags, table contact, lift height, and a
+normalized task-progress target in addition to images, joint state, phase, and
+action. Resume validation rejects older episodes that lack these fields. This
+prevents the later world-model stage from requiring a second 120-episode data
+collection.
+
+The final project target is language-conditioned predictive G1 manipulation:
+SmolVLA proposes action chunks, an action-conditioned world model predicts their
+future object state and safety, and model-predictive control executes only the
+best chunk prefix before replanning. The required evaluation compares VLA-only
+against VLA plus world-model planning under identical initial conditions, then
+tests sim-to-sim transfer between physics backends. G1WH-40 supplies the scaled
+data and defensible VLA-only baseline for that integration; it is not itself the
+completed world-model project.
