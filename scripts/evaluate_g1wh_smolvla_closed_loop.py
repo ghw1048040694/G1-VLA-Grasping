@@ -37,6 +37,8 @@ from run_g1_assisted_tote_lift import (
     object_name,
 )
 from validate_g1_bimanual_actuation import apply_regularized_dynamics, unitree_gains
+import train_g1_world_model as world_model_utils
+from train_g1_hybrid_world_model import build_hybrid_from_checkpoint
 
 
 TASK_CAMERAS = {
@@ -129,6 +131,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=2707)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--world-model-checkpoint", type=Path)
+    parser.add_argument("--world-model-candidates", type=int, default=4)
+    parser.add_argument("--world-model-horizon", type=int, default=5)
+    parser.add_argument(
+        "--compare-world-model-planner",
+        action="store_true",
+        help="Evaluate both VLA-only and VLA plus world-model candidate ranking.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -336,6 +346,163 @@ def contact_state(
     return bilateral, table_contact
 
 
+def world_model_state(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    controlled: dict[str, dict[str, int]],
+    upper_names: list[str],
+    tote_body_id: int,
+    tote_site_id: int,
+    palm_ids: list[int],
+    initial_tote_z: float,
+    phase: int,
+) -> np.ndarray:
+    bilateral, table_contact = contact_state(model, data)
+    hands = np.asarray(
+        (float(bilateral["left"]), float(bilateral["right"])), dtype=np.float32
+    )
+    lift = float(data.site_xpos[tote_site_id, 2] - initial_tote_z)
+    progress = (
+        float(phase) / 5.0
+        + float(hands.mean())
+        + float(np.clip(lift / 0.10, 0.0, 1.0))
+    ) / 3.0
+    state = np.concatenate(
+        (
+            [data.qpos[controlled[name]["qpos_id"]] for name in upper_names],
+            [data.qvel[controlled[name]["qvel_id"]] for name in upper_names],
+            data.xpos[tote_body_id],
+            data.xquat[tote_body_id],
+            data.cvel[tote_body_id, 3:],
+            data.cvel[tote_body_id, :3],
+            np.stack([data.site_xpos[item] for item in palm_ids]).reshape(-1),
+            hands,
+            (float(table_contact), lift, progress),
+        )
+    ).astype(np.float32)
+    if state.shape != (world_model_utils.LAYOUT.state_dim,):
+        raise RuntimeError(f"Unexpected world-model state shape: {state.shape}")
+    return state
+
+
+@torch.no_grad()
+def select_world_model_candidate(
+    policy,
+    batch: dict,
+    planner: dict,
+    current_state: np.ndarray,
+    previous_action: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    base_seed: int,
+    device: str,
+) -> tuple[np.ndarray, dict]:
+    candidates = []
+    raw_candidates = []
+    inference_started = time.perf_counter()
+    for candidate_index in range(planner["candidate_count"]):
+        raw = (
+            policy.predict_action_chunk(
+                batch,
+                noise=seeded_noise(policy, base_seed + candidate_index * 1_000_003, device),
+            )[0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        raw_candidates.append(raw)
+        candidates.append(np.clip(raw, lower, upper))
+    policy_inference_s = time.perf_counter() - inference_started
+    horizon = min(planner["horizon"], min(len(item) for item in candidates))
+    stats = planner["stats"]
+    initial = (current_state - stats["state_mean"]) / stats["state_std"]
+    candidate_actions = np.stack([item[:horizon] for item in candidates]).astype(np.float32)
+    normalized_actions = (
+        candidate_actions - stats["action_mean"][None, None, :]
+    ) / stats["action_std"][None, None, :]
+    initial_batch = np.repeat(initial[None, :], len(candidates), axis=0).astype(np.float32)
+    prediction_started = time.perf_counter()
+    predicted = world_model_utils.rollout(
+        planner["model"],
+        torch.from_numpy(initial_batch).to(device),
+        torch.from_numpy(normalized_actions).to(device),
+    ).cpu().numpy()
+    world_model_inference_s = time.perf_counter() - prediction_started
+    predicted = predicted * stats["state_std"][None, None, :] + stats["state_mean"][None, None, :]
+    endpoint = predicted[:, -1]
+    layout = world_model_utils.LAYOUT
+    q_low, q_high = layout.joint_position
+    contact_low, contact_high = layout.bilateral_contact
+    table_index = layout.table_contact[0]
+    lift_index = layout.lift_height[0]
+    progress_index = layout.task_progress[0]
+    linear_low, linear_high = layout.tote_linear_velocity
+    angular_low, angular_high = layout.tote_angular_velocity
+    quaternion_low, quaternion_high = layout.tote_quaternion
+
+    scores = []
+    components = []
+    for index in range(len(candidates)):
+        raw = raw_candidates[index][:horizon]
+        clipped = candidate_actions[index]
+        clip_rmse = float(np.sqrt(np.mean((raw - clipped) ** 2)))
+        action_sequence = np.concatenate((previous_action[None, :], clipped), axis=0)
+        smoothness = float(np.sqrt(np.mean(np.diff(action_sequence, axis=0) ** 2)))
+        predicted_qpos = predicted[index, :, q_low:q_high]
+        lower_violation = np.maximum(lower[None, :] - predicted_qpos, 0.0)
+        upper_violation = np.maximum(predicted_qpos - upper[None, :], 0.0)
+        predicted_violation = float(
+            np.sqrt(np.mean((lower_violation + upper_violation) ** 2))
+        )
+        quaternion = endpoint[index, quaternion_low:quaternion_high]
+        quaternion /= max(float(np.linalg.norm(quaternion)), 1e-8)
+        upright_error = float(2.0 * np.arccos(np.clip(abs(quaternion[0]), 0.0, 1.0)))
+        lift_score = float(np.clip(endpoint[index, lift_index] / 0.10, -0.5, 1.5))
+        contact_score = float(np.mean(endpoint[index, contact_low:contact_high]))
+        progress_score = float(endpoint[index, progress_index])
+        table_contact = float(endpoint[index, table_index])
+        linear_speed = float(np.linalg.norm(endpoint[index, linear_low:linear_high]))
+        angular_speed = float(np.linalg.norm(endpoint[index, angular_low:angular_high]))
+        score = (
+            8.0 * progress_score
+            + 6.0 * lift_score
+            + 2.0 * contact_score
+            - 6.0 * table_contact
+            - 1.5 * linear_speed
+            - 0.3 * angular_speed
+            - 0.5 * upright_error
+            - 40.0 * clip_rmse
+            - 25.0 * predicted_violation
+            - 0.5 * smoothness
+        )
+        scores.append(score)
+        components.append(
+            {
+                "score": score,
+                "predicted_progress": progress_score,
+                "predicted_lift_m": float(endpoint[index, lift_index]),
+                "predicted_contact": contact_score,
+                "predicted_table_contact": table_contact,
+                "predicted_linear_speed_m_s": linear_speed,
+                "predicted_upright_error_rad": upright_error,
+                "action_clip_rmse_rad": clip_rmse,
+                "predicted_joint_violation_rmse_rad": predicted_violation,
+                "action_smoothness_rmse_rad": smoothness,
+            }
+        )
+    selected = int(np.argmax(scores))
+    sorted_scores = np.sort(np.asarray(scores))
+    score_margin = float(sorted_scores[-1] - sorted_scores[-2]) if len(scores) > 1 else 0.0
+    return candidates[selected], {
+        "selected_index": selected,
+        "selected_nonbaseline": selected != 0,
+        "score_margin": score_margin,
+        "policy_inference_s": policy_inference_s,
+        "world_model_inference_s": world_model_inference_s,
+        "candidate_scores": components,
+    }
+
+
 def stability_metrics(
     states: np.ndarray,
     commands: np.ndarray,
@@ -406,6 +573,7 @@ def run_episode(
     expected_upper_names: list[str],
     device: str,
     hold_policy=None,
+    world_model_planner: dict | None = None,
 ) -> dict:
     episode_index = int(episode["episode_index"])
     episode_instruction = episode["language_instruction"]
@@ -511,6 +679,10 @@ def run_episode(
     commands = []
     tote_heights = []
     inference_times = []
+    world_model_inference_times = []
+    planner_score_margins = []
+    planner_selected_indices = []
+    planner_nonbaseline_selections = 0
     scheduler_phase = 0
     hold_latched = False
     phase_history = []
@@ -584,26 +756,56 @@ def run_episode(
                 )
             else:
                 batch = render_observation(task_renderer, data, upper_state, task, device)
-                inference_started = time.perf_counter()
                 active_policy = (
                     hold_policy
                     if hold_policy is not None and scheduler_phase == 5
                     else policy
                 )
-                current_chunk = (
-                    active_policy.predict_action_chunk(
+                base_seed = args.seed + episode_index * 10_000 + frame
+                if world_model_planner is None:
+                    inference_started = time.perf_counter()
+                    current_chunk = (
+                        active_policy.predict_action_chunk(
+                            batch,
+                            noise=seeded_noise(active_policy, base_seed, device),
+                        )[0]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    inference_times.append(time.perf_counter() - inference_started)
+                else:
+                    planner_state = world_model_state(
+                        model,
+                        data,
+                        controlled,
+                        upper_names,
+                        tote_body_id,
+                        tote_site_ids[0],
+                        palm_ids,
+                        initial_tote_z,
+                        scheduler_phase,
+                    )
+                    current_chunk, planner_report = select_world_model_candidate(
+                        active_policy,
                         batch,
-                        noise=seeded_noise(
-                            active_policy,
-                            args.seed + episode_index * 10_000 + frame,
-                            device,
-                        ),
-                    )[0]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                )
-                inference_times.append(time.perf_counter() - inference_started)
+                        world_model_planner,
+                        planner_state,
+                        previous_action,
+                        upper_lower,
+                        upper_upper,
+                        base_seed,
+                        device,
+                    )
+                    inference_times.append(planner_report["policy_inference_s"])
+                    world_model_inference_times.append(
+                        planner_report["world_model_inference_s"]
+                    )
+                    planner_score_margins.append(planner_report["score_margin"])
+                    planner_selected_indices.append(planner_report["selected_index"])
+                    planner_nonbaseline_selections += int(
+                        planner_report["selected_nonbaseline"]
+                    )
         if current_chunk is None or chunk_index >= len(current_chunk):
             raise RuntimeError("Policy did not produce enough actions for replanning")
         raw_action = current_chunk[chunk_index].astype(np.float64)
@@ -796,6 +998,31 @@ def run_episode(
         "actuator_saturation_fraction": saturated_samples / actuator_samples,
         "mean_inference_s": float(np.mean(inference_times)),
         "p95_inference_s": float(np.percentile(inference_times, 95)),
+        "world_model_planner_enabled": world_model_planner is not None,
+        "world_model_candidate_count": (
+            world_model_planner["candidate_count"] if world_model_planner else 1
+        ),
+        "world_model_horizon": (
+            world_model_planner["horizon"] if world_model_planner else None
+        ),
+        "mean_world_model_inference_s": (
+            float(np.mean(world_model_inference_times))
+            if world_model_inference_times
+            else None
+        ),
+        "planner_replans": len(planner_selected_indices),
+        "planner_nonbaseline_selection_rate": (
+            planner_nonbaseline_selections / len(planner_selected_indices)
+            if planner_selected_indices
+            else None
+        ),
+        "mean_planner_score_margin": (
+            float(np.mean(planner_score_margins)) if planner_score_margins else None
+        ),
+        "planner_selected_index_counts": {
+            str(index): planner_selected_indices.count(index)
+            for index in sorted(set(planner_selected_indices))
+        },
         "wall_time_s": time.perf_counter() - started,
         "video": str(video_path),
         "hold_substep_joint_velocity_rmse_rad_s": (
@@ -934,6 +1161,13 @@ def aggregate(reports: list[dict]) -> dict:
         "mean_inference_s": float(
             np.mean([report["mean_inference_s"] for report in reports])
         ),
+        "mean_world_model_inference_s": mean_available(
+            "mean_world_model_inference_s"
+        ),
+        "mean_planner_nonbaseline_selection_rate": mean_available(
+            "planner_nonbaseline_selection_rate"
+        ),
+        "mean_planner_score_margin": mean_available("mean_planner_score_margin"),
         "mean_hold_action_delta_rmse_rad": mean_available(
             "hold_action_delta_rmse_rad"
         ),
@@ -1013,6 +1247,15 @@ def main() -> None:
         raise ValueError(
             "--terminal-hold-controller requires --phase-language-scheduler"
         )
+    if args.compare_world_model_planner and args.world_model_checkpoint is None:
+        raise ValueError(
+            "--compare-world-model-planner requires --world-model-checkpoint"
+        )
+    if args.world_model_checkpoint is not None:
+        if args.world_model_candidates < 2:
+            raise ValueError("world-model-candidates must be at least 2")
+        if args.world_model_horizon < 1:
+            raise ValueError("world-model-horizon must be positive")
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     source = json.loads(args.source_summary.read_text(encoding="utf-8"))
     episodes = source["episodes"][
@@ -1028,6 +1271,20 @@ def main() -> None:
     if missing:
         raise FileNotFoundError(f"Checkpoint directories do not exist: {missing}")
     all_reports = {}
+    world_model_planner = None
+    if args.world_model_checkpoint is not None:
+        checkpoint = torch.load(
+            args.world_model_checkpoint, map_location=device, weights_only=False
+        )
+        world_model_planner = {
+            "model": build_hybrid_from_checkpoint(
+                checkpoint, torch.device(device)
+            ).eval(),
+            "stats": checkpoint["normalizers"],
+            "candidate_count": args.world_model_candidates,
+            "horizon": args.world_model_horizon,
+            "checkpoint": str(args.world_model_checkpoint),
+        }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.skip_standalone and not hybrids:
         raise ValueError("--skip-standalone requires at least one --hybrid")
@@ -1046,6 +1303,20 @@ def main() -> None:
                 )
                 for episode in episodes
             ]
+            if args.compare_world_model_planner:
+                planner_name = f"{policy_name}_world_model_mpc"
+                all_reports[planner_name] = [
+                    run_episode(
+                        policy,
+                        planner_name,
+                        episode,
+                        args,
+                        expected_upper_names,
+                        device,
+                        world_model_planner=world_model_planner,
+                    )
+                    for episode in episodes
+                ]
             del policy
             if device.startswith("cuda"):
                 torch.cuda.empty_cache()
@@ -1083,6 +1354,13 @@ def main() -> None:
         "hold_action_blend_alpha": args.hold_action_blend_alpha,
         "hold_gain_scale": args.hold_gain_scale,
         "terminal_hold_controller": args.terminal_hold_controller,
+        "world_model_checkpoint": (
+            str(args.world_model_checkpoint)
+            if args.world_model_checkpoint is not None
+            else None
+        ),
+        "world_model_candidates": args.world_model_candidates,
+        "world_model_horizon": args.world_model_horizon,
         "assist_solref_timeconst_s": args.assist_solref_timeconst,
         "executed_chunk_duration_s": args.replan_steps / args.control_fps,
         "policies": {
