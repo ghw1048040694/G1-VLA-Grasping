@@ -23,6 +23,7 @@ from validate_g1_bimanual_actuation import (
 )
 
 OBJECT_NAMES = ("red_triangle", "yellow_rod", "green_cube")
+EXPERT_CONTRACT_VERSION = "g1lang_v2_bimanual_safe_approach"
 OBJECT_LABELS = {
     "red_triangle": "red triangular prism",
     "yellow_rod": "yellow rod",
@@ -32,11 +33,17 @@ INSTRUCTIONS = {
     name: f"put the {label} into the blue box" for name, label in OBJECT_LABELS.items()
 }
 PALM_NAMES = ("left_palm_center", "right_palm_center")
+LEFT_PALM_INDEX = 0
 RIGHT_PALM_INDEX = 1
 HOME_POSITIONS_M = np.array(((0.22, 0.32, 1.00), (0.22, -0.32, 1.00)))
 WAIST_PITCH_LIMIT_RAD = 0.10
 TABLE_TOP_Z_M = 0.75
-BIN_POSITION_M = np.array((0.59, -0.23, TABLE_TOP_Z_M + 0.01))
+BIN_POSITION_M = np.array((0.59, 0.00, TABLE_TOP_Z_M + 0.01))
+OBJECT_SLOTS_XY_M = (
+    np.array((0.36, -0.34)),
+    np.array((0.34, -0.10)),
+    np.array((0.36, 0.20)),
+)
 OBJECT_ASSIST_Z_M = {
     "red_triangle": 0.055,
     "yellow_rod": 0.050,
@@ -146,13 +153,24 @@ def add_free_object(
         ET.SubElement(
             body,
             "geom",
-            name=f"{name}_geom",
+            name=f"{name}_visual",
             type="cylinder",
             fromto="-0.09 0 0 0.09 0 0",
             size="0.025",
-            mass="0.20",
-            friction="0.9 0.02 0.002",
+            contype="0",
+            conaffinity="0",
+            density="0",
             rgba="0.95 0.78 0.05 1",
+        )
+        ET.SubElement(
+            body,
+            "geom",
+            name=f"{name}_collision",
+            type="box",
+            size="0.09 0.025 0.025",
+            mass="0.20",
+            friction="0.9 0.02 0.01",
+            rgba="0.95 0.78 0.05 0",
         )
     else:
         ET.SubElement(
@@ -183,15 +201,16 @@ def add_free_object(
         size="0.009",
         rgba="1 1 0 0.35",
     )
-    ET.SubElement(
-        equality,
-        "connect",
-        name=f"{name}_assisted_grasp",
-        site1="right_palm_center",
-        site2=f"{name}_assist_site",
-        active="false",
-        solref="0.02 1",
-    )
+    for side, palm_name in zip(("left", "right"), PALM_NAMES):
+        ET.SubElement(
+            equality,
+            "connect",
+            name=f"{name}_{side}_assisted_grasp",
+            site1=palm_name,
+            site2=f"{name}_assist_site",
+            active="false",
+            solref="0.02 1",
+        )
 
 
 def add_blue_box(scene: ET.Element) -> None:
@@ -338,9 +357,11 @@ def solve_pose(
         float(np.linalg.norm(data.site_xpos[site] - target))
         for site, target in zip(palm_ids, target_positions)
     ]
+    maximum_error = max(errors)
     return solution.x.copy(), {
-        "solver_success": bool(solution.success),
-        "maximum_position_error_m": max(errors),
+        "solver_success": bool(maximum_error <= 0.08),
+        "optimizer_converged": bool(solution.success),
+        "maximum_position_error_m": maximum_error,
         "cost": float(solution.cost),
     }
 
@@ -376,14 +397,12 @@ def main() -> None:
     offsets = tuple(
         np.asarray(offset_values[index : index + 2]) for index in range(0, 6, 2)
     )
-    slots_xy = (
-        np.array((0.36, -0.34)),
-        np.array((0.34, -0.10)),
-        np.array((0.36, 0.14)),
-    )
     positions = {
         name: np.array(
-            (*(slots_xy[permutation[index]] + offsets[index]), OBJECT_SPAWN_Z_M[name])
+            (
+                *(OBJECT_SLOTS_XY_M[permutation[index]] + offsets[index]),
+                OBJECT_SPAWN_Z_M[name],
+            )
         )
         for index, name in enumerate(OBJECT_NAMES)
     }
@@ -409,9 +428,12 @@ def main() -> None:
         for name in OBJECT_NAMES
     }
     equality_ids = {
-        name: mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_EQUALITY, f"{name}_assisted_grasp"
+        (arm_index, name): mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_EQUALITY,
+            f"{name}_{'left' if arm_index == LEFT_PALM_INDEX else 'right'}_assisted_grasp",
         )
+        for arm_index in (LEFT_PALM_INDEX, RIGHT_PALM_INDEX)
         for name in OBJECT_NAMES
     }
     bin_site_id = mujoco.mj_name2id(
@@ -434,17 +456,38 @@ def main() -> None:
     mujoco.mj_resetData(model, data)
     mujoco.mj_forward(model, data)
     object_assist = data.site_xpos[object_site_ids[args.target_object]].copy()
+    active_palm_index = (
+        LEFT_PALM_INDEX if object_assist[1] >= 0.05 else RIGHT_PALM_INDEX
+    )
+    active_side = "left" if active_palm_index == LEFT_PALM_INDEX else "right"
+    high_pregrasp_targets = HOME_POSITIONS_M.copy()
+    high_pregrasp_targets[active_palm_index] = object_assist + np.array(
+        (0.0, 0.0, 0.28)
+    )
     pregrasp_targets = HOME_POSITIONS_M.copy()
-    pregrasp_targets[RIGHT_PALM_INDEX] = object_assist + np.array((0.0, -0.015, 0.12))
+    lateral_offset = 0.015 if active_palm_index == LEFT_PALM_INDEX else -0.015
+    pregrasp_targets[active_palm_index] = object_assist + np.array(
+        (0.0, lateral_offset, 0.12)
+    )
     grasp_targets = HOME_POSITIONS_M.copy()
-    grasp_targets[RIGHT_PALM_INDEX] = object_assist
+    grasp_targets[active_palm_index] = object_assist
     lift_targets = grasp_targets.copy()
-    lift_targets[RIGHT_PALM_INDEX, 2] += 0.18
+    lift_targets[active_palm_index, 2] += 0.22
     place_targets = HOME_POSITIONS_M.copy()
-    place_targets[RIGHT_PALM_INDEX] = data.site_xpos[bin_site_id].copy()
+    place_targets[active_palm_index] = data.site_xpos[bin_site_id].copy()
     retreat_targets = place_targets.copy()
-    retreat_targets[RIGHT_PALM_INDEX, 2] += 0.14
+    retreat_targets[active_palm_index, 2] += 0.18
 
+    high_pregrasp_pose, high_pregrasp_report = solve_pose(
+        model,
+        data,
+        palm_ids,
+        selected_qpos_ids,
+        lower,
+        upper,
+        high_pregrasp_targets,
+        home_pose,
+    )
     pregrasp_pose, pregrasp_report = solve_pose(
         model,
         data,
@@ -453,7 +496,7 @@ def main() -> None:
         lower,
         upper,
         pregrasp_targets,
-        home_pose,
+        high_pregrasp_pose,
     )
     grasp_pose, grasp_report = solve_pose(
         model,
@@ -483,6 +526,7 @@ def main() -> None:
     )
     pose_reports = {
         "home": home_report,
+        "high_pregrasp": high_pregrasp_report,
         "pregrasp": pregrasp_report,
         "grasp": grasp_report,
         "lift": lift_report,
@@ -557,14 +601,19 @@ def main() -> None:
         time_s = step * dt
         if time_s < 0.5:
             selected_pose, phase = home_pose, 0
-        elif time_s < 2.5:
+        elif time_s < 2.3:
             selected_pose, phase = (
-                interpolate(home_pose, pregrasp_pose, (time_s - 0.5) / 2.0),
+                interpolate(home_pose, high_pregrasp_pose, (time_s - 0.5) / 1.8),
                 1,
+            )
+        elif time_s < 3.1:
+            selected_pose, phase = (
+                interpolate(high_pregrasp_pose, pregrasp_pose, (time_s - 2.3) / 0.8),
+                2,
             )
         elif time_s < 4.0:
             selected_pose, phase = (
-                interpolate(pregrasp_pose, grasp_pose, (time_s - 2.5) / 1.5),
+                interpolate(pregrasp_pose, grasp_pose, (time_s - 3.1) / 0.9),
                 2,
             )
         elif time_s < 4.8:
@@ -590,9 +639,11 @@ def main() -> None:
             selected_pose, phase = retreat_pose, 7
 
         grasp_active = 4.0 <= time_s < 9.35
-        for name, equality_id in equality_ids.items():
+        for (arm_index, name), equality_id in equality_ids.items():
             data.eq_active[equality_id] = int(
-                grasp_active and name == args.target_object
+                grasp_active
+                and arm_index == active_palm_index
+                and name == args.target_object
             )
         close_alpha = smoothstep((time_s - 4.0) / 0.6)
         open_alpha = smoothstep((time_s - 9.25) / 0.45)
@@ -601,7 +652,7 @@ def main() -> None:
         for name, index in selected_index.items():
             commanded[name] = float(selected_pose[index])
         for name, closed in HAND_TARGETS.items():
-            if name.startswith("right_hand_"):
+            if name.startswith(f"{active_side}_hand_"):
                 commanded[name] = (1.0 - hand_alpha) * open_hand_targets[
                     name
                 ] + hand_alpha * 0.4 * closed
@@ -656,6 +707,7 @@ def main() -> None:
                 )
                 records["task_phase"].append(phase)
                 records["assist_active"].append(int(grasp_active))
+                records["active_arm_index"].append(active_palm_index)
                 records["object_position_m"].append(
                     np.stack(
                         [
@@ -715,9 +767,11 @@ def main() -> None:
     instruction = args.language_instruction or INSTRUCTIONS[args.target_object]
     summary = {
         "experiment": "G1-Language-Grounded-Manipulation",
+        "expert_contract_version": EXPERT_CONTRACT_VERSION,
         "task": "language_conditioned_object_to_box",
         "language_instruction": instruction,
         "target_object": args.target_object,
+        "active_arm": active_side,
         "object_order": list(OBJECT_NAMES),
         "slot_permutation": list(permutation),
         "slot_offsets_xy_m": [offset.tolist() for offset in offsets],
@@ -755,6 +809,7 @@ def main() -> None:
             ),
             task_phase=np.asarray(records["task_phase"], dtype=np.int64),
             assist_active=np.asarray(records["assist_active"], dtype=np.int64),
+            active_arm_index=np.asarray(records["active_arm_index"], dtype=np.int64),
             object_position_m=np.asarray(
                 records["object_position_m"], dtype=np.float32
             ),

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from run_g1_language_pick_place import OBJECT_NAMES
+from run_g1_language_pick_place import EXPERT_CONTRACT_VERSION, OBJECT_NAMES
 
 LANGUAGE_VARIANTS = {
     "red_triangle": (
@@ -68,6 +68,7 @@ def collect_episode(args: argparse.Namespace, spec: dict) -> dict:
         args.resume_successful
         and existing
         and existing.get("passed")
+        and existing.get("expert_contract_version") == EXPERT_CONTRACT_VERSION
         and existing.get("target_object") == spec["target_object"]
         and existing.get("slot_permutation") == spec["slot_permutation"]
         and np.allclose(
@@ -191,6 +192,7 @@ def main() -> None:
     }
     summary = {
         "experiment": "G1-Language-Grounded-Manipulation-Production-Dataset",
+        "expert_contract_version": EXPERT_CONTRACT_VERSION,
         "seed": args.seed,
         "episodes": args.episodes,
         "successful_episodes": sum(item["passed"] for item in results),

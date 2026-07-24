@@ -77,6 +77,11 @@ def dataset_features(joint_names: list[str]) -> dict:
             "shape": (1,),
             "names": ["assisted_grasp_active"],
         },
+        "complementary_info.active_arm_index": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["active_arm_index_0_left_1_right"],
+        },
     }
     for key in CAMERAS:
         features[key] = {
@@ -109,6 +114,7 @@ def load_episode(episode_dir: Path) -> tuple[np.lib.npyio.NpzFile, dict, list[st
         "action_joint_position_rad": (frame_count, 43),
         "object_position_m": (frame_count, 3, 3),
         "object_quaternion_wxyz": (frame_count, 3, 4),
+        "active_arm_index": (frame_count,),
     }
     for key, shape in expected_shapes.items():
         if arrays[key].shape != shape:
@@ -184,6 +190,9 @@ def convert_split(
                     ),
                     "complementary_info.assisted_grasp_active": np.asarray(
                         [arrays["assist_active"][frame_index]], dtype=np.int64
+                    ),
+                    "complementary_info.active_arm_index": np.asarray(
+                        [arrays["active_arm_index"][frame_index]], dtype=np.int64
                     ),
                 }
                 for key, reader in readers.items():

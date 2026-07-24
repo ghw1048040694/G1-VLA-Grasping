@@ -27,8 +27,10 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
 from run_g1_language_pick_place import (
     BIN_POSITION_M,
+    LEFT_PALM_INDEX,
     HOME_POSITIONS_M,
     OBJECT_NAMES,
+    OBJECT_SLOTS_XY_M,
     OBJECT_SPAWN_Z_M,
     PALM_NAMES,
     arm_ik_contract,
@@ -159,15 +161,13 @@ def run_episode(
     episode_index = spec["episode_index"]
     output_dir = args.output_dir / f"episode_{episode_index:04d}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    slots_xy = (
-        np.asarray((0.36, -0.34)),
-        np.asarray((0.34, -0.10)),
-        np.asarray((0.36, 0.14)),
-    )
     positions = {
         name: np.asarray(
             (
-                *(slots_xy[spec["permutation"][index]] + spec["offsets"][index]),
+                *(
+                    OBJECT_SLOTS_XY_M[spec["permutation"][index]]
+                    + spec["offsets"][index]
+                ),
                 OBJECT_SPAWN_Z_M[name],
             )
         )
@@ -196,9 +196,12 @@ def run_episode(
         for name in OBJECT_NAMES
     }
     equality_ids = {
-        name: mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_EQUALITY, f"{name}_assisted_grasp"
+        (arm_index, name): mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_EQUALITY,
+            f"{name}_{'left' if arm_index == LEFT_PALM_INDEX else 'right'}_assisted_grasp",
         )
+        for arm_index in range(len(PALM_NAMES))
         for name in OBJECT_NAMES
     }
 
@@ -256,6 +259,7 @@ def run_episode(
     control_frames = round(args.duration_s * args.control_fps)
     current_chunk = None
     grabbed_object = None
+    grabbed_arm_index = None
     assist_activation_frame = None
     assist_release_frame = None
     inference_times = []
@@ -295,21 +299,24 @@ def run_episode(
         previous_action = clipped
 
         if grabbed_object is None and frame >= args.control_fps:
-            palm_position = data.site_xpos[palm_ids[1]]
             distances = {
-                name: float(np.linalg.norm(palm_position - data.site_xpos[site_id]))
+                (arm_index, name): float(
+                    np.linalg.norm(data.site_xpos[palm_id] - data.site_xpos[site_id])
+                )
+                for arm_index, palm_id in enumerate(palm_ids)
                 for name, site_id in object_site_ids.items()
             }
-            nearest = min(distances, key=distances.get)
-            if distances[nearest] <= args.assist_distance_m:
-                grabbed_object = nearest
+            nearest_arm, nearest_object = min(distances, key=distances.get)
+            if distances[(nearest_arm, nearest_object)] <= args.assist_distance_m:
+                grabbed_object = nearest_object
+                grabbed_arm_index = nearest_arm
                 assist_activation_frame = frame
-                data.eq_active[equality_ids[nearest]] = 1
+                data.eq_active[equality_ids[(nearest_arm, nearest_object)]] = 1
         if grabbed_object is not None and assist_release_frame is None:
             object_position = data.xpos[object_body_ids[grabbed_object]]
             relative = object_position - BIN_POSITION_M
             if abs(relative[0]) <= 0.105 and abs(relative[1]) <= 0.125:
-                data.eq_active[equality_ids[grabbed_object]] = 0
+                data.eq_active[equality_ids[(grabbed_arm_index, grabbed_object)]] = 0
                 assist_release_frame = frame
 
         commanded = initial_targets.copy()
@@ -363,6 +370,11 @@ def run_episode(
         "language_instruction": spec["instruction"],
         "target_object": spec["target_object"],
         "grabbed_object": grabbed_object,
+        "grabbed_arm": (
+            PALM_NAMES[grabbed_arm_index].removesuffix("_palm_center")
+            if grabbed_arm_index is not None
+            else None
+        ),
         "selected_correct_object": selected_correct_object,
         "target_in_box": target_in_box,
         "wrong_objects_in_box": wrong_objects_in_box,
