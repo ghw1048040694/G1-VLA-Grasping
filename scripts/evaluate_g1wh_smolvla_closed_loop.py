@@ -144,6 +144,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Reject candidates whose normalized ensemble disagreement exceeds this value.",
     )
+    parser.add_argument(
+        "--world-model-uncertainty-keep-fraction",
+        type=float,
+        help="Keep only this lowest-disagreement fraction of candidates before scoring.",
+    )
     parser.add_argument("--world-model-candidates", type=int, default=4)
     parser.add_argument("--world-model-horizon", type=int, default=5)
     parser.add_argument(
@@ -167,6 +172,11 @@ def parse_args() -> argparse.Namespace:
         "--compare-world-model-planner",
         action="store_true",
         help="Evaluate both VLA-only and VLA plus world-model candidate ranking.",
+    )
+    parser.add_argument(
+        "--compare-unfiltered-ensemble-planner",
+        action="store_true",
+        help="Also evaluate the same ensemble without uncertainty rejection.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
@@ -576,7 +586,12 @@ def select_world_model_candidate(
         )
     threshold = planner["uncertainty_threshold"]
     eligible = np.ones(len(scores), dtype=bool)
-    if threshold is not None and len(planner["models"]) > 1:
+    keep_fraction = planner["uncertainty_keep_fraction"]
+    if keep_fraction is not None and len(planner["models"]) > 1:
+        keep_count = max(1, math.ceil(len(scores) * keep_fraction))
+        eligible[:] = False
+        eligible[np.argsort(candidate_uncertainty)[:keep_count]] = True
+    elif threshold is not None and len(planner["models"]) > 1:
         eligible = candidate_uncertainty <= threshold
     all_candidates_uncertain = not bool(np.any(eligible))
     if all_candidates_uncertain:
@@ -1142,6 +1157,11 @@ def run_episode(
             if world_model_planner
             else None
         ),
+        "world_model_uncertainty_keep_fraction": (
+            world_model_planner["uncertainty_keep_fraction"]
+            if world_model_planner
+            else None
+        ),
         "world_model_horizon": (
             world_model_planner["horizon"] if world_model_planner else None
         ),
@@ -1430,6 +1450,13 @@ def main() -> None:
         raise ValueError(
             "--compare-world-model-planner requires --world-model-checkpoint"
         )
+    if (
+        args.compare_unfiltered_ensemble_planner
+        and not args.world_model_ensemble_checkpoint
+    ):
+        raise ValueError(
+            "--compare-unfiltered-ensemble-planner requires an ensemble"
+        )
     if args.world_model_checkpoint is not None:
         if args.world_model_candidates < 2:
             raise ValueError("world-model-candidates must be at least 2")
@@ -1442,13 +1469,29 @@ def main() -> None:
     if args.world_model_ensemble_checkpoint:
         if len(args.world_model_ensemble_checkpoint) < 2:
             raise ValueError("An ensemble requires at least two additional checkpoints")
-        if args.world_model_uncertainty_threshold is None:
-            raise ValueError("An ensemble requires --world-model-uncertainty-threshold")
+        if (
+            args.world_model_uncertainty_threshold is None
+            and args.world_model_uncertainty_keep_fraction is None
+            and not args.compare_unfiltered_ensemble_planner
+        ):
+            raise ValueError(
+                "An ensemble requires a threshold, keep fraction, or unfiltered comparison"
+            )
     if (
         args.world_model_uncertainty_threshold is not None
         and args.world_model_uncertainty_threshold <= 0.0
     ):
         raise ValueError("--world-model-uncertainty-threshold must be positive")
+    if (
+        args.world_model_uncertainty_keep_fraction is not None
+        and not 0.0 < args.world_model_uncertainty_keep_fraction <= 1.0
+    ):
+        raise ValueError("--world-model-uncertainty-keep-fraction must be in (0, 1]")
+    if (
+        args.world_model_uncertainty_threshold is not None
+        and args.world_model_uncertainty_keep_fraction is not None
+    ):
+        raise ValueError("Use either an uncertainty threshold or keep fraction, not both")
     for name in (
         "planner_body_safety_margin_fraction",
         "planner_hand_safety_margin_fraction",
@@ -1493,6 +1536,9 @@ def main() -> None:
             "checkpoint": str(args.world_model_checkpoint),
             "checkpoint_paths": [str(path) for path in checkpoint_paths],
             "uncertainty_threshold": args.world_model_uncertainty_threshold,
+            "uncertainty_keep_fraction": (
+                args.world_model_uncertainty_keep_fraction
+            ),
         }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.skip_standalone and not hybrids:
@@ -1513,6 +1559,27 @@ def main() -> None:
                 for episode in episodes
             ]
             if args.compare_world_model_planner:
+                if args.compare_unfiltered_ensemble_planner:
+                    unfiltered_name = (
+                        f"{policy_name}_world_model_ensemble_unfiltered"
+                    )
+                    unfiltered_planner = {
+                        **world_model_planner,
+                        "uncertainty_threshold": None,
+                        "uncertainty_keep_fraction": None,
+                    }
+                    all_reports[unfiltered_name] = [
+                        run_episode(
+                            policy,
+                            unfiltered_name,
+                            episode,
+                            args,
+                            expected_upper_names,
+                            device,
+                            world_model_planner=unfiltered_planner,
+                        )
+                        for episode in episodes
+                    ]
                 planner_name = f"{policy_name}_world_model_mpc"
                 all_reports[planner_name] = [
                     run_episode(
@@ -1573,6 +1640,9 @@ def main() -> None:
         ],
         "world_model_uncertainty_threshold": (
             args.world_model_uncertainty_threshold
+        ),
+        "world_model_uncertainty_keep_fraction": (
+            args.world_model_uncertainty_keep_fraction
         ),
         "world_model_candidates": args.world_model_candidates,
         "world_model_horizon": args.world_model_horizon,
