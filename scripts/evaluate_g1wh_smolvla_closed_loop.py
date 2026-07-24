@@ -132,6 +132,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2707)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--world-model-checkpoint", type=Path)
+    parser.add_argument(
+        "--world-model-ensemble-checkpoint",
+        type=Path,
+        action="append",
+        default=[],
+        help="Additional hybrid world-model checkpoint; repeat to form an ensemble.",
+    )
+    parser.add_argument(
+        "--world-model-uncertainty-threshold",
+        type=float,
+        help="Reject candidates whose normalized ensemble disagreement exceeds this value.",
+    )
     parser.add_argument("--world-model-candidates", type=int, default=4)
     parser.add_argument("--world-model-horizon", type=int, default=5)
     parser.add_argument(
@@ -463,23 +475,43 @@ def select_world_model_candidate(
     candidates.extend(np.clip(raw, lower, upper) for raw in raw_candidates)
     policy_inference_s = time.perf_counter() - inference_started
     horizon = min(planner["horizon"], min(len(item) for item in candidates))
-    stats = planner["stats"]
-    initial = (current_state - stats["state_mean"]) / stats["state_std"]
     candidate_actions = np.stack([item[:horizon] for item in candidates]).astype(np.float32)
-    normalized_actions = (
-        candidate_actions - stats["action_mean"][None, None, :]
-    ) / stats["action_std"][None, None, :]
-    initial_batch = np.repeat(initial[None, :], len(candidates), axis=0).astype(np.float32)
     prediction_started = time.perf_counter()
-    predicted = world_model_utils.rollout(
-        planner["model"],
-        torch.from_numpy(initial_batch).to(device),
-        torch.from_numpy(normalized_actions).to(device),
-    ).cpu().numpy()
+    member_predictions = []
+    for model, stats in zip(
+        planner["models"], planner["member_stats"], strict=True
+    ):
+        initial = (current_state - stats["state_mean"]) / stats["state_std"]
+        normalized_actions = (
+            candidate_actions - stats["action_mean"][None, None, :]
+        ) / stats["action_std"][None, None, :]
+        initial_batch = np.repeat(
+            initial[None, :], len(candidates), axis=0
+        ).astype(np.float32)
+        normalized_prediction = world_model_utils.rollout(
+            model,
+            torch.from_numpy(initial_batch).to(device),
+            torch.from_numpy(normalized_actions).to(device),
+        ).cpu().numpy()
+        member_predictions.append(
+            normalized_prediction * stats["state_std"][None, None, :]
+            + stats["state_mean"][None, None, :]
+        )
     world_model_inference_s = time.perf_counter() - prediction_started
-    predicted = predicted * stats["state_std"][None, None, :] + stats["state_mean"][None, None, :]
+    members = np.stack(member_predictions, axis=0)
+    predicted = np.mean(members, axis=0)
     endpoint = predicted[:, -1]
     layout = world_model_utils.LAYOUT
+    object_low = layout.tote_position[0]
+    object_high = layout.task_progress[1]
+    reference_stats = planner["member_stats"][0]
+    normalized_member_endpoints = (
+        members[:, :, -1, object_low:object_high]
+        - reference_stats["state_mean"][None, None, object_low:object_high]
+    ) / reference_stats["state_std"][None, None, object_low:object_high]
+    candidate_uncertainty = np.sqrt(
+        np.mean(np.var(normalized_member_endpoints, axis=0), axis=1)
+    )
     q_low, q_high = layout.joint_position
     contact_low, contact_high = layout.bilateral_contact
     table_index = layout.table_contact[0]
@@ -537,9 +569,21 @@ def select_world_model_candidate(
                 "action_clip_rmse_rad": clip_rmse,
                 "predicted_joint_violation_rmse_rad": predicted_violation,
                 "action_smoothness_rmse_rad": smoothness,
+                "normalized_ensemble_disagreement": float(
+                    candidate_uncertainty[index]
+                ),
             }
         )
-    selected = int(np.argmax(scores))
+    threshold = planner["uncertainty_threshold"]
+    eligible = np.ones(len(scores), dtype=bool)
+    if threshold is not None and len(planner["models"]) > 1:
+        eligible = candidate_uncertainty <= threshold
+    all_candidates_uncertain = not bool(np.any(eligible))
+    if all_candidates_uncertain:
+        selected = 0
+    else:
+        eligible_scores = np.where(eligible, np.asarray(scores), -np.inf)
+        selected = int(np.argmax(eligible_scores))
     sorted_scores = np.sort(np.asarray(scores))
     score_margin = float(sorted_scores[-1] - sorted_scores[-2]) if len(scores) > 1 else 0.0
     return candidates[selected], {
@@ -549,6 +593,9 @@ def select_world_model_candidate(
         "policy_inference_s": policy_inference_s,
         "batched_candidates": planner["batched_candidates"],
         "world_model_inference_s": world_model_inference_s,
+        "selected_uncertainty": float(candidate_uncertainty[selected]),
+        "uncertainty_rejected_fraction": float(np.mean(~eligible)),
+        "all_candidates_uncertain": all_candidates_uncertain,
         "candidate_scores": components,
     }
 
@@ -746,6 +793,9 @@ def run_episode(
     planner_score_margins = []
     planner_selected_indices = []
     planner_nonbaseline_selections = 0
+    planner_selected_uncertainties = []
+    planner_uncertainty_rejected_fractions = []
+    planner_all_candidates_uncertain = 0
     scheduler_phase = 0
     hold_latched = False
     phase_history = []
@@ -868,6 +918,15 @@ def run_episode(
                     planner_selected_indices.append(planner_report["selected_index"])
                     planner_nonbaseline_selections += int(
                         planner_report["selected_nonbaseline"]
+                    )
+                    planner_selected_uncertainties.append(
+                        planner_report["selected_uncertainty"]
+                    )
+                    planner_uncertainty_rejected_fractions.append(
+                        planner_report["uncertainty_rejected_fraction"]
+                    )
+                    planner_all_candidates_uncertain += int(
+                        planner_report["all_candidates_uncertain"]
                     )
         if current_chunk is None or chunk_index >= len(current_chunk):
             raise RuntimeError("Policy did not produce enough actions for replanning")
@@ -1075,6 +1134,14 @@ def run_episode(
         "world_model_candidate_count": (
             world_model_planner["candidate_count"] if world_model_planner else 1
         ),
+        "world_model_ensemble_size": (
+            len(world_model_planner["models"]) if world_model_planner else 0
+        ),
+        "world_model_uncertainty_threshold": (
+            world_model_planner["uncertainty_threshold"]
+            if world_model_planner
+            else None
+        ),
         "world_model_horizon": (
             world_model_planner["horizon"] if world_model_planner else None
         ),
@@ -1106,6 +1173,21 @@ def run_episode(
         ),
         "mean_planner_score_margin": (
             float(np.mean(planner_score_margins)) if planner_score_margins else None
+        ),
+        "mean_planner_selected_uncertainty": (
+            float(np.mean(planner_selected_uncertainties))
+            if planner_selected_uncertainties
+            else None
+        ),
+        "mean_planner_uncertainty_rejected_fraction": (
+            float(np.mean(planner_uncertainty_rejected_fractions))
+            if planner_uncertainty_rejected_fractions
+            else None
+        ),
+        "planner_all_candidates_uncertain_rate": (
+            planner_all_candidates_uncertain / len(planner_selected_indices)
+            if planner_selected_indices
+            else None
         ),
         "planner_selected_index_counts": {
             str(index): planner_selected_indices.count(index)
@@ -1256,6 +1338,15 @@ def aggregate(reports: list[dict]) -> dict:
             "planner_nonbaseline_selection_rate"
         ),
         "mean_planner_score_margin": mean_available("mean_planner_score_margin"),
+        "mean_planner_selected_uncertainty": mean_available(
+            "mean_planner_selected_uncertainty"
+        ),
+        "mean_planner_uncertainty_rejected_fraction": mean_available(
+            "mean_planner_uncertainty_rejected_fraction"
+        ),
+        "mean_planner_all_candidates_uncertain_rate": mean_available(
+            "planner_all_candidates_uncertain_rate"
+        ),
         "mean_hold_action_delta_rmse_rad": mean_available(
             "hold_action_delta_rmse_rad"
         ),
@@ -1344,6 +1435,20 @@ def main() -> None:
             raise ValueError("world-model-candidates must be at least 2")
         if args.world_model_horizon < 1:
             raise ValueError("world-model-horizon must be positive")
+    if args.world_model_ensemble_checkpoint and args.world_model_checkpoint is None:
+        raise ValueError(
+            "--world-model-ensemble-checkpoint requires --world-model-checkpoint"
+        )
+    if args.world_model_ensemble_checkpoint:
+        if len(args.world_model_ensemble_checkpoint) < 2:
+            raise ValueError("An ensemble requires at least two additional checkpoints")
+        if args.world_model_uncertainty_threshold is None:
+            raise ValueError("An ensemble requires --world-model-uncertainty-threshold")
+    if (
+        args.world_model_uncertainty_threshold is not None
+        and args.world_model_uncertainty_threshold <= 0.0
+    ):
+        raise ValueError("--world-model-uncertainty-threshold must be positive")
     for name in (
         "planner_body_safety_margin_fraction",
         "planner_hand_safety_margin_fraction",
@@ -1368,18 +1473,26 @@ def main() -> None:
     all_reports = {}
     world_model_planner = None
     if args.world_model_checkpoint is not None:
-        checkpoint = torch.load(
-            args.world_model_checkpoint, map_location=device, weights_only=False
-        )
+        checkpoint_paths = [
+            args.world_model_checkpoint,
+            *args.world_model_ensemble_checkpoint,
+        ]
+        checkpoints = [
+            torch.load(path, map_location=device, weights_only=False)
+            for path in checkpoint_paths
+        ]
         world_model_planner = {
-            "model": build_hybrid_from_checkpoint(
-                checkpoint, torch.device(device)
-            ).eval(),
-            "stats": checkpoint["normalizers"],
+            "models": [
+                build_hybrid_from_checkpoint(item, torch.device(device)).eval()
+                for item in checkpoints
+            ],
+            "member_stats": [item["normalizers"] for item in checkpoints],
             "candidate_count": args.world_model_candidates,
             "horizon": args.world_model_horizon,
             "batched_candidates": args.world_model_batched_candidates,
             "checkpoint": str(args.world_model_checkpoint),
+            "checkpoint_paths": [str(path) for path in checkpoint_paths],
+            "uncertainty_threshold": args.world_model_uncertainty_threshold,
         }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.skip_standalone and not hybrids:
@@ -1454,6 +1567,12 @@ def main() -> None:
             str(args.world_model_checkpoint)
             if args.world_model_checkpoint is not None
             else None
+        ),
+        "world_model_ensemble_checkpoints": [
+            str(path) for path in args.world_model_ensemble_checkpoint
+        ],
+        "world_model_uncertainty_threshold": (
+            args.world_model_uncertainty_threshold
         ),
         "world_model_candidates": args.world_model_candidates,
         "world_model_horizon": args.world_model_horizon,
