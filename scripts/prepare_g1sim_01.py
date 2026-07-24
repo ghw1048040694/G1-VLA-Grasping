@@ -84,7 +84,7 @@ def main() -> None:
         "source_experiment": "G1MPC-04-rank-filtered-independent-heldout",
         "source_policy": "scaled20000_world_model_mpc",
         "source_episode": 0,
-        "source_simulator": "MuJoCo/Genesis project pipeline",
+        "source_simulator": "MuJoCo",
         "target_simulator": "Isaac Sim 6.0.1 PhysX",
         "control_fps": dataset_info["fps"],
         "physics_fps": 60,

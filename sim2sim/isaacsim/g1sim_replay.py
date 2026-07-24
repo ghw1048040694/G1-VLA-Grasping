@@ -95,6 +95,23 @@ def world_z(stage, prim_path: str) -> float:
     return float(transform.ExtractTranslation()[2])
 
 
+def show_tote_markers(stage, tote_path: str) -> list[str]:
+    marker_names = (
+        "tote_left_grasp_site",
+        "tote_right_grasp_site",
+        "tote_left_assist_site",
+        "tote_right_assist_site",
+    )
+    visible = []
+    for name in marker_names:
+        prim = stage.GetPrimAtPath(f"{tote_path}/{name}")
+        if not prim.IsValid():
+            continue
+        UsdGeom.Imageable(prim).GetPurposeAttr().Set(UsdGeom.Tokens.default_)
+        visible.append(name)
+    return visible
+
+
 def main() -> None:
     enable_required_extensions()
     manifest = json.loads((ARGS.root / "manifest.json").read_text(encoding="utf-8"))
@@ -123,6 +140,8 @@ def main() -> None:
     simulation_app.update()
     default_prim_path = select_physx_variant()
     root_path = find_articulation_root()
+    tote_path = f"{default_prim_path}/Geometry/warehouse_tote"
+    visible_tote_markers = show_tote_markers(stage, tote_path)
     stage.GetRootLayer().Save()
 
     add_light()
@@ -153,6 +172,7 @@ def main() -> None:
         "action_dof_count": len(action_names),
         "missing_action_joints": missing,
         "joint_contract_passed": not missing,
+        "visible_tote_markers": visible_tote_markers,
         "mode": "inspect_only" if ARGS.inspect_only else "offline_action_replay",
     }
     if missing:
@@ -172,7 +192,6 @@ def main() -> None:
 
     if not ARGS.inspect_only:
         substeps = manifest["physics_fps"] // manifest["control_fps"]
-        tote_path = f"{default_prim_path}/Geometry/warehouse_tote"
         for _ in range(round(ARGS.warmup_seconds * manifest["physics_fps"])):
             simulation_app.update()
         initial_tote_z = world_z(stage, tote_path)
