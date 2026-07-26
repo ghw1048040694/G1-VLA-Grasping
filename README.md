@@ -1875,3 +1875,10 @@ finite (`loss=0.024`, `grad_norm=0.819`), but the next backward pass raised
 `CUBLAS_STATUS_INTERNAL_ERROR`. No new checkpoint was written. The original
 5K specialists remain the only valid specialist artifacts; further SmolVLA
 training requires a fresh WSL2/DXG context or a different supported CUDA stack.
+
+## Project Evidence Report
+
+The concise job-search-ready evidence report is maintained at
+`PROJECT_FINAL_REPORT.md`. It lists the validated components, failed gates,
+video paths, reproduction environment, and the exact limitation on further
+specialist training.
