@@ -191,6 +191,7 @@ def make_policy_with_language_adapter(cfg, dataset_meta, checkpoint):
             or key.startswith("model.language_action_adapter.target_classifier.")
             or key.startswith("model.language_action_adapter.target_action_chunk_proj.")
             or key.startswith("model.language_action_adapter.target_action_hidden_proj.")
+            or key.startswith("model.language_action_adapter.target_suffix_proj.")
         }
         if unexpected or set(missing) != allowed_missing:
             raise RuntimeError(

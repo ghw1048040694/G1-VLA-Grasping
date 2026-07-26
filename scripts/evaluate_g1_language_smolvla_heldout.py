@@ -108,6 +108,7 @@ def load_policy(path: Path, train_meta: LeRobotDatasetMetadata, device: str):
             or key.startswith("model.language_action_adapter.target_classifier.")
             or key.startswith("model.language_action_adapter.target_action_chunk_proj.")
             or key.startswith("model.language_action_adapter.target_action_hidden_proj.")
+            or key.startswith("model.language_action_adapter.target_suffix_proj.")
         }
         if unexpected or set(missing) != allowed_missing:
             raise RuntimeError(f"Adapter checkpoint load mismatch: missing={missing}, unexpected={unexpected}")

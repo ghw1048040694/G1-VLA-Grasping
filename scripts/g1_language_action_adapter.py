@@ -45,6 +45,7 @@ class LanguageActionAdapter(nn.Module):
         # action expert's state/time features instead of supplying only a
         # fixed trajectory offset.
         self.target_action_hidden_proj = nn.Linear(output_dim, 3 * action_dim)
+        self.target_suffix_proj = nn.Linear(3, output_dim)
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
         nn.init.zeros_(self.action_output_proj.weight)
@@ -55,6 +56,8 @@ class LanguageActionAdapter(nn.Module):
         nn.init.zeros_(self.target_action_chunk_proj.bias)
         nn.init.zeros_(self.target_action_hidden_proj.weight)
         nn.init.zeros_(self.target_action_hidden_proj.bias)
+        nn.init.zeros_(self.target_suffix_proj.weight)
+        nn.init.zeros_(self.target_suffix_proj.bias)
 
     def forward(self, language_embedding: torch.Tensor) -> torch.Tensor:
         parameter_dtype = self.input_proj.weight.dtype
@@ -87,6 +90,12 @@ class LanguageActionAdapter(nn.Module):
             basis
             * target_probabilities[:, None, :, None].to(dtype=basis.dtype)
         ).sum(dim=2)
+
+    def project_target_suffix(self, target_logits: torch.Tensor) -> torch.Tensor:
+        target_probabilities = target_logits.softmax(dim=-1)
+        return self.target_suffix_proj(
+            target_probabilities.to(dtype=self.target_suffix_proj.weight.dtype)
+        )
 
     def modulate_action_hidden(
         self, hidden: torch.Tensor, condition: torch.Tensor
@@ -142,6 +151,14 @@ def attach_language_action_adapter(policy, *, bottleneck: int = 256):
         condition = getattr(self, "_language_action_condition", None)
         if condition is not None:
             suffix_embs = suffix_embs + condition[:, None, :].to(dtype=suffix_embs.dtype)
+        target_logits = getattr(model, "_language_action_target_logits", None)
+        if target_logits is not None:
+            target_suffix = model.language_action_adapter.project_target_suffix(
+                target_logits
+            )
+            suffix_embs = suffix_embs + target_suffix[:, None, :].to(
+                dtype=suffix_embs.dtype
+            )
         return suffix_embs, pad_masks, att_masks
 
     model._language_action_original_prefix = original_prefix

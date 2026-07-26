@@ -1449,3 +1449,85 @@ classification is worse than chance. The `80%` gate fails, so no closed loop or
 World Model/MPC evaluation is allowed. This stops the current family of frozen
 action-path adapter variants; the next work must audit the expert training path
 and data/target action contract before another architecture sweep.
+
+## Post-G1LANG-29 Data Contract Audit
+
+The paired train split contains 150 episodes / 50 complete triplets and the
+validation split 30 episodes / 10 triplets. In both splits, target order is
+always `[0, 1, 2]`; within every triplet the maximum initial-state and object
+position difference is exactly `0.0`. Initial expert action chunks are not
+identical: pairwise RMSE averages `0.2490` on train and `0.2506` on validation
+(`0.1725-0.3256` and `0.1822-0.3223` ranges respectively). The datasets expose
+nine language variants and 31-dimensional state/action features, with action
+absolute values up to about `1.6`. The grounding gate is therefore not failing
+because target actions are missing or the paired scene contract is broken.
+
+G1LANG-30 tests co-adaptation: retain the verified language target paths while
+unfreezing the action expert for a bounded 1K continuation. It uses the same
+four-seed gate and still cannot enter closed loop until `96/120` is reached.
+
+## G1LANG-30 Result: Action-Expert Co-Adaptation Still Failed
+
+G1LANG-30 resumed G1LANG-29 from 32K to 33K and unfroze the action expert while
+retaining the target classifier, chunk basis, and hidden-dependent basis. The
+smoke update was finite (`loss 0.023`, gradient `0.679`) with `101,451,139`
+trainable parameters (`22.46%`). The production checkpoint changed 136 common
+model tensors, including action input/output/time-MLP tensors and all 14
+adapter tensors, so co-adaptation was real and not silently frozen.
+
+The four-seed exact-scene gate remained below chance: `36/120 = 30.0%`, with
+red/yellow/green totals `17/12/7` and mean separation ratio `0.2703`. Per-seed
+counts were `10/30`, `10/30`, `8/30`, and `8/30`; all references were exactly
+scene-matched. An additional train-split audit over 50 scenes and 150 queries
+reached only `57/150 = 38.0%` (red/yellow/green `16/20/21`), showing that this
+is not merely a validation generalization gap. The `80%` gate fails and closed
+loop/MPC remains blocked.
+
+## G1LANG-31 Result: Target-Conditioned Suffix Projection Still Failed
+
+G1LANG-31 resumed G1LANG-30 from 33K to 34K and added a zero-initialized
+projection of the verified three-class target posterior to the action suffix
+inputs. The action expert remained unfrozen and the existing direct output,
+FiLM, chunk-basis, and hidden-basis paths remained enabled. The training smoke
+was finite; `101,454,019` parameters were trainable (`22.46%`), and the new
+`target_suffix_proj` weights updated from zero. Because the optimizer state did
+not contain the two new adapter tensors, its reset at source step 33,000 was
+reported explicitly in the training log.
+
+The four-seed exact-scene gate was:
+
+| flow noise seed | correct | separation ratio |
+|---|---:|---:|
+| `20260727` | `9/30` | `0.2394` |
+| `20260728` | `8/30` | `0.2457` |
+| `20260729` | `10/30` | `0.2762` |
+| `20260730` | `11/30` | `0.2443` |
+
+The aggregate is `38/120 = 31.7%`, with red/yellow/green totals `12/14/12`
+and mean separation ratio `0.2514`. Every reference scene has zero object
+position and initial-state mismatch. The target classifier remains a valid
+language audit, but adding the same projected target vector to every suffix
+token does not make the flow-matching action chunk follow the target. The
+pre-registered `96/120` (`80%`) gate fails; paired closed loop, formal 30
+episodes, and World Model/MPC remain blocked.
+
+The next intervention is an objective/forward-path audit followed by a
+dedicated target token or target-conditioned action decoder. Another residual
+adapter variant will not be started without a measurable training-path
+invariant.
+
+## G1LANG-32A Forward-Path Audit (planned)
+
+Before another training intervention, `scripts/audit_g1_language_forward_path.py`
+checks the G1LANG-31 checkpoint on one exact-scene validation triplet. It uses
+the same image/state and seeded flow noise for all three language tasks and
+reports target-posterior separation, final flow-velocity separation, adapter
+gradient norms, and the `t=1` training-versus-first-inference velocity RMSE.
+The audit does not update weights or enter closed loop. Its output is written to
+`outputs/G1LANG-32A_forward_path_audit_034000/summary.json` and its terminal
+output is captured in `outputs/G1LANG-32A_forward_path_audit.log`.
+
+The next decoder design is permitted only after these invariants are measured:
+the target posterior must be distinct, the action output must be finite and
+target-distinct, all connected adapter gradients must be finite, and the
+training/inference `t=1` velocity RMSE must be at most `1e-5`.
