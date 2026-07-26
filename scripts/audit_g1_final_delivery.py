@@ -48,6 +48,7 @@ def main() -> None:
     sim2sim = load_json(Path("/mnt/d/G1-UpperBody-Sim2Sim/G1SIM-02/isaacsim_report.json"))
     baseline = summary_gate(ROOT / "outputs/G1FINAL-01_target_router_smoke_3ep/summary.json")
     mpc = summary_gate(ROOT / "outputs/G1FINAL-03_target_router_mpc_smoke_3ep/summary.json")
+    video_audit = load_json(ROOT / "outputs/G1FINAL-05_video_audit.json")
 
     strict_source_available = bool(
         baseline["strict_success_rate"] is not None
@@ -69,6 +70,23 @@ def main() -> None:
         "closed_loop": {
             "baseline": baseline,
             "world_model_mpc": mpc,
+            "video_trajectory_audit": {
+                "path": "outputs/G1FINAL-05_video_audit.json",
+                "passed": bool(video_audit.get("video_audit_passed")),
+                "episodes": [
+                    {
+                        "episode": item["episode"],
+                        "target_object": item["target_object"],
+                        "grabbed_objects": item["grabbed_objects"],
+                        "selected_correct_object": item["selected_correct_object"],
+                        "task_success": item["task_success"],
+                        "action_observation_rmse_rad": item[
+                            "action_observation_rmse_rad"
+                        ],
+                    }
+                    for item in video_audit["episodes"]
+                ],
+            },
         },
         "sim2sim": {
             "g1sim_02_replay_completed": bool(sim2sim.get("replay_completed")),

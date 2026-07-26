@@ -1839,3 +1839,23 @@ The deliverable architecture claim is intentionally limited to
 `language classifier -> target specialist -> World Model/MPC -> Sim2Sim`.
 End-to-end SmolVLA grounding is not passed, and G1SIM-03 cannot be prepared
 until a strict-success language episode exists.
+
+## G1FINAL-05: Video and Trajectory Audit
+
+The `G1FINAL-03` videos were audited frame-by-frame through their saved
+trajectories after visual review raised a concern that the instruction was not
+being executed. The concern is correct at the task level: control was applied,
+but target selection failed. Each video has 180 control frames and nonzero
+action-vs-observation motion. In episode 0 the instruction targets the red
+triangle, while the green cube moved about `0.0966 m` and the red triangle did
+not move. In episode 1 the instruction targets the yellow rod, while the red
+triangle moved about `0.2281 m` and the yellow rod did not move. Episode 2 did
+not grasp an object. The video audit therefore confirms `0/3` strict success;
+it does not support a claim that the language instruction was completed.
+
+The reproducible audit is:
+
+```text
+scripts/audit_g1_video_trajectories.py
+outputs/G1FINAL-05_video_audit.json
+```
