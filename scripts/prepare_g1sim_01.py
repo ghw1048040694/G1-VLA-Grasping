@@ -31,6 +31,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asset-root", type=Path, default=DEFAULT_ASSET_ROOT)
     parser.add_argument("--episode", type=Path, default=DEFAULT_EPISODE)
     parser.add_argument("--dataset-info", type=Path, default=DEFAULT_DATASET_INFO)
+    parser.add_argument(
+        "--experiment-id", default="G1SIM-01-isaacsim-offline-action-replay"
+    )
+    parser.add_argument("--activate-assisted-grasp", action="store_true")
     return parser.parse_args()
 
 
@@ -80,7 +84,7 @@ def main() -> None:
     )
     action_feature = dataset_info["features"]["action"]
     manifest = {
-        "experiment": "G1SIM-01-isaacsim-offline-action-replay",
+        "experiment": args.experiment_id,
         "source_experiment": "G1MPC-04-rank-filtered-independent-heldout",
         "source_policy": "scaled20000_world_model_mpc",
         "source_episode": 0,
@@ -89,6 +93,8 @@ def main() -> None:
         "control_fps": dataset_info["fps"],
         "physics_fps": 60,
         "action_joint_names": action_feature["names"],
+        "activate_assisted_grasp": args.activate_assisted_grasp,
+        "assisted_grasp_activation_phase": 4,
         "source_passed": genesis_summary["passed"],
         "source_final_lift_height_m": genesis_summary["tote_lift_height_m"],
         "source_maximum_lift_height_m": genesis_summary[
@@ -98,8 +104,12 @@ def main() -> None:
             "joint_limit_violation_fraction"
         ],
         "scope": (
-            "Offline action replay for articulation, joint-order, units, and "
-            "basic PhysX response validation. This is not online VLA inference."
+            "Offline action replay with source-timed assisted-grasp constraint "
+            "activation for task-level PhysX transfer. This is not online VLA "
+            "inference."
+            if args.activate_assisted_grasp
+            else "Offline action replay for articulation, joint-order, units, "
+            "and basic PhysX response validation. This is not online VLA inference."
         ),
     }
     (args.output / "manifest.json").write_text(

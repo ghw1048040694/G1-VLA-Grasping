@@ -1684,3 +1684,158 @@ and is recorded as G1FINAL-01.
 Version snapshot after the loader fix and router implementation: G1-UpperBody
 commit `90e528b` and VLA-Learning commit `a52b875` were pushed to GitHub
 `main`. The separate `/home/ubuntu/lerobot` checkout remains local-only.
+
+## G1FINAL-02: Routed-Target World Model
+
+The existing 86-state world-model contract is now connected to the language
+task without reusing the old single-tote result as new evidence. For each of
+the 180 successful multi-object demonstrations, the episode's true routed
+target is projected into the legacy object slot. Position and quaternion come
+from the recorded three-object state; linear and angular velocity are computed
+from recorded timestamps; assisted contact, table-contact proxy, target lift,
+and normalized task phase complete the state. Non-target objects are explicitly
+outside this first model's state and remain a documented limitation.
+
+The deterministic projection produced 180 finite `(182, 86)` state sequences
+and `(182, 31)` action sequences. The fixed split uses episodes `0..149` for
+training and `150..179` for validation, has no episode overlap, and preserves
+target balance at `50/50/50` and `10/10/10`. A one-step CPU smoke exercised the
+full train/evaluate/checkpoint path before the one planned 10,000-step CUDA run.
+
+The production model passed all five existing screening checks. The best
+checkpoint was selected at step 9,500. On 5,430 independent validation
+transitions, H1 joint-position RMSE is `0.00348 rad`; H10 joint-position error
+improves `91.35%` over persistence; H20 target-position and target-lift RMSE are
+`0.00750 m` and `0.00702 m`; H20 joint-position improvement is `92.77%`.
+These are offline dynamics results, not MPC task success.
+
+The language router evaluator now optionally generates four action chunks from
+the routed specialist in one batched inference and uses this checkpoint to
+score predicted palm-to-target or target-to-box distance together with contact,
+progress, action clipping, joint limits, and smoothness. A synthetic MuJoCo
+state/action smoke returned a finite `(1, 10, 31)` selected chunk and a complete
+four-candidate report. Formal closed-loop comparison remains pending specialist
+completion.
+
+Artifacts:
+
+```text
+outputs/G1FINAL-02_language_world_model_dataset/summary.json
+outputs/G1FINAL-02_language_world_model_10000step/best_model.pt
+outputs/G1FINAL-02_language_world_model_10000step/summary.json
+```
+
+## G1SIM-02 Plan: Task-Level Assisted-Grasp Replay
+
+The G1SIM-01 USD audit found that Isaac Sim imported both MuJoCo assisted-grasp
+constraints as spherical joints, but stored both with
+`physics:jointEnabled = 0`. The first replay never enabled them, which directly
+explains why joint tracking passed while maximum tote lift remained only
+`0.00404 m`. G1SIM-02 preserves that result and adds source-timed activation of
+both imported constraints at the first trajectory frame whose scheduled phase
+is 4, matching the MuJoCo assist transition at frame 45. The new Windows bundle
+has been prepared at `D:\G1-UpperBody-Sim2Sim\G1SIM-02`; Isaac Sim execution and
+the required `0.10 m` lift gate are still pending.
+
+## G1FINAL-01 Result: Specialist Checkpoint and Closed-Loop Smoke
+
+The three target specialists completed the planned 5,000-update runs. The
+checkpoint audit found step `5000`, all required model and training-state files,
+506 finite tensors, 450,046,362 parameters, and distinct SHA-256 hashes from the
+source checkpoint for red, yellow, and green. The audit passed:
+`outputs/G1FINAL-01_target_specialists_audit.json`.
+
+The learned router classified all three smoke instructions correctly (`3/3`),
+but target-object selection and strict task success were both `0/3`. Baseline
+wrong-object grasp rate was `2/3` and mean joint-limit violation was `0.00551`.
+The fixed four-candidate World Model/MPC path was exercised for 108 replans and
+selected a non-baseline candidate 82 times, but it also achieved `0/3` target
+selection and `0/3` strict success; wrong-object grasp remained `2/3` and mean
+joint-limit violation was `0.00911`. These are real closed-loop negative
+results, not interface failures.
+
+Artifacts:
+
+```text
+outputs/G1FINAL-01_target_router_smoke_3ep/summary.json
+outputs/G1FINAL-03_target_router_mpc_smoke_3ep/summary.json
+outputs/G1FINAL-01_red_specialist_initial_action_audit/summary.json
+outputs/G1FINAL-01_yellow_specialist_initial_action_audit/summary.json
+outputs/G1FINAL-01_green_specialist_initial_action_audit/summary.json
+```
+
+## 2026-07-26 Post-Reboot GPU Recovery Check
+
+After a full machine reboot, WSL2 booted at `20:12` and the GPU path recovered:
+`/dev/dxg` is present, `nvidia-smi` sees the RTX 4070 Laptop GPU with driver
+`591.74`, and the `lerobot` environment reports `torch 2.6.0+cu124` with
+`torch.cuda.is_available() == True`. A fresh 2048x2048 FP32 CUDA matmul and
+synchronize completed successfully. System memory had about `12 GiB` available;
+this was not an OOM condition.
+
+The recovery is not yet a clean experiment state. Failed process `96069`
+(`yellow_fp32_freezestate100_retry_smoke`, parent shell `96068`) remained busy
+after its `20:34:32` illegal-memory-access traceback, and its log did not grow
+after that traceback. It produced no valid checkpoint. Stop those two stale
+processes before starting another GPU experiment. A separate ROS `apt-get`
+installation (`18454`) is unrelated to the CUDA incident and was left running.
+
+## G1SIM-02 Result: Assisted-Grasp Sim2Sim Transfer
+
+After WSL Windows-process interop was restored, Isaac Sim replay completed with
+31 commanded action joints and the two imported assisted-grasp constraints
+activated at frame 45. Final tote lift was `0.16607 m`, maximum lift was
+`0.17046 m`, and the `0.10 m` transfer gate passed. Joint tracking RMSE was
+`0.09446 rad`; this stage validates the assisted-grasp transfer only and does
+not imply language-task success.
+
+## G1FINAL-01 Stable-Continuation Incident
+
+A seamless 5K-to-10K resume produced a valid red checkpoint at step `10000`.
+The yellow continuation first became non-finite near estimated step `7860` and
+then raised a CUDA illegal-memory-access error; no yellow or green 10K
+checkpoint was written. A project-owned finite-update retry wrapper and a fixed
+low-learning-rate continuation were tested. The wrapper unit test passed, but
+the GPU later raised `invalid program counter` during the first SmolVLA forward,
+so the fallback was stopped before any checkpoint. The NVIDIA reset command is
+unsupported because this is the primary display GPU. All original 5K
+checkpoints remain intact; further GPU training requires a clean WSL/GPU
+context. The end-to-end SmolVLA language gate remains failed, and the modular
+hybrid system must not be described as successful end-to-end grounding.
+
+## G1FINAL-04: Final Evidence Audit and GPU Inference Incident
+
+On 2026-07-26 the failed continuation process was terminated and the GPU was
+rechecked. The hybrid import contract was then validated with the Genesis
+environment's MuJoCo `3.2.5` first on `PYTHONPATH`, plus the LeRobot
+environment's `datasets 3.6.0` and `transformers 4.51.3`. The target specialist
+audit, the 10K residual World Model screening checks, and the existing G1SIM-02
+Isaac Sim report all remain valid.
+
+The existing 3-episode closed-loop evidence is unchanged: language routing is
+`3/3`, but target selection and strict task success are `0/3` for both baseline
+and World Model/MPC. The MPC evaluator did execute 108 replans and selected a
+non-baseline candidate 82 times, so this is a real negative task result rather
+than an unconnected interface.
+
+Several attempts to extend the evidence to a formal 30-episode run were kept as
+separate artifacts. The first stopped at MuJoCo `2.3.7` XML schema import; the
+corrected MuJoCo `3.2.5` run saved three episodes and then raised
+`CUBLAS_STATUS_INTERNAL_ERROR`. A post-reboot 3-episode run raised simulation
+`NaN/Inf` followed by CUDA illegal memory access. An opt-in evaluation-only
+`G1_EVAL_FORCE_FP32=1` conversion was added and tested, but the image encoder
+then raised `CUBLAS_STATUS_EXECUTION_FAILED`. These failures occurred with
+roughly 6--7 GiB free VRAM and independent small CUDA matmuls still passing;
+they are recorded as a WSL2/DXG long-inference stability incident, not as
+checkpoint corruption.
+
+The final machine-readable audit is:
+
+```text
+outputs/G1FINAL-04_project_audit.json
+```
+
+The deliverable architecture claim is intentionally limited to
+`language classifier -> target specialist -> World Model/MPC -> Sim2Sim`.
+End-to-end SmolVLA grounding is not passed, and G1SIM-03 cannot be prepared
+until a strict-success language episode exists.

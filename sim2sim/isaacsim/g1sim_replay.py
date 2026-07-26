@@ -87,12 +87,16 @@ def add_light() -> None:
     light.CreateAngleAttr(0.5)
 
 
-def world_z(stage, prim_path: str) -> float:
+def world_position(stage, prim_path: str) -> np.ndarray:
     prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid():
         raise RuntimeError(f"Missing scene prim: {prim_path}")
     transform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-    return float(transform.ExtractTranslation()[2])
+    return np.asarray(transform.ExtractTranslation(), dtype=np.float64)
+
+
+def world_z(stage, prim_path: str) -> float:
+    return float(world_position(stage, prim_path)[2])
 
 
 def show_tote_markers(stage, tote_path: str) -> list[str]:
@@ -112,10 +116,32 @@ def show_tote_markers(stage, tote_path: str) -> list[str]:
     return visible
 
 
+def assisted_grasp_joint_paths(
+    stage, default_prim_path: str, joint_names: list[str] | None = None
+) -> list[str]:
+    names = joint_names or ["left_assisted_grasp", "right_assisted_grasp"]
+    paths = [f"{default_prim_path}/Physics/{name}" for name in names]
+    missing = [path for path in paths if not stage.GetPrimAtPath(path).IsValid()]
+    if missing:
+        raise RuntimeError(f"Missing imported assisted-grasp joints: {missing}")
+    return paths
+
+
+def set_assisted_grasp_enabled(stage, joint_paths: list[str], enabled: bool) -> None:
+    for path in joint_paths:
+        attribute = stage.GetPrimAtPath(path).GetAttribute("physics:jointEnabled")
+        if not attribute.IsValid():
+            raise RuntimeError(f"Joint has no physics:jointEnabled attribute: {path}")
+        if not attribute.Set(enabled):
+            raise RuntimeError(f"Failed to set physics:jointEnabled={enabled}: {path}")
+
+
 def main() -> None:
     enable_required_extensions()
     manifest = json.loads((ARGS.root / "manifest.json").read_text(encoding="utf-8"))
-    mjcf_path = ARGS.root / "assets/g1_mpc04_episode0000.xml"
+    mjcf_path = ARGS.root / manifest.get(
+        "mjcf_file", "assets/g1_mpc04_episode0000.xml"
+    )
     usd_dir = ARGS.root / "usd"
     usd_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,8 +166,19 @@ def main() -> None:
     simulation_app.update()
     default_prim_path = select_physx_variant()
     root_path = find_articulation_root()
-    tote_path = f"{default_prim_path}/Geometry/warehouse_tote"
-    visible_tote_markers = show_tote_markers(stage, tote_path)
+    tracked_object_name = manifest.get("tracked_object_name", "warehouse_tote")
+    tracked_object_path = f"{default_prim_path}/Geometry/{tracked_object_name}"
+    visible_tote_markers = (
+        show_tote_markers(stage, tracked_object_path)
+        if tracked_object_name == "warehouse_tote"
+        else []
+    )
+    grasp_joint_paths = assisted_grasp_joint_paths(
+        stage,
+        default_prim_path,
+        manifest.get("assisted_grasp_joint_names"),
+    )
+    set_assisted_grasp_enabled(stage, grasp_joint_paths, False)
     stage.GetRootLayer().Save()
 
     add_light()
@@ -173,6 +210,11 @@ def main() -> None:
         "missing_action_joints": missing,
         "joint_contract_passed": not missing,
         "visible_tote_markers": visible_tote_markers,
+        "tracked_object_name": tracked_object_name,
+        "imported_assisted_grasp_joints": grasp_joint_paths,
+        "activate_assisted_grasp": bool(
+            manifest.get("activate_assisted_grasp", False)
+        ),
         "mode": "inspect_only" if ARGS.inspect_only else "offline_action_replay",
     }
     if missing:
@@ -185,6 +227,20 @@ def main() -> None:
         raise ValueError(
             f"Trajectory has {commands.shape[1]} actions, expected {len(action_names)}"
         )
+    phases = (
+        trajectory["scheduled_phase"].astype(np.int64)
+        if "scheduled_phase" in trajectory.files
+        else None
+    )
+    if phases is not None and phases.shape != (len(commands),):
+        raise ValueError(f"Unexpected scheduled_phase shape: {phases.shape}")
+    assist_active = (
+        trajectory["assist_active"].astype(bool)
+        if "assist_active" in trajectory.files
+        else None
+    )
+    if assist_active is not None and assist_active.shape != (len(commands),):
+        raise ValueError(f"Unexpected assist_active shape: {assist_active.shape}")
 
     robot.set_dof_positions(commands[0][None, :], dof_indices=indices)
     robot.set_dof_position_targets(commands[0][None, :], dof_indices=indices)
@@ -194,19 +250,56 @@ def main() -> None:
         substeps = manifest["physics_fps"] // manifest["control_fps"]
         for _ in range(round(ARGS.warmup_seconds * manifest["physics_fps"])):
             simulation_app.update()
-        initial_tote_z = world_z(stage, tote_path)
+        initial_tote_z = world_z(stage, tracked_object_path)
         actual = []
         tote_lifts = []
-        for command in commands:
+        tracked_positions = []
+        grasp_activation_frame = None
+        grasp_activation_phase = None
+        grasp_activation_joint = None
+        grasp_release_frame = None
+        activation_phase = int(manifest.get("assisted_grasp_activation_phase", 4))
+        for frame, command in enumerate(commands):
+            if manifest.get("activate_assisted_grasp", False):
+                if assist_active is not None:
+                    if assist_active[frame] and grasp_activation_frame is None:
+                        object_index = int(trajectory["grabbed_object_index"][frame])
+                        arm_index = int(trajectory["grabbed_arm_index"][frame])
+                        object_name = str(trajectory["object_names"][object_index])
+                        side = "left" if arm_index == 0 else "right"
+                        joint_name = f"{object_name}_{side}_assisted_grasp"
+                        joint_path = f"{default_prim_path}/Physics/{joint_name}"
+                        if joint_path not in grasp_joint_paths:
+                            raise RuntimeError(
+                                f"Trajectory requested unavailable joint: {joint_path}"
+                            )
+                        set_assisted_grasp_enabled(stage, [joint_path], True)
+                        grasp_activation_frame = frame
+                        grasp_activation_joint = joint_path
+                    elif (
+                        not assist_active[frame]
+                        and grasp_activation_frame is not None
+                        and grasp_release_frame is None
+                    ):
+                        set_assisted_grasp_enabled(stage, grasp_joint_paths, False)
+                        grasp_release_frame = frame
+                elif grasp_activation_frame is None and phases[frame] >= activation_phase:
+                    set_assisted_grasp_enabled(stage, grasp_joint_paths, True)
+                    grasp_activation_frame = frame
+                    grasp_activation_phase = int(phases[frame])
             robot.set_dof_position_targets(command[None, :], dof_indices=indices)
             for _ in range(substeps):
                 simulation_app.update()
             actual.append(robot.get_dof_positions().numpy()[0, indices])
-            tote_lifts.append(world_z(stage, tote_path) - initial_tote_z)
+            position = world_position(stage, tracked_object_path)
+            tracked_positions.append(position)
+            tote_lifts.append(float(position[2] - initial_tote_z))
         endpoint_lift = tote_lifts[-1]
         for _ in range(round(ARGS.hold_seconds * manifest["physics_fps"])):
             simulation_app.update()
-            tote_lifts.append(world_z(stage, tote_path) - initial_tote_z)
+            position = world_position(stage, tracked_object_path)
+            tracked_positions.append(position)
+            tote_lifts.append(float(position[2] - initial_tote_z))
         actual_array = np.asarray(actual, dtype=np.float32)
         error = actual_array - commands
         final_lift = tote_lifts[-1]
@@ -221,11 +314,53 @@ def main() -> None:
                 "tote_endpoint_lift_height_m": endpoint_lift,
                 "tote_final_lift_height_m": final_lift,
                 "tote_maximum_lift_height_m": max(tote_lifts),
+                "assisted_grasp_activation_frame": grasp_activation_frame,
+                "assisted_grasp_activation_phase": grasp_activation_phase,
+                "assisted_grasp_activation_joint": grasp_activation_joint,
+                "assisted_grasp_release_frame": grasp_release_frame,
                 "required_lift_height_m": 0.10,
                 "task_transfer_passed": final_lift >= 0.10,
                 "replay_completed": True,
             }
         )
+        if manifest.get("task_type") == "language_object_to_box":
+            goal = np.asarray(manifest["goal_position_m"], dtype=np.float64)
+
+            def inside_box(position: np.ndarray) -> bool:
+                relative = position - goal
+                return bool(
+                    abs(relative[0]) <= 0.105
+                    and abs(relative[1]) <= 0.125
+                    and 0.75 <= position[2] <= 0.93
+                )
+
+            final_positions = {
+                name: world_position(stage, f"{default_prim_path}/Geometry/{name}")
+                for name in manifest["object_names"]
+            }
+            target_inside = inside_box(final_positions[tracked_object_name])
+            wrong_objects_inside = [
+                name
+                for name, position in final_positions.items()
+                if name != tracked_object_name and inside_box(position)
+            ]
+            report.update(
+                {
+                    "goal_position_m": goal.tolist(),
+                    "tracked_object_final_position_m": final_positions[
+                        tracked_object_name
+                    ].tolist(),
+                    "final_object_position_m": {
+                        name: position.tolist()
+                        for name, position in final_positions.items()
+                    },
+                    "target_in_box": target_inside,
+                    "wrong_objects_in_box": wrong_objects_inside,
+                    "task_transfer_passed": bool(
+                        target_inside and not wrong_objects_inside
+                    ),
+                }
+            )
 
     timeline.stop()
     report_path = ARGS.root / "isaacsim_report.json"

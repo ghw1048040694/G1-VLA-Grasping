@@ -10,7 +10,7 @@ PYTHON="${LEROBOT_PYTHON:-/home/ubuntu/miniconda3/envs/lerobot/bin/python}"
 TRAIN_ROOT="${TRAIN_ROOT:-$LEROBOT_ROOT/datasets/local/g1_language_paired_train}"
 REPO_ID="${REPO_ID:-local/g1_language_paired_train}"
 SOURCE_POLICY="${SOURCE_POLICY:-$PROJECT_ROOT/outputs/G1LANG-12_paired_smolvla_20000step/checkpoints/020000/pretrained_model}"
-STEPS="${STEPS:-10000}"
+STEPS="${STEPS:-5000}"
 SAVE_FREQ="${SAVE_FREQ:-5000}"
 
 if [[ ! -f "$SOURCE_POLICY/model.safetensors" ]]; then

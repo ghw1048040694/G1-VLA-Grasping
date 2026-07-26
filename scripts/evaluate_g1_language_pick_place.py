@@ -74,6 +74,12 @@ def load_policy(checkpoint: Path, train_meta: LeRobotDatasetMetadata, device: st
     config.device = device
     config.pretrained_path = checkpoint
     policy = make_policy(config, ds_meta=train_meta).eval()
+    if os.environ.get("G1_EVAL_FORCE_FP32") == "1":
+        # WSL2/DXG has shown intermittent BF16 attention failures during long
+        # inference runs. Keep the opt-in conversion local to evaluation; the
+        # stored specialist checkpoint and its training contract are unchanged.
+        policy.model.float()
+        print(f"G1_EVAL_FORCE_FP32=1 checkpoint={checkpoint}", flush=True)
     if policy.config.action_feature.shape != (31,):
         raise ValueError(
             f"Expected 31 actions, found {policy.config.action_feature.shape}"
@@ -276,6 +282,12 @@ def run_episode(
     action_delta_count = 0
     action_delta_max_abs = 0.0
     previous_action = initial_targets[LOWER_BODY_JOINTS:].copy()
+    trajectory_joint_position = []
+    trajectory_action = []
+    trajectory_object_position = []
+    trajectory_assist_active = []
+    trajectory_grabbed_object_index = []
+    trajectory_grabbed_arm_index = []
 
     for frame in range(control_frames):
         state = np.asarray(
@@ -284,6 +296,30 @@ def run_episode(
         )
         chunk_index = frame % args.replan_steps
         if chunk_index == 0:
+            planner_context_setter = getattr(policy, "set_planner_context", None)
+            if planner_context_setter is not None:
+                planner_context_setter(
+                    {
+                        "model": model,
+                        "data": data,
+                        "controlled": controlled,
+                        "upper_names": upper_names,
+                        "object_body_ids": object_body_ids,
+                        "palm_ids": palm_ids,
+                        "initial_object_positions": positions,
+                        "grabbed_object": grabbed_object,
+                        "grabbed_arm_index": grabbed_arm_index,
+                        "assist_active": (
+                            grabbed_object is not None and assist_release_frame is None
+                        ),
+                        "action_lower": action_lower,
+                        "action_upper": action_upper,
+                        "previous_action": previous_action,
+                        "frame": frame,
+                        "control_frames": control_frames,
+                        "base_seed": args.seed + spec["scene_index"] * 1000 + frame,
+                    }
+                )
             batch = render_observation(
                 task_renderer, data, state, spec["instruction"], args.device
             )
@@ -358,6 +394,22 @@ def run_episode(
                 joint_samples += 1
                 joint_limit_violations_by_joint[name] += violated
                 joint_samples_by_joint[name] += 1
+        trajectory_joint_position.append(
+            [data.qpos[controlled[name]["qpos_id"]] for name in upper_names]
+        )
+        trajectory_action.append(clipped.copy())
+        trajectory_object_position.append(
+            np.stack([data.xpos[object_body_ids[name]].copy() for name in OBJECT_NAMES])
+        )
+        trajectory_assist_active.append(
+            int(grabbed_object is not None and assist_release_frame is None)
+        )
+        trajectory_grabbed_object_index.append(
+            OBJECT_NAMES.index(grabbed_object) if grabbed_object is not None else -1
+        )
+        trajectory_grabbed_arm_index.append(
+            grabbed_arm_index if grabbed_arm_index is not None else -1
+        )
         video_renderer.update_scene(data, camera=camera)
         writer.append_data(video_renderer.render())
 
@@ -389,6 +441,7 @@ def run_episode(
         "scene_index": spec["scene_index"],
         "language_instruction": spec["instruction"],
         "target_object": spec["target_object"],
+        "blue_box_position_m": BIN_POSITION_M.tolist(),
         "grabbed_object": grabbed_object,
         "grabbed_arm": (
             PALM_NAMES[grabbed_arm_index].removesuffix("_palm_center")
@@ -420,7 +473,27 @@ def run_episode(
         },
         "passed": passed,
         "video": str(video_path),
+        "trajectory": str(output_dir / "trajectory.npz"),
     }
+    np.savez_compressed(
+        output_dir / "trajectory.npz",
+        joint_names=np.asarray(upper_names),
+        observation_joint_position_rad=np.asarray(
+            trajectory_joint_position, dtype=np.float32
+        ),
+        action_joint_position_rad=np.asarray(trajectory_action, dtype=np.float32),
+        object_names=np.asarray(OBJECT_NAMES),
+        object_position_m=np.asarray(trajectory_object_position, dtype=np.float32),
+        assist_active=np.asarray(trajectory_assist_active, dtype=np.int8),
+        grabbed_object_index=np.asarray(
+            trajectory_grabbed_object_index, dtype=np.int8
+        ),
+        grabbed_arm_index=np.asarray(trajectory_grabbed_arm_index, dtype=np.int8),
+        task_target_index=np.full(
+            control_frames, OBJECT_NAMES.index(spec["target_object"]), dtype=np.int8
+        ),
+        control_fps=np.asarray(args.control_fps, dtype=np.int64),
+    )
     (output_dir / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     print(
         f"EVAL_EPISODE={episode_index + 1}/{args.episodes} "
