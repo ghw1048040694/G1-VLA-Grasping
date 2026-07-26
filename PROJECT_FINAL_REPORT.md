@@ -62,6 +62,12 @@ outputs/G1FINAL-09_router_classical_9ep/episode_0001/language_pick_place.mp4
 outputs/G1FINAL-09_router_classical_9ep/episode_0002/language_pick_place.mp4
 ```
 
+Public downloadable release:
+
+```text
+https://github.com/ghw1048040694/G1-UpperBody/releases/tag/g1final-09
+```
+
 Open one from WSL2 with:
 
 ```bash

@@ -44,6 +44,13 @@ outputs/G1FINAL-09_router_classical_9ep/summary.json
 outputs/G1FINAL-09_router_classical_9ep/episode_0000/language_pick_place.mp4
 ```
 
+Public release with downloadable red/yellow/green videos and the complete
+nine-episode summary:
+
+```text
+https://github.com/ghw1048040694/G1-UpperBody/releases/tag/g1final-09
+```
+
 The preferred run can be reproduced with:
 
 ```bash
