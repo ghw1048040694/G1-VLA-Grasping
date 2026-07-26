@@ -25,10 +25,47 @@ def summary_gate(path: Path) -> dict:
         "path": str(path),
         "episodes": report.get("episodes"),
         "router_accuracy": report.get("router_accuracy"),
+        "controller_success_rate": report.get("controller_success_rate"),
+        "hybrid_success_rate": report.get("hybrid_success_rate"),
+        "mean_joint_limit_violation_fraction": report.get(
+            "mean_joint_limit_violation_fraction"
+        ),
+        "mean_router_top1_probability": report.get("mean_router_top1_probability"),
+        "min_router_top1_probability": report.get("min_router_top1_probability"),
+        "mean_router_logit_margin": report.get("mean_router_logit_margin"),
+        "min_router_logit_margin": report.get("min_router_logit_margin"),
         "object_selection_accuracy": report.get("object_selection_accuracy"),
         "strict_success_rate": report.get("strict_success_rate"),
         "wrong_object_grasp_rate": report.get("wrong_object_grasp_rate"),
         "passed": bool(report.get("passed", False)),
+    }
+
+
+def hybrid_artifact_gate(path: Path) -> dict:
+    """Check that every hybrid report points to locally present evidence."""
+    report = load_json(path)
+    episodes = report.get("reports", [])
+    checks = []
+    for item in episodes:
+        video = ROOT / item["video"]
+        execution = ROOT / item["execution_summary"]
+        checks.append(
+            {
+                "episode_index": item.get("episode_index"),
+                "video": str(video),
+                "video_present": video.is_file() and video.stat().st_size > 0,
+                "execution_summary": str(execution),
+                "execution_summary_present": execution.is_file(),
+            }
+        )
+    return {
+        "episodes": checks,
+        "all_videos_present": bool(checks) and all(
+            item["video_present"] for item in checks
+        ),
+        "all_execution_summaries_present": bool(checks) and all(
+            item["execution_summary_present"] for item in checks
+        ),
     }
 
 
@@ -38,6 +75,12 @@ def main() -> None:
         "--output",
         type=Path,
         default=ROOT / "outputs/G1FINAL-04_project_audit.json",
+    )
+    parser.add_argument(
+        "--hybrid-summary",
+        type=Path,
+        default=None,
+        help="Hybrid summary to audit; defaults to the 9-episode run when present.",
     )
     args = parser.parse_args()
 
@@ -49,6 +92,18 @@ def main() -> None:
     baseline = summary_gate(ROOT / "outputs/G1FINAL-01_target_router_smoke_3ep/summary.json")
     mpc = summary_gate(ROOT / "outputs/G1FINAL-03_target_router_mpc_smoke_3ep/summary.json")
     video_audit = load_json(ROOT / "outputs/G1FINAL-05_video_audit.json")
+    default_hybrid = ROOT / "outputs/G1FINAL-09_router_classical_9ep/summary.json"
+    if not default_hybrid.is_file():
+        default_hybrid = ROOT / "outputs/G1FINAL-07_router_classical_3ep/summary.json"
+    hybrid_path = args.hybrid_summary or default_hybrid
+    hybrid = summary_gate(hybrid_path)
+    hybrid_artifacts = hybrid_artifact_gate(hybrid_path)
+    hybrid_sim2sim_source = Path(
+        "/mnt/d/G1-UpperBody-Sim2Sim/G1SIM-03/data/source_summary.json"
+    )
+    hybrid_sim2sim_report = Path(
+        "/mnt/d/G1-UpperBody-Sim2Sim/G1SIM-03/isaacsim_report.json"
+    )
 
     strict_source_available = bool(
         baseline["strict_success_rate"] is not None
@@ -56,7 +111,7 @@ def main() -> None:
     )
     report = {
         "experiment": "G1FINAL-04-project-delivery-audit",
-        "audit_version": 1,
+        "audit_version": 2,
         "python": sys.executable,
         "platform": platform.platform(),
         "delivery_status": "final-evidence-package-ready",
@@ -87,6 +142,24 @@ def main() -> None:
                     for item in video_audit["episodes"]
                 ],
             },
+            "hybrid_router_classical": hybrid,
+            "hybrid_summary": str(hybrid_path),
+            "hybrid_artifacts": hybrid_artifacts,
+            "hybrid_sim2sim": {
+                "source_prepared": hybrid_sim2sim_source.is_file(),
+                "source_passed": (
+                    bool(load_json(hybrid_sim2sim_source).get("passed"))
+                    if hybrid_sim2sim_source.is_file()
+                    else False
+                ),
+                "replay_report_available": hybrid_sim2sim_report.is_file(),
+                "status": (
+                    "passed"
+                    if hybrid_sim2sim_report.is_file()
+                    else "failed_isaac_gpu_device_lost"
+                ),
+                "external_root": "/mnt/d/G1-UpperBody-Sim2Sim/G1SIM-03",
+            },
         },
         "sim2sim": {
             "g1sim_02_replay_completed": bool(sim2sim.get("replay_completed")),
@@ -94,9 +167,16 @@ def main() -> None:
             "g1sim_02_task_transfer_passed": bool(sim2sim.get("task_transfer_passed")),
             "g1sim_02_final_lift_m": sim2sim.get("tote_final_lift_height_m"),
             "g1sim_02_max_lift_m": sim2sim.get("tote_maximum_lift_height_m"),
-            "g1sim_03_source_episode_available": strict_source_available,
+            "g1sim_03_learned_source_available": strict_source_available,
+            "g1sim_03_hybrid_source_prepared": hybrid_sim2sim_source.is_file(),
             "g1sim_03_status": (
-                "ready_for_replay" if strict_source_available else "blocked_no_strict_success_source"
+                "replay_completed"
+                if hybrid_sim2sim_report.is_file()
+                else (
+                    "hybrid_source_ready_isaac_gpu_device_lost"
+                    if hybrid_sim2sim_source.is_file()
+                    else "blocked_no_strict_success_source"
+                )
             ),
         },
         "stability_incidents": [
@@ -131,11 +211,12 @@ def main() -> None:
         ],
         "architecture_claim": (
             "language classifier -> target specialist -> World Model/MPC -> Sim2Sim; "
-            "the SmolVLA end-to-end language gate is not passed"
+            "G1FINAL-07/G1FINAL-09 also validate learned language routing -> classical IK execution "
+            "as a separate upper bound; the SmolVLA end-to-end language gate is not passed"
         ),
         "required_follow_up": [
-            "Reset the WSL2/DXG GPU context before any further SmolVLA inference.",
-            "Do not prepare G1SIM-03 until a strict-success language episode exists.",
+            "Do not claim G1FINAL-07/G1FINAL-09 as end-to-end learned SmolVLA control.",
+            "Only retry G1SIM-03 after changing the Isaac/RTX device context.",
         ],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

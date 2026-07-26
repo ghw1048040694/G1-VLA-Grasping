@@ -25,6 +25,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--asset-root", type=Path, default=DEFAULT_ASSET_ROOT)
     parser.add_argument("--source-experiment", required=True)
+    parser.add_argument(
+        "--target-only-assisted-grasp",
+        action="store_true",
+        help="Import only the two assisted-grasp joints for the tracked target.",
+    )
     args = parser.parse_args()
 
     summary_path = args.episode / "summary.json"
@@ -79,9 +84,10 @@ def main() -> None:
         scripts_dir / "g1sim_replay.py",
     )
 
+    grasp_objects = [tracked_object_name] if args.target_only_assisted_grasp else object_names
     joint_names = [
         f"{name}_{side}_assisted_grasp"
-        for name in object_names
+        for name in grasp_objects
         for side in ("left", "right")
     ]
     manifest = {
@@ -99,6 +105,7 @@ def main() -> None:
         "tracked_object_name": tracked_object_name,
         "goal_position_m": source_summary["blue_box_position_m"],
         "activate_assisted_grasp": True,
+        "target_only_assisted_grasp": bool(args.target_only_assisted_grasp),
         "assisted_grasp_joint_names": joint_names,
         "source_passed": True,
         "scope": (

@@ -30,6 +30,31 @@ These are project targets, not current results:
 - Language target-selection accuracy at least 90% across object/bin commands.
 - MuJoCo Sim2Sim success-rate loss no greater than 15 percentage points.
 
+## Current Delivery Snapshot (2026-07-26)
+
+The current practical demo is `G1FINAL-09`: the learned `G1LANG-34` router
+correctly maps language to one of three objects, and a verified classical
+IK/interpolation/assisted-grasp controller performs the requested pick and
+place. The nine-episode MuJoCo robustness run passes `9/9` instructions across
+three object-slot permutations. This is a modular
+hybrid result, not end-to-end learned SmolVLA control.
+
+```text
+outputs/G1FINAL-09_router_classical_9ep/summary.json
+outputs/G1FINAL-09_router_classical_9ep/episode_0000/language_pick_place.mp4
+```
+
+The preferred run can be reproduced with:
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1_final09.sh
+```
+
+The learned specialist plus World Model/MPC gate remains an honest `0/3`
+strict-success baseline. It is retained as a negative comparison, not as the
+current demo. Isaac Sim `G1SIM-03` source preparation passed, but replay hit an
+RTX `ERROR_DEVICE_LOST`; no Isaac task success is claimed for that attempt.
+
 ## System Architecture
 
 - VLA: maps camera observations and a language work order to a skill or action
@@ -1837,8 +1862,9 @@ outputs/G1FINAL-04_project_audit.json
 
 The deliverable architecture claim is intentionally limited to
 `language classifier -> target specialist -> World Model/MPC -> Sim2Sim`.
-End-to-end SmolVLA grounding is not passed, and G1SIM-03 cannot be prepared
-until a strict-success language episode exists.
+End-to-end SmolVLA grounding is not passed. G1FINAL-07 now provides a strict
+hybrid source episode, but its Isaac Sim replay hit an RTX
+`GPU pagefault / ERROR_DEVICE_LOST` before writing a report.
 
 ## G1FINAL-05: Video and Trajectory Audit
 
@@ -1882,3 +1908,46 @@ The concise job-search-ready evidence report is maintained at
 `PROJECT_FINAL_REPORT.md`. It lists the validated components, failed gates,
 video paths, reproduction environment, and the exact limitation on further
 specialist training.
+
+## G1FINAL-07: Learned Router + Classical Execution
+
+To produce a task-level execution result without hiding the failed learned
+action policy, the verified language router was connected to the verified
+classical IK/interpolation controller. The router runs on the initial rendered
+scene and chooses one of `red_triangle`, `yellow_rod`, or `green_cube`; the
+controller then performs the full assisted-grasp pick-and-place trajectory.
+
+This hybrid is a useful upper bound and a practical demo, but it is not
+end-to-end learned SmolVLA control. The original three-episode smoke and the
+extended nine-episode robustness run both passed:
+
+| Metric | Result |
+| --- | ---: |
+| Router accuracy | `3/3` (`100%`) |
+| Classical controller success | `3/3` (`100%`) |
+| Hybrid strict success | `3/3` (`100%`) |
+| Mean joint-limit violation fraction | `0.000340` |
+
+The extended run passes router `9/9`, controller `9/9`, and hybrid strict
+success `9/9`, with mean joint-limit violation fraction `0.000441` and minimum
+router top-1 probability `0.999798`.
+
+Machine-readable evidence and videos:
+
+```text
+outputs/G1FINAL-07_router_classical_3ep/summary.json
+outputs/G1FINAL-07_router_classical_3ep/episode_0000/language_pick_place.mp4
+outputs/G1FINAL-07_router_classical_3ep/episode_0001/language_pick_place.mp4
+outputs/G1FINAL-07_router_classical_3ep/episode_0002/language_pick_place.mp4
+outputs/G1FINAL-09_router_classical_9ep/summary.json
+```
+
+The earlier `G1FINAL-03` learned specialist/World-Model/MPC result remains a
+negative end-to-end task gate (`0/3`) and is retained as the honest comparison.
+The one-command launcher is `scripts/run_g1_final07.sh`; it refuses to
+overwrite an existing result directory.
+
+The hybrid Sim2Sim source conversion is reproducible with
+`scripts/prepare_g1final07_sim2sim_source.py`. The prepared package is under
+`/mnt/d/G1-UpperBody-Sim2Sim/G1SIM-03`; the Isaac replay log records the
+environment-level `ERROR_DEVICE_LOST` and no replay success is claimed.

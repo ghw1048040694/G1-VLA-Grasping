@@ -11,7 +11,8 @@ SOURCE_EXPERIMENT="${SOURCE_EXPERIMENT:-G1FINAL-language-target-router}"
 "$LINUX_PYTHON" "$PROJECT_ROOT/scripts/prepare_g1sim_03.py" \
   --episode "$SOURCE_EPISODE" \
   --output "$OUTPUT_ROOT" \
-  --source-experiment "$SOURCE_EXPERIMENT"
+  --source-experiment "$SOURCE_EXPERIMENT" \
+  ${TARGET_ONLY_ASSISTED_GRASP:+--target-only-assisted-grasp}
 
 EXTRA_ARGS=""
 if [[ "${HEADLESS:-1}" == "1" ]]; then

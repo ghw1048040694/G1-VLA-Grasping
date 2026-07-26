@@ -386,8 +386,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run_episode(args: argparse.Namespace) -> dict:
     permutation = tuple(int(value) for value in args.slot_permutation.split(","))
     if sorted(permutation) != [0, 1, 2]:
         raise ValueError("--slot-permutation must contain 0,1,2 exactly once")
@@ -824,7 +823,12 @@ def main() -> None:
         )
     print(json.dumps(summary, indent=2), flush=True)
     print(f"Saved {summary_path}", flush=True)
-    if not passed:
+    return summary
+
+
+def main() -> None:
+    summary = run_episode(parse_args())
+    if not summary["passed"]:
         raise SystemExit(1)
 
 
