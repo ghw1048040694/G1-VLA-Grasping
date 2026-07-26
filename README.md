@@ -1516,18 +1516,26 @@ dedicated target token or target-conditioned action decoder. Another residual
 adapter variant will not be started without a measurable training-path
 invariant.
 
-## G1LANG-32A Forward-Path Audit (planned)
+## G1LANG-32A Result: Forward/Inference Cache Parity Failed
 
-Before another training intervention, `scripts/audit_g1_language_forward_path.py`
-checks the G1LANG-31 checkpoint on one exact-scene validation triplet. It uses
-the same image/state and seeded flow noise for all three language tasks and
-reports target-posterior separation, final flow-velocity separation, adapter
-gradient norms, and the `t=1` training-versus-first-inference velocity RMSE.
-The audit does not update weights or enter closed loop. Its output is written to
-`outputs/G1LANG-32A_forward_path_audit_034000/summary.json` and its terminal
-output is captured in `outputs/G1LANG-32A_forward_path_audit.log`.
+The G1LANG-31 checkpoint was audited on one exact-scene validation triplet with
+the same image/state and seeded flow noise for all three language tasks. The
+target posterior was clearly distinct (pairwise RMSE `0.8164`), final flow
+velocity was target-distinct (pairwise RMSE `0.1186-0.1325`), and every adapter
+gradient was finite and nonzero where connected. The audit therefore confirms
+that the language branch reaches the action output during training.
 
-The next decoder design is permitted only after these invariants are measured:
-the target posterior must be distinct, the action output must be finite and
-target-distinct, all connected adapter gradients must be finite, and the
-training/inference `t=1` velocity RMSE must be at most `1e-5`.
+The training output at `t=1` and the first cached inference denoise output did
+not match: velocity RMSE was `0.0019361577`, above the pre-registered `1e-5`
+invariant. No weights were updated and no closed loop was run. The next step is
+a cache-parity control audit across the source checkpoint and G1LANG-31, with
+the same exact inputs, before selecting a target decoder or starting training.
+
+## G1LANG-32B Cache-Parity Control (planned)
+
+The same audit will be run on the G1LANG-30 33K source checkpoint, using a
+separate output directory. If the `t=1` mismatch is present there as well, it is
+a stock cached-inference numerical/path difference rather than a new adapter
+disconnect. If it appears only after G1LANG-31, the target suffix hook must be
+fixed before any decoder experiment. No training is allowed until this control
+is recorded.

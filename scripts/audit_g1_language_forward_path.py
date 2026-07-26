@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260727)
     parser.add_argument("--time", type=float, default=1.0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--experiment", default="G1LANG-32A-forward-path-audit")
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -156,7 +157,7 @@ def run_audit(args: argparse.Namespace) -> dict:
         output_handle.remove()
 
     report = {
-        "experiment": "G1LANG-32A-forward-path-audit",
+        "experiment": args.experiment,
         "checkpoint": str(args.checkpoint),
         "device": device_name,
         "scene_index": args.scene_index,

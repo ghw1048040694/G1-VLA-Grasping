@@ -7,6 +7,7 @@ LEROBOT_PYTHON="${LEROBOT_PYTHON:-/home/ubuntu/miniconda3/envs/lerobot/bin/pytho
 CHECKPOINT="${CHECKPOINT:-$PROJECT_ROOT/outputs/G1LANG-31_target_suffix_expert_34000step/checkpoints/034000/pretrained_model}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/outputs/G1LANG-32A_forward_path_audit_034000}"
 LOG_PATH="${LOG_PATH:-$PROJECT_ROOT/outputs/G1LANG-32A_forward_path_audit.log}"
+EXPERIMENT="${EXPERIMENT:-G1LANG-32A-forward-path-audit}"
 
 export PYTHONPATH="$LEROBOT_ROOT/src:$PROJECT_ROOT/scripts"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/tmp/g1_hf_datasets}"
@@ -29,6 +30,7 @@ exec > >(tee -a "$LOG_PATH") 2>&1
   --scene-index 0 \
   --frame-index 0 \
   --seed 20260727 \
-  --time 1.0
+  --time 1.0 \
+  --experiment "$EXPERIMENT"
 
 echo "G1_LANGUAGE_FORWARD_AUDIT_COMPLETE=1"
