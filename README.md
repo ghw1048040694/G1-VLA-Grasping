@@ -1663,3 +1663,20 @@ outputs/G1LANG-34_context_target_decoder_44000step
 outputs/G1LANG-34_context_target_decoder_44000step/checkpoint_audit.json
 outputs/G1LANG-34_context_target_gate_044000/summary.json
 ```
+
+## G1FINAL-00: Target-Subset Loader Contract Fix
+
+The first start of the target-specialist run intentionally stopped before the
+first optimizer update. LeRobot v2.1 accepted the non-contiguous
+`dataset.episodes` lists but retained original parquet episode ids while its
+compact temporal index expected positions `0..N-1`; the first red subset batch
+therefore raised `IndexError: index 132 is out of bounds for dimension 0 with
+size 50`. No checkpoint or parameter update was produced.
+
+The local-only LeRobot checkout now maps each original episode id to its
+selected compact slot for temporal queries, while preserving the original id
+for video lookup. The change is limited to
+`/home/ubuntu/lerobot/src/lerobot/datasets/lerobot_dataset.py`, passes Python
+bytecode compilation, and is not pushed upstream. The corrected production
+run uses `dataset.episodes` lists of 50 red, 50 yellow, and 50 green episodes
+and is recorded as G1FINAL-01.
