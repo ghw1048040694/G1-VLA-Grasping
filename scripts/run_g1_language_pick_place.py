@@ -23,7 +23,7 @@ from validate_g1_bimanual_actuation import (
 )
 
 OBJECT_NAMES = ("red_triangle", "yellow_rod", "green_cube")
-EXPERT_CONTRACT_VERSION = "g1lang_v2_bimanual_safe_approach"
+EXPERT_CONTRACT_VERSION = "g1lang_v3_paired_scene_supervision"
 OBJECT_LABELS = {
     "red_triangle": "red triangular prism",
     "yellow_rod": "yellow rod",

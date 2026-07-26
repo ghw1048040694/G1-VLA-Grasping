@@ -1065,3 +1065,387 @@ against VLA plus world-model planning under identical initial conditions, then
 tests sim-to-sim transfer between physics backends. G1WH-40 supplies the scaled
 data and defensible VLA-only baseline for that integration; it is not itself the
 completed world-model project.
+
+## G1 Language-Grounded Multi-Object Manipulation
+
+The current final project replaces the single tote task with three instructions:
+put a red triangular prism, yellow rod, or green cube into a blue box. The scene
+randomizes the three graspable objects across six slot permutations with
+continuous position jitter. Expert demonstrations select the reachable arm,
+approach from above, grasp, transport, release, and retreat while recording
+three cameras, 43 raw G1 joints, object poses, target identity, active arm, task
+phase, and assisted-grasp state.
+
+The corrected production run passes all 180/180 expert episodes. Conversion
+creates 150 training episodes with 27,300 frames and 30 isolated validation
+episodes with 5,460 frames. Both splits expose 31 upper-body states/actions,
+three video streams, and all nine language variants. SmolVLA fine-tuning from
+the G1WH-40 checkpoint completes 20,000 updates. Mean logged loss decreases
+from 0.4535 over the first 100 records to 0.04104 in the middle and 0.01800 over
+the final 100. This is frozen-VLM partial fine-tuning, not full fine-tuning,
+LoRA, or quantization.
+
+The first 30-episode evaluation is invalid as a policy benchmark because its PD
+feedback was computed once per 15 Hz command and the stale torque was held for
+about 33 MuJoCo substeps. The simulation timestep is 0.002 s (500 Hz), while
+the expert and established G1 evaluator recompute feedback at every physics
+substep. That bug produced visible instability and a 32.63% mean joint-limit
+violation fraction. The language evaluator now keeps the 15 Hz VLA target but
+recomputes PD torque at 500 Hz, reports task success separately from strict
+safety success, and records per-joint violations and action deltas.
+
+After the control fix, a three-episode smoke run grasps an object in every
+episode, achieves one strict task success, and reduces mean joint-limit
+violations to 0.247%. A stricter paired protocol now gives each group of three
+instructions the exact same scene offsets and inference noise, so language is
+the only preset difference. Its first group selects the correct object in 2/3
+episodes, succeeds strictly in 1/3, and keeps mean joint-limit violations at
+0.290%. Red succeeds, yellow incorrectly selects red, and green is selected but
+stalls at the box edge.
+
+A counterfactual initial-action test holds image, robot state, and flow-matching
+noise fixed while changing only the instruction. Across ten scenes and 30
+queries, the predicted chunk is nearest to the correct target expert chunk in
+21/30 cases (70%, versus 33.3% chance): red is 10/10, yellow 5/10, and green
+6/10. Mean language-conditioned prediction separation is 0.1749 rad versus
+0.2510 rad between expert target trajectories, a ratio of 0.697. Language has a
+real effect, but yellow/green grounding remains incomplete. The project does
+not yet claim a passed VLA baseline, multi-object world-model MPC, or
+multi-object Isaac Sim transfer.
+
+The counterfactual query itself is controlled: each three-instruction group
+reuses the first validation image, robot state, and seeded noise. Its nearest
+expert references are target-matched validation episodes with independent
+continuous position jitter, however. Across the ten groups, the maximum object
+position mismatch averages 3.05 cm and reaches 3.73 cm. The 70% number is
+therefore a reproducible language-sensitivity diagnostic, not a substitute for
+the exact-scene paired closed loop. On the same 30 queries, accuracy improves
+from 17/30 (56.7%) at 10K to 21/30 (70.0%) at 20K, while the separation ratio is
+nearly unchanged at 0.695 versus 0.697.
+
+The 40K checkpoint does not pass the counterfactual gate. On the same 30
+queries it scores 20/30 (66.7%): red is 10/10, yellow 7/10, and green 3/10.
+Yellow and green choose the same nearest expert class in all ten scenes. Their
+predicted chunk distance is 0.04353 rad versus 0.23901 rad between their expert
+references, only 18.2%. The overall separation ratio rises to 0.729 because red
+separates well, not because all three classes improve. The gate correctly skips
+both closed-loop stages.
+
+The next intervention changes data identifiability rather than another training
+hyperparameter. Dataset contract `g1lang_dataset_v3_exact_scene_triplets`
+samples each permutation and continuous XY jitter once, then reuses that exact
+scene for red, yellow, and green expert episodes. A separate collection spec
+prevents independent-jitter episodes from being resumed into the new dataset.
+The full G1LANG-11 collection passes 180/180 expert episodes across 60 exact
+scene triplets. All six permutations occur in ten scenes, all three language
+variant groups occur in 20 scenes, and all nine complete instructions occur 20
+times. Independent audit finds exactly 0.0 m initial-position difference within
+each triplet, 0.0534% mean and 0.3469% worst joint-limit violations, valid
+182-by-43 NPZ arrays, and complete three-camera media. A full resume reuses all
+180 episodes in about 1.15 seconds.
+
+G1LANG-12 converts complete triplets without crossing the split boundary: 150
+episodes / 27,300 frames / 50 scenes for training and 30 / 5,460 / 10 scenes for
+validation. Both datasets expose 31-dimensional state and action, three
+decodable 240-by-320 videos, and nine tasks. The converter now rejects the wrong
+dataset contract, incomplete triplets, and split sizes not divisible by three.
+The adapted SmolVLA reuses the source network weights and refreshes
+normalization from the new training set. This validates the intervention and
+training contract; it does not yet show that a newly trained policy resolves
+yellow/green grounding.
+
+Current diagnostic and paired-data outputs:
+
+```text
+outputs/G1LANG-04_pd_substep_fix_smoke
+outputs/G1LANG-05_paired_language_smoke
+outputs/G1LANG-06_counterfactual_initial_action
+outputs/G1LANG-08_counterfactual_040000
+outputs/G1LANG-11_paired_dataset_contract_smoke
+outputs/G1LANG-11_paired_production_dataset
+outputs/G1LANG-12_paired_lerobot_dataset
+```
+
+The next controlled run trains a fresh adapted policy on the paired dataset for
+20K updates. Its gate order remains: require at least 80% on the exact-scene
+30-query counterfactual test, then require 3/3 strict successes in one paired
+closed-loop scene, and only then run the formal 30 episodes. Multi-object
+world-model and MPC integration starts only after the VLA gate passes.
+
+The fresh paired-data 20K run completes normally with full model, optimizer,
+scheduler, and RNG state. Mean loss over the first, middle, and last 100 log
+records falls from 0.45649 to 0.04316 to 0.02000; all 1,000 records are finite.
+This numerical fit does not translate into language grounding. On exact-scene
+counterfactual references, 10K and 20K both score 10/30 (33.3%, chance). Their
+language-separation ratios are only 0.092 and 0.110, versus 0.697 for the old
+20K diagnostic. The 20K per-target result is red 3/10, yellow 6/10, green 1/10.
+The gate therefore skips all closed-loop evaluation.
+
+This negative result narrows the failure mode: exact triplets remove scene
+confounding, but the default loader still samples independent frames in
+two-sample batches, and later trajectory images reveal which object is already
+being manipulated. A low flow-matching loss can therefore coexist with a
+language-agnostic initial policy. The next bounded experiment resumes the 20K
+checkpoint for 2K curriculum updates where each batch is the red/yellow/green
+triplet from one scene and one of the first 16 frames, with shared flow noise
+and time. It must improve the exact-scene counterfactual gate before any longer
+training or closed-loop run is justified.
+
+The 2K exact-triplet curriculum completes and preserves full checkpoint state.
+On the original seed, accuracy moves only from 10/30 to 11/30 while the
+separation ratio rises from 0.110 to 0.162. A matched four-seed check removes
+the temptation to overread that single query: the 20K baseline totals 40/120
+(33.3%) with mean separation 0.1246, and the 22K curriculum totals 41/120
+(34.2%) with mean separation 0.1521. Separation improves by about 22% on
+average, but classification remains chance and one seed's separation declines.
+The project therefore stops ordinary curriculum continuation.
+
+The next intervention adds an explicit ranking objective on the same initial
+triplet batches. For each expert action chunk, the correct task prompt must
+produce lower flow-matching error than both cyclically shuffled wrong prompts
+by a fixed margin. Correct and wrong forwards share the scene, frame, flow
+noise, and time. This directly penalizes language bypass while retaining the
+original behavior-cloning loss, and is tested first with a bounded continuation
+before any closed-loop evaluation.
+
+The bounded G1LANG-18 continuation is now complete. It resumes the 22K model
+for 1,000 updates with a ranking margin of 0.01 and weight 1.0. A one-update
+smoke test first verifies finite loss and gradients without OOM. The production
+checkpoint reaches exactly step 23,000 and preserves all model, optimizer, and
+RNG state. Across the first, middle, and last ten logging windows, correct-task
+behavior-cloning loss is 0.0485, 0.0564, and 0.0428; ranking loss is 0.0069,
+0.0059, and 0.0055; mean wrong-minus-correct loss gap is 0.0063, 0.0090, and
+0.0091; and margin satisfaction is 27.0%, 38.5%, and 38.9%. The explicit
+objective therefore changes its own training diagnostics in the intended
+direction, but does not by itself establish usable grounding.
+
+Matched evaluation rejects this intervention as the current solution. On the
+original seed, the 23K checkpoint scores 11/30 (36.7%) with a separation ratio
+of 0.1367. Across the same four seeds used for the 20K and 22K comparison, it
+scores 42/120 (35.0%) with mean separation 0.1378 and cumulative red/yellow/green
+correct counts of 17/12/13. For comparison, 20K scores 40/120 with separation
+0.1246 and 22K scores 41/120 with separation 0.1521. Another one-query increase
+is not reliable classification progress, while separation actually falls from
+22K. No seed reaches the required 24/30 gate, so paired and formal closed-loop
+evaluation remain skipped. Further repetitions of the same curriculum are
+stopped; the next model intervention must test trainable language-related layers
+or explicit target conditioning before world-model and MPC integration.
+
+G1LANG-20 isolates the first architecture intervention. It freezes the complete
+action path and unfreezes only VLM text layer 14, the deepest layer whose prefix
+output can still affect a later action-attention layer. This makes 9,832,320 of
+450,046,362 parameters trainable (2.18%). A one-update smoke test confirms a
+nonzero VLM gradient norm of 0.019 without OOM. The 1,000-update continuation
+then reaches step 24,000 in about 11.5 minutes. Checkpoint comparison verifies
+that exactly seven model tensors change, all in text layer 14; every action-path
+tensor remains bitwise identical.
+
+This isolated language-layer adaptation also fails the held-out gate. The four
+seeds reproduce exactly the same classification counts as 23K: 11, 10, 10, and
+11 correct, or 42/120 (35.0%) with cumulative red/yellow/green counts 17/12/13.
+Mean separation changes only from 0.1378 to 0.1373. The result rules out a short
+single-late-layer update as a sufficient fix, while not ruling out broader VLM
+adaptation. Closed loop remains skipped. The next controlled architecture should
+provide the action expert a direct learned condition derived from language
+embeddings, rather than manually parsing a target label or adding more training
+to the same indirect cross-attention route.
+## G1LANG-22 Direct Language-to-Action Adapter (in progress)
+
+The next intervention is implemented in `scripts/g1_language_action_adapter.py`.
+It pools valid SmolVLM input-token embeddings, projects them through a small
+trainable adapter to the action-expert width, and adds that residual to every
+action suffix token. The final projection is zero-initialized, so attaching it
+preserves the source policy exactly before training. The adapter is project
+local and is attached consistently during triplet training and counterfactual
+evaluation; no LeRobot source file is modified.
+
+The one-update smoke test passes on the 24K checkpoint: the adapter is the only
+trainable path (431,056 parameters, 0.096% of the model), the exact-scene
+triplet sampler remains valid, and the finite-gradient update completes. The
+old checkpoint has no adapter optimizer slots, so the first continuation
+resets optimizer moments at source step 24,000 and records that mismatch.
+
+Run the bounded production continuation with:
+
+```bash
+bash scripts/run_g1_language_action_adapter.sh
+```
+
+Its first gate is the same four-seed exact-scene counterfactual test with an
+80% threshold. Closed-loop evaluation and World Model/MPC integration remain
+blocked until that gate passes.
+
+## G1LANG-22 Result: Adapter-Only Grounding Gate Failed
+
+The bounded continuation from G1LANG-20 step 24,000 to step 25,000 completed
+normally in 1,000 exact-scene triplet updates. The checkpoint contains model,
+optimizer, scheduler, and RNG state, with `training_step.json = 25000`.
+Only the four project-owned adapter tensors were added or changed; the 506
+pre-existing model tensors remained unchanged. The adapter has 431,056
+trainable parameters (`0.0957%` of the 450,477,418-parameter policy). The
+original optimizer state had no adapter slots, so optimizer moments were reset
+at step 24,000 and this was recorded in the training log.
+
+The exact-scene counterfactual gate fails at chance:
+
+| matched flow seed | correct | separation ratio |
+|---|---:|---:|
+| `20260727` | `10/30` | `0.1246` |
+| `20260728` | `10/30` | `0.1308` |
+| `20260729` | `10/30` | `0.1258` |
+| `20260730` | `10/30` | `0.1244` |
+
+The aggregate is `40/120 = 33.3%`, with red/yellow/green counts `16/12/12`
+and mean separation ratio `0.1264`. All four scenes use zero initial-state
+and zero object-position mismatch within each triplet. Therefore the adapter
+is connected and trainable, but a short adapter-only update does not produce
+held-out language grounding. No closed-loop or World Model/MPC stage is run.
+
+The first device-mapped run exposed and recorded a CPU/CUDA placement bug for
+the newly attached adapter; the corrected rerun placed it beside the action
+expert and completed successfully. The training loader now also supports
+resuming checkpoints that contain the project adapter. The next bounded
+intervention is G1LANG-23: resume the 25K adapter checkpoint while unfreezing
+the action expert together with the adapter, keeping the same four-seed gate.
+
+## G1LANG-23 Result: Joint Action-Expert and Adapter Update Also Failed
+
+G1LANG-23 resumed the 25K adapter checkpoint and ran 1,000 updates to step
+26,000 with the action expert and adapter trainable. The loader restored all
+four adapter tensors, and the audit reported 100,312,048 trainable parameters
+(`22.27%`). The checkpoint completed with model, optimizer, scheduler, and RNG
+state. Parameter comparison against G1LANG-22 found 126 changed tensors: all
+four adapter tensors and 124 action-path tensors, confirming the intended
+optimization boundary.
+
+The four-seed exact-scene gate remains at chance: `40/120 = 33.3%`, with
+red/yellow/green counts `16/12/12` and mean separation ratio `0.1183` (lower
+than G1LANG-22's `0.1264`). The four seed accuracies are all `10/30`, and every
+within-triplet initial-state and object-position delta is zero. This rules out
+a short action-expert co-adaptation as sufficient language grounding; closed
+loop and World Model/MPC remain blocked. G1LANG-24 next tests unfreezing the
+last four effective VLM text layers together with the existing adapter and
+action expert.
+
+## G1LANG-24 Result: Four-Layer VLM Adaptation Still Failed
+
+G1LANG-24 resumed step 26,000 and trained the adapter, action expert, and VLM
+text layers 11-14 for 1,000 updates. The 139,641,328 trainable parameters
+(`31.0%`) fit on the 8 GB GPU, VLM gradients remained nonzero, and the step
+27,000 checkpoint completed. Compared with G1LANG-23, 159 tensors changed,
+including 33 tensors in the selected VLM layers and all adapter tensors.
+
+The four-seed exact-scene result remains `40/120 = 33.3%`; per-target totals
+are `17/13/10` and mean separation is `0.1312`. Broader VLM adaptation therefore
+does not pass the language gate. A representation audit shows that pooled task
+embeddings and adapter outputs are already distinct, but the residual injected
+before the action expert is attenuated before the final action. G1LANG-25 tests
+a zero-initialized direct language-conditioned residual on the flow-velocity
+output, still derived from natural-language embeddings and not a parsed label.
+
+## G1LANG-25 / G1LANG-26: Direct Output and FiLM Adapters Still Failed
+
+G1LANG-25 resumed the 27K checkpoint to step 28K and added a zero-initialized
+language-conditioned residual directly to the flow-velocity output. The
+condition was still a masked pooled natural-language embedding; no target text
+parser or one-hot input was used. With the action path frozen, 454,128 adapter
+parameters were trainable. The four-seed exact-scene gate reached `41/120 =
+34.2%`, with per-seed counts `11/30`, `10/30`, `11/30`, and `9/30`, and mean
+separation ratio `0.1251`. This is one query above chance and does not justify
+closed-loop evaluation.
+
+G1LANG-26 resumed 28K to 29K and added zero-initialized language FiLM before
+the action output projection. The 1,492,368 trainable adapter parameters
+modulated suffix hidden states with a learned scale and shift, while the action
+path remained frozen. The gate fell to `39/120 = 32.5%`, with mean separation
+ratio `0.1086`; no closed loop or World Model/MPC stage was run.
+
+## G1LANG-27 Result: Auxiliary Target Classification Does Not Ground Actions
+
+G1LANG-27 resumed the G1LANG-26 checkpoint from step 29K to 30K. It added a
+three-class auxiliary classifier to the same pooled natural-language condition,
+with labels taken from the dataset's `target_object_index`; the action output
+was not given a hand-built label or one-hot input. The classifier loss fell from
+about `1.098` to effectively `0.000`, proving that the auxiliary objective was
+optimized. The action path stayed frozen and the audit reported `1,494,531`
+trainable parameters (`0.331%` of `451,540,893`). Compared with G1LANG-26,
+eight existing adapter tensors changed and two target-classifier tensors were
+added, so the intended parameters were actually present in the checkpoint.
+
+The exact-scene counterfactual gate used the same first image/state and seeded
+noise for each red/yellow/green instruction. The four seeds produced:
+
+| flow noise seed | correct | separation ratio |
+|---|---:|---:|
+| `20260727` | `10/30` | `0.2273` |
+| `20260728` | `12/30` | `0.2175` |
+| `20260729` | `11/30` | `0.2311` |
+| `20260730` | `10/30` | `0.2466` |
+
+The aggregate is `43/120 = 35.8%`, with red/yellow/green totals `19/14/10`
+and mean separation ratio `0.2306`. Every reference scene has zero initial
+state and object-position mismatch. The classifier therefore learns its own
+language proxy, but that signal still does not reliably control the action
+chunk. The pre-registered `96/120` (`80%`) gate fails, so paired closed loop,
+formal 30 episodes, and World Model/MPC remain blocked.
+
+The next intervention must connect the learned target proxy to action generation
+more explicitly and test that connection under the same four-seed gate; simply
+extending this adapter family or tuning another auxiliary weight is stopped.
+
+## G1LANG-28 Result: Target-Conditioned Chunk Basis Still Failed
+
+G1LANG-28 resumed the 30K target-classifier checkpoint to step 31K. The learned
+language-to-target posterior was passed through a zero-initialized linear basis
+that expands over the complete action chunk, while the action path remained
+frozen. The audit reported `1,500,931` trainable parameters. The new projection
+was not inert: its `[1600, 3]` weight and `[1600]` bias were both nonzero in the
+31K checkpoint, and the old adapter tensors also changed.
+
+The four exact-scene counterfactual seeds produced:
+
+| flow noise seed | correct | separation ratio |
+|---|---:|---:|
+| `20260727` | `10/30` | `0.2102` |
+| `20260728` | `11/30` | `0.2056` |
+| `20260729` | `11/30` | `0.1962` |
+| `20260730` | `9/30` | `0.1941` |
+
+The aggregate is `41/120 = 34.2%`, with red/yellow/green totals `16/13/12` and
+mean separation ratio `0.2015`. All four evaluation reports have zero initial
+state and object-position mismatch. An independent validation audit of the
+target classifier itself is `30/30` (10/10 for every target), with posterior
+probabilities near one-hot. Thus the classifier has learned the language target
+proxy, but the chunk action basis does not make the action prediction follow it.
+The `96/120` (`80%`) gate fails; closed loop and World Model/MPC remain blocked.
+
+G1LANG-29 adds a state/time-dependent target-conditioned bilinear residual at
+the final action hidden, so the target posterior can select action bases that
+depend on the expert's hidden state rather than only a fixed chunk offset.
+
+## G1LANG-29 Result: State-Dependent Target Basis Also Failed
+
+G1LANG-29 resumed G1LANG-28 from 31K to 32K. It added a zero-initialized
+hidden-dependent projection that produces three action bases from the final
+action hidden and mixes them with the learned target posterior; the previous
+chunk basis remained enabled. The new `[96, 720]` weight and `[96]` bias became
+nonzero (maximum absolute weight about `0.0090`), and the checkpoint reached
+step 32,000 with `520` model tensors. The action path remained frozen and the
+training signal stayed finite.
+
+The exact-scene counterfactual gate was:
+
+| flow noise seed | correct | separation ratio |
+|---|---:|---:|
+| `20260727` | `9/30` | `0.2585` |
+| `20260728` | `7/30` | `0.2416` |
+| `20260729` | `9/30` | `0.2692` |
+| `20260730` | `10/30` | `0.3006` |
+
+The aggregate is `35/120 = 29.2%`, with red/yellow/green totals `13/13/9` and
+mean separation ratio `0.2675`. All references remain exactly scene-matched.
+Despite a larger language-conditioned action separation, nearest-expert action
+classification is worse than chance. The `80%` gate fails, so no closed loop or
+World Model/MPC evaluation is allowed. This stops the current family of frozen
+action-path adapter variants; the next work must audit the expert training path
+and data/target action contract before another architecture sweep.

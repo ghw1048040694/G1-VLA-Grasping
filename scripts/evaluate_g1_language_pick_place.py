@@ -125,20 +125,23 @@ def evaluation_specs(episodes: int, seed: int, jitter: float) -> list[dict]:
     rng = np.random.default_rng(seed)
     permutations = tuple(itertools.permutations(range(3)))
     specs = []
-    for index in range(episodes):
-        target = OBJECT_NAMES[index % 3]
-        instruction = LANGUAGE_VARIANTS[target][
-            (index // len(OBJECT_NAMES)) % len(LANGUAGE_VARIANTS[target])
-        ]
-        specs.append(
-            {
-                "episode_index": index,
-                "target_object": target,
-                "instruction": instruction,
-                "permutation": permutations[(index // 3) % len(permutations)],
-                "offsets": rng.uniform(-jitter, jitter, size=(3, 2)),
-            }
-        )
+    for scene_index in range(episodes // len(OBJECT_NAMES)):
+        permutation = permutations[scene_index % len(permutations)]
+        offsets = rng.uniform(-jitter, jitter, size=(3, 2))
+        for target in OBJECT_NAMES:
+            instruction = LANGUAGE_VARIANTS[target][
+                scene_index % len(LANGUAGE_VARIANTS[target])
+            ]
+            specs.append(
+                {
+                    "episode_index": len(specs),
+                    "scene_index": scene_index,
+                    "target_object": target,
+                    "instruction": instruction,
+                    "permutation": permutation,
+                    "offsets": offsets.copy(),
+                }
+            )
     return specs
 
 
@@ -267,6 +270,11 @@ def run_episode(
     action_values = 0
     joint_limit_violations = 0
     joint_samples = 0
+    joint_limit_violations_by_joint = {name: 0 for name in controlled_names}
+    joint_samples_by_joint = {name: 0 for name in controlled_names}
+    action_delta_squared_sum = 0.0
+    action_delta_count = 0
+    action_delta_max_abs = 0.0
     previous_action = initial_targets[LOWER_BODY_JOINTS:].copy()
 
     for frame in range(control_frames):
@@ -284,7 +292,9 @@ def run_episode(
                 policy.predict_action_chunk(
                     batch,
                     noise=seeded_noise(
-                        policy, args.seed + episode_index * 1000 + frame, args.device
+                        policy,
+                        args.seed + spec["scene_index"] * 1000 + frame,
+                        args.device,
                     ),
                 )[0]
                 .detach()
@@ -296,7 +306,13 @@ def run_episode(
         clipped = np.clip(action, action_lower, action_upper)
         action_clip_values += int(np.count_nonzero(np.abs(clipped - action) > 1e-8))
         action_values += len(action)
-        previous_action = clipped
+        action_delta = clipped - previous_action
+        action_delta_squared_sum += float(np.sum(action_delta**2))
+        action_delta_count += action_delta.size
+        action_delta_max_abs = max(
+            action_delta_max_abs, float(np.max(np.abs(action_delta)))
+        )
+        previous_action = clipped.copy()
 
         if grabbed_object is None and frame >= args.control_fps:
             distances = {
@@ -321,24 +337,27 @@ def run_episode(
 
         commanded = initial_targets.copy()
         commanded[LOWER_BODY_JOINTS:] = clipped
-        for name, item in controlled.items():
-            kp, kd = unitree_gains(name)
-            kp *= 1.5
-            kd *= math.sqrt(1.5)
-            qpos = float(data.qpos[item["qpos_id"]])
-            qvel = float(data.qvel[item["qvel_id"]])
-            torque = kp * (commanded[item["actuator_id"]] - qpos) - kd * qvel
-            torque += float(data.qfrc_bias[item["qvel_id"]])
-            data.ctrl[item["actuator_id"]] = torque
         for _ in range(physics_per_control):
+            for name, item in controlled.items():
+                kp, kd = unitree_gains(name)
+                kp *= 1.5
+                kd *= math.sqrt(1.5)
+                qpos = float(data.qpos[item["qpos_id"]])
+                qvel = float(data.qvel[item["qvel_id"]])
+                torque = kp * (commanded[item["actuator_id"]] - qpos) - kd * qvel
+                torque += float(data.qfrc_bias[item["qvel_id"]])
+                data.ctrl[item["actuator_id"]] = torque
             mujoco.mj_step(model, data)
             for name, item in controlled.items():
                 low_limit, high_limit = model.jnt_range[item["joint_id"]]
                 qpos = float(data.qpos[item["qpos_id"]])
-                joint_limit_violations += int(
+                violated = int(
                     qpos < low_limit - 1e-6 or qpos > high_limit + 1e-6
                 )
+                joint_limit_violations += violated
                 joint_samples += 1
+                joint_limit_violations_by_joint[name] += violated
+                joint_samples_by_joint[name] += 1
         video_renderer.update_scene(data, camera=camera)
         writer.append_data(video_renderer.render())
 
@@ -359,14 +378,15 @@ def run_episode(
     ]
     selected_correct_object = grabbed_object == spec["target_object"]
     violation_fraction = joint_limit_violations / max(joint_samples, 1)
-    passed = bool(
+    task_success = bool(
         selected_correct_object
         and target_in_box
         and not wrong_objects_in_box
-        and violation_fraction <= 0.01
     )
+    passed = bool(task_success and violation_fraction <= 0.01)
     report = {
         "episode_index": episode_index,
+        "scene_index": spec["scene_index"],
         "language_instruction": spec["instruction"],
         "target_object": spec["target_object"],
         "grabbed_object": grabbed_object,
@@ -379,8 +399,19 @@ def run_episode(
         "target_in_box": target_in_box,
         "wrong_objects_in_box": wrong_objects_in_box,
         "objects_in_box": objects_in_box,
+        "task_success": task_success,
         "joint_limit_violation_fraction": violation_fraction,
+        "joint_limit_violation_fraction_by_joint": {
+            name: joint_limit_violations_by_joint[name]
+            / joint_samples_by_joint[name]
+            for name in controlled_names
+            if joint_limit_violations_by_joint[name]
+        },
         "action_clip_fraction": action_clip_values / max(action_values, 1),
+        "action_delta_rmse_rad": math.sqrt(
+            action_delta_squared_sum / max(action_delta_count, 1)
+        ),
+        "action_delta_max_abs_rad": action_delta_max_abs,
         "assist_activation_frame": assist_activation_frame,
         "assist_release_frame": assist_release_frame,
         "mean_policy_inference_s": float(np.mean(inference_times)),
@@ -418,7 +449,9 @@ def main() -> None:
                 item["selected_correct_object"] for item in subset
             )
             / len(subset),
-            "put_in_box_success_rate": sum(item["passed"] for item in subset)
+            "put_in_box_success_rate": sum(item["task_success"] for item in subset)
+            / len(subset),
+            "strict_success_rate": sum(item["passed"] for item in subset)
             / len(subset),
         }
     summary = {
@@ -429,7 +462,9 @@ def main() -> None:
             item["selected_correct_object"] for item in reports
         )
         / len(reports),
-        "put_in_box_success_rate": sum(item["passed"] for item in reports)
+        "put_in_box_success_rate": sum(item["task_success"] for item in reports)
+        / len(reports),
+        "strict_success_rate": sum(item["passed"] for item in reports)
         / len(reports),
         "wrong_object_grasp_rate": sum(
             item["grabbed_object"] is not None and not item["selected_correct_object"]
@@ -441,12 +476,26 @@ def main() -> None:
         "mean_joint_limit_violation_fraction": float(
             np.mean([item["joint_limit_violation_fraction"] for item in reports])
         ),
+        "mean_action_delta_rmse_rad": float(
+            np.mean([item["action_delta_rmse_rad"] for item in reports])
+        ),
+        "maximum_action_delta_abs_rad": float(
+            np.max([item["action_delta_max_abs_rad"] for item in reports])
+        ),
         "per_target": per_target,
+        "acceptance_thresholds": {
+            "object_selection_accuracy_min": 0.80,
+            "put_in_box_success_rate_min": 0.70,
+            "strict_success_rate_min": 0.70,
+            "wrong_object_grasp_rate_max": 0.10,
+            "mean_joint_limit_violation_fraction_max": 0.01,
+        },
         "reports": reports,
     }
     summary["passed"] = bool(
         summary["object_selection_accuracy"] >= 0.80
         and summary["put_in_box_success_rate"] >= 0.70
+        and summary["strict_success_rate"] >= 0.70
         and summary["wrong_object_grasp_rate"] <= 0.10
         and summary["mean_joint_limit_violation_fraction"] <= 0.01
     )

@@ -20,6 +20,7 @@ CAMERAS = {
 }
 OBJECT_NAMES = ("red_triangle", "yellow_rod", "green_cube")
 LOWER_BODY_JOINTS = 12
+PAIRED_DATASET_CONTRACT_VERSION = "g1lang_dataset_v3_exact_scene_triplets"
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,9 +32,64 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-repo-id", default="local/g1_language_pick_place_val")
     parser.add_argument("--train-episodes", type=int, default=150)
     parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument("--required-dataset-contract-version")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
+
+
+def validate_source_contract(
+    source_summary: dict,
+    episode_dirs: list[Path],
+    train_episodes: int,
+    required_version: str | None,
+) -> dict:
+    version = source_summary.get("dataset_contract_version")
+    if required_version and version != required_version:
+        raise ValueError(
+            f"Source dataset contract is {version!r}, expected {required_version!r}"
+        )
+    if version != PAIRED_DATASET_CONTRACT_VERSION:
+        return {
+            "dataset_contract_version": version,
+            "paired_scene_contract_checked": False,
+        }
+    if train_episodes % len(OBJECT_NAMES) != 0:
+        raise ValueError("--train-episodes must preserve complete three-target scenes")
+    specs = source_summary.get("episode_specs")
+    if not isinstance(specs, list) or len(specs) != len(episode_dirs):
+        raise ValueError("Paired source summary has incomplete episode specs")
+    if source_summary.get("paired_scene_groups") != len(specs) // len(OBJECT_NAMES):
+        raise ValueError("Paired source summary has an incorrect scene-group count")
+    for group_start in range(0, len(specs), len(OBJECT_NAMES)):
+        group = specs[group_start : group_start + len(OBJECT_NAMES)]
+        reference = group[0]
+        expected_indices = list(range(group_start, group_start + len(OBJECT_NAMES)))
+        if [item.get("episode_index") for item in group] != expected_indices:
+            raise ValueError("Paired source episode ordering is not contiguous")
+        if [item.get("target_object") for item in group] != list(OBJECT_NAMES):
+            raise ValueError("Paired source scene does not contain all targets in order")
+        for item in group:
+            if not item.get("passed"):
+                raise ValueError("Paired source summary contains a failed episode")
+            if item.get("scene_index") != reference.get("scene_index"):
+                raise ValueError("Paired source group contains multiple scene indices")
+            if item.get("slot_permutation") != reference.get("slot_permutation"):
+                raise ValueError("Paired source group contains multiple permutations")
+            if item.get("slot_offsets_xy_m") != reference.get("slot_offsets_xy_m"):
+                raise ValueError("Paired source group contains multiple jitters")
+            if item.get("language_variant_index") != reference.get(
+                "language_variant_index"
+            ):
+                raise ValueError("Paired source group contains multiple language variants")
+    return {
+        "dataset_contract_version": version,
+        "paired_scene_contract_checked": True,
+        "paired_scene_groups": len(specs) // len(OBJECT_NAMES),
+        "train_scene_groups": train_episodes // len(OBJECT_NAMES),
+        "validation_scene_groups": (len(specs) - train_episodes)
+        // len(OBJECT_NAMES),
+    }
 
 
 def dataset_features(joint_names: list[str]) -> dict:
@@ -253,6 +309,12 @@ def main() -> None:
     episode_dirs = sorted(args.source_root.glob("episode_*"))
     if not 0 < args.train_episodes < len(episode_dirs):
         raise ValueError("--train-episodes must leave at least one validation episode")
+    contract_validation = validate_source_contract(
+        source_summary,
+        episode_dirs,
+        args.train_episodes,
+        args.required_dataset_contract_version,
+    )
     train_dirs = episode_dirs[: args.train_episodes]
     val_dirs = episode_dirs[args.train_episodes :]
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -260,6 +322,7 @@ def main() -> None:
         "experiment": "G1-Language-Grounded-Manipulation-LeRobot-Dataset",
         "source_root": str(args.source_root),
         "source_episodes": len(episode_dirs),
+        "source_contract_validation": contract_validation,
         "language_mode": "full_episode_instruction",
         "train": convert_split(
             train_dirs, args.train_repo_id, args.train_root, args.fps, args.overwrite
