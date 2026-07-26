@@ -1621,3 +1621,45 @@ both changed by about `9.99e-8`. The four upstream attention projections had
 finite zero gradients on the first step because the downstream residual output
 was still zero initialized. The missing optimizer slots were explicitly reset
 at source step 39,000, and the smoke wrote no checkpoint.
+
+Version snapshot before production training: G1-UpperBody commit `69ec91e`
+and VLA-Learning commit `700bbca` were both pushed successfully to GitHub
+`main`. The separate `/home/ubuntu/lerobot` worktree remains local-only.
+
+## G1LANG-34 Result: Final Contextual Decoder Failed the Language Gate
+
+The single planned production run completed all 5,000 updates from step 39,000
+to 44,000. The direct action MSE moved below G1LANG-33's `0.24-0.27` plateau,
+with frequent late-training values around `0.09-0.15` and a lowest observed
+value near `0.085`. The checkpoint audit passed: all 526 tensors shared with
+the 39K source are bitwise unchanged, exactly the six expected contextual
+decoder tensors were added, all six are finite and nonzero, and the saved step
+is exactly 44,000.
+
+The unchanged exact-scene four-seed gate was deterministic at `11/30` for each
+seed and produced `44/120 = 36.7%` overall. Red/yellow/green totals are
+`8/20/16`. Mean predicted pairwise action RMSE is `0.02339 rad` versus
+`0.25058 rad` for the expert references, giving a separation ratio of
+`0.09335`. Every reference has exactly zero initial-state and object-position
+mismatch. The contextual target-specific branch therefore improves separation
+over G1LANG-33, but it still predicts trajectories that are far too similar
+across instructions and misses the pre-registered `96/120` gate by a wide
+margin.
+
+No paired closed loop, formal 30-episode evaluation, or new-language World
+Model/MPC run is permitted from this checkpoint. G1LANG-34 ends the current
+end-to-end SmolVLA architecture search; no G1LANG-35 parameter or adapter sweep
+will be started. The fastest defensible delivery route is now a hybrid
+language-grounded controller: reuse the learned natural-language target
+classifier, which independently scored `30/30`, to route among target-specific
+manipulation controllers, then reuse the already implemented World Model/MPC
+and Sim2Sim infrastructure. Results must be described as a modular hybrid
+system, not as successful end-to-end SmolVLA grounding.
+
+Artifacts:
+
+```text
+outputs/G1LANG-34_context_target_decoder_44000step
+outputs/G1LANG-34_context_target_decoder_44000step/checkpoint_audit.json
+outputs/G1LANG-34_context_target_gate_044000/summary.json
+```
