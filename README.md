@@ -1859,3 +1859,19 @@ The reproducible audit is:
 scripts/audit_g1_video_trajectories.py
 outputs/G1FINAL-05_video_audit.json
 ```
+
+## G1FINAL-06: Specialist Training Recovery Boundary
+
+The specialist dataset contract was independently checked after the video
+audit. The red, yellow, and green subsets contain exactly 50 non-contiguous
+episodes each, with a single target index (`0`, `1`, and `2` respectively), so
+the failed target selection is not caused by episode filtering.
+
+After the GPU recovered enough for a small CUDA matmul, a 100-update yellow
+continuation using FP32 trainable layers and bounded flow inputs still failed in
+the frozen BF16 VLM attention before any finite update. An evaluation-only full
+FP32 policy conversion was then tested for 20 updates: the first update was
+finite (`loss=0.024`, `grad_norm=0.819`), but the next backward pass raised
+`CUBLAS_STATUS_INTERNAL_ERROR`. No new checkpoint was written. The original
+5K specialists remain the only valid specialist artifacts; further SmolVLA
+training requires a fresh WSL2/DXG context or a different supported CUDA stack.

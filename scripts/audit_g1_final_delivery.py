@@ -120,6 +120,14 @@ def main() -> None:
                 "artifact": "outputs/G1FINAL-01_target_router_postreboot_fp32_3ep.log",
                 "status": "failed_cublas_fp32_image_encoder",
             },
+            {
+                "artifact": "outputs/G1FINAL-01_yellow_clean100_recovery_smoke.log",
+                "status": "failed_bf16_vlm_attention_after_zero_finite_updates",
+            },
+            {
+                "artifact": "outputs/G1FINAL-01_yellow_fullfp32_20_smoke.log",
+                "status": "one_finite_update_then_cublas_backward_failure",
+            },
         ],
         "architecture_claim": (
             "language classifier -> target specialist -> World Model/MPC -> Sim2Sim; "

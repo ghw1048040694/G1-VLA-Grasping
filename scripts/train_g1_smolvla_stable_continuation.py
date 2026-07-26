@@ -41,6 +41,13 @@ def bounded_flow_inputs(policy: PreTrainedPolicy, batch: Any, device: torch.devi
 def make_policy_with_stable_dtype(*args, **kwargs):
     """Keep the frozen VLM in BF16 but run trainable expert layers in FP32."""
     policy = _ORIGINAL_MAKE_POLICY(*args, **kwargs)
+    if os.environ.get("G1_FORCE_FULL_FP32", "0").lower() in {"1", "true", "yes"}:
+        # The WSL2/DXG path can fail inside BF16 VLM attention even when the
+        # trainable expert is already FP32. This opt-in mode trades memory for
+        # a homogeneous FP32 CUDA execution path during recovery experiments.
+        policy.model.float()
+        logging.warning("G1 stable continuation: full policy converted to FP32")
+        return policy
     if os.environ.get("G1_FORCE_EXPERT_FP32", "0").lower() not in {"1", "true", "yes"}:
         return policy
 
