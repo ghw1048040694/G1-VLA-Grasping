@@ -1680,3 +1680,7 @@ for video lookup. The change is limited to
 bytecode compilation, and is not pushed upstream. The corrected production
 run uses `dataset.episodes` lists of 50 red, 50 yellow, and 50 green episodes
 and is recorded as G1FINAL-01.
+
+Version snapshot after the loader fix and router implementation: G1-UpperBody
+commit `90e528b` and VLA-Learning commit `a52b875` were pushed to GitHub
+`main`. The separate `/home/ubuntu/lerobot` checkout remains local-only.
