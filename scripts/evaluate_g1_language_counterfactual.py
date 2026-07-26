@@ -160,6 +160,7 @@ def main() -> None:
         "experiment": "G1LANG-counterfactual-initial-action",
         "checkpoint": str(args.checkpoint),
         "device": device,
+        "flow_noise_seed": args.seed,
         "scenes": scene_count,
         "queries": len(correct),
         "nearest_expert_classification_accuracy": float(np.mean(correct)),

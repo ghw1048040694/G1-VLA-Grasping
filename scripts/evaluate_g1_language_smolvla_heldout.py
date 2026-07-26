@@ -23,7 +23,11 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.policies.factory import make_policy
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import standardise_state_dict
-from g1_language_action_adapter import attach_language_action_adapter
+from g1_language_action_adapter import (
+    attach_language_action_adapter,
+    set_context_scene_action_decoder_enabled,
+    set_scene_action_decoder_enabled,
+)
 
 
 PHASE_NAMES = {
@@ -94,6 +98,16 @@ def load_policy(path: Path, train_meta: LeRobotDatasetMetadata, device: str):
         policy = make_policy(config, ds_meta=train_meta)
         attach_language_action_adapter(policy)
         state = safetensors.torch.load_file(path / "model.safetensors", device=device)
+        scene_decoder_in_checkpoint = any(
+            key.startswith("model.language_action_adapter.scene_action_decoder.")
+            for key in state
+        )
+        context_scene_decoder_in_checkpoint = any(
+            key.startswith(
+                "model.language_action_adapter.target_scene_action_decoder."
+            )
+            for key in state
+        )
         state, _ = standardise_state_dict(state, set(policy.state_dict().keys()), verbose=False)
         state = {
             key: value for key, value in state.items()
@@ -109,9 +123,20 @@ def load_policy(path: Path, train_meta: LeRobotDatasetMetadata, device: str):
             or key.startswith("model.language_action_adapter.target_action_chunk_proj.")
             or key.startswith("model.language_action_adapter.target_action_hidden_proj.")
             or key.startswith("model.language_action_adapter.target_suffix_proj.")
+            or key.startswith("model.language_action_adapter.scene_input_proj.")
+            or key.startswith("model.language_action_adapter.scene_action_decoder.")
+            or key.startswith("model.language_action_adapter.context_token_proj.")
+            or key.startswith("model.language_action_adapter.target_query_proj.")
+            or key.startswith(
+                "model.language_action_adapter.target_scene_action_decoder."
+            )
         }
         if unexpected or set(missing) != allowed_missing:
             raise RuntimeError(f"Adapter checkpoint load mismatch: missing={missing}, unexpected={unexpected}")
+        set_scene_action_decoder_enabled(policy, scene_decoder_in_checkpoint)
+        set_context_scene_action_decoder_enabled(
+            policy, context_scene_decoder_in_checkpoint
+        )
     else:
         # Source checkpoints predate the adapter; attach it after stock load.
         attach_language_action_adapter(policy)

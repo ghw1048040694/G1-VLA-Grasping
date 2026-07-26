@@ -10,9 +10,12 @@ attaching it preserves the source policy exactly until training changes it.
 from __future__ import annotations
 
 import types
+import math
 
 import torch
 from torch import nn
+
+from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
 
 
 ADAPTER_NAME = "language_action_adapter"
@@ -46,6 +49,18 @@ class LanguageActionAdapter(nn.Module):
         # fixed trajectory offset.
         self.target_action_hidden_proj = nn.Linear(output_dim, 3 * action_dim)
         self.target_suffix_proj = nn.Linear(3, output_dim)
+        self.scene_input_proj = nn.Linear(input_dim, bottleneck)
+        self.scene_action_decoder = nn.Linear(
+            bottleneck + 3, chunk_size * action_dim
+        )
+        # Final language-grounded decoder: target-conditioned attention over
+        # contextualized VLM prefix tokens followed by one scene-to-action map
+        # per learned language target.
+        self.context_token_proj = nn.Linear(input_dim, bottleneck)
+        self.target_query_proj = nn.Linear(3, bottleneck)
+        self.target_scene_action_decoder = nn.Linear(
+            bottleneck, 3 * chunk_size * action_dim
+        )
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
         nn.init.zeros_(self.action_output_proj.weight)
@@ -58,6 +73,10 @@ class LanguageActionAdapter(nn.Module):
         nn.init.zeros_(self.target_action_hidden_proj.bias)
         nn.init.zeros_(self.target_suffix_proj.weight)
         nn.init.zeros_(self.target_suffix_proj.bias)
+        nn.init.zeros_(self.scene_action_decoder.weight)
+        nn.init.zeros_(self.scene_action_decoder.bias)
+        nn.init.zeros_(self.target_scene_action_decoder.weight)
+        nn.init.zeros_(self.target_scene_action_decoder.bias)
 
     def forward(self, language_embedding: torch.Tensor) -> torch.Tensor:
         parameter_dtype = self.input_proj.weight.dtype
@@ -97,6 +116,63 @@ class LanguageActionAdapter(nn.Module):
             target_probabilities.to(dtype=self.target_suffix_proj.weight.dtype)
         )
 
+    def decode_scene_action_chunk(
+        self, scene_embedding: torch.Tensor, target_logits: torch.Tensor
+    ) -> torch.Tensor:
+        scene_features = torch.tanh(
+            self.scene_input_proj(
+                scene_embedding.to(dtype=self.scene_input_proj.weight.dtype)
+            )
+        )
+        target_probabilities = target_logits.softmax(dim=-1).to(
+            dtype=scene_features.dtype
+        )
+        decoded = self.scene_action_decoder(
+            torch.cat([scene_features, target_probabilities], dim=-1)
+        )
+        return decoded.reshape(
+            decoded.shape[0], self.chunk_size, self.action_dim
+        )
+
+    def decode_context_scene_action_chunk(
+        self,
+        contextual_tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+        target_logits: torch.Tensor,
+        base_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        token_features = torch.tanh(
+            self.context_token_proj(
+                contextual_tokens.to(dtype=self.context_token_proj.weight.dtype)
+            )
+        )
+        target_probabilities = target_logits.softmax(dim=-1).to(
+            dtype=token_features.dtype
+        )
+        target_query = torch.tanh(
+            self.target_query_proj(
+                target_probabilities.to(dtype=self.target_query_proj.weight.dtype)
+            )
+        )
+        attention_logits = torch.einsum(
+            "bld,bd->bl", token_features, target_query
+        ) / math.sqrt(self.bottleneck)
+        attention_logits = attention_logits.masked_fill(~token_mask.bool(), -torch.inf)
+        attention_weights = attention_logits.softmax(dim=-1)
+        context = torch.einsum("bl,bld->bd", attention_weights, token_features)
+        candidate_deltas = self.target_scene_action_decoder(
+            context.to(dtype=self.target_scene_action_decoder.weight.dtype)
+        ).reshape(
+            context.shape[0], 3, self.chunk_size, self.action_dim
+        )
+        routed_delta = (
+            candidate_deltas
+            * target_probabilities[:, :, None, None].to(
+                dtype=candidate_deltas.dtype
+            )
+        ).sum(dim=1)
+        return base_chunk.to(dtype=routed_delta.dtype) + routed_delta
+
     def modulate_action_hidden(
         self, hidden: torch.Tensor, condition: torch.Tensor
     ) -> torch.Tensor:
@@ -133,6 +209,7 @@ def attach_language_action_adapter(policy, *, bottleneck: int = 256):
 
     original_prefix = model.embed_prefix
     original_suffix = model.embed_suffix
+    original_sample_actions = model.sample_actions
 
     def embed_prefix_with_language_context(self, images, img_masks, lang_tokens, lang_masks, state=None):
         language_embeddings = self.vlm_with_expert.embed_language_tokens(lang_tokens)
@@ -144,7 +221,19 @@ def attach_language_action_adapter(policy, *, bottleneck: int = 256):
                 self._language_action_condition
             )
         )
-        return self._language_action_original_prefix(images, img_masks, lang_tokens, lang_masks, state)
+        prefix_embs, pad_masks, att_masks = self._language_action_original_prefix(
+            images, img_masks, lang_tokens, lang_masks, state
+        )
+        prefix_mask = pad_masks.to(dtype=prefix_embs.dtype).unsqueeze(-1)
+        scene_embedding = (prefix_embs * prefix_mask).sum(dim=1) / prefix_mask.sum(
+            dim=1
+        ).clamp_min(1.0)
+        self._language_action_scene_chunk = (
+            self.language_action_adapter.decode_scene_action_chunk(
+                scene_embedding, self._language_action_target_logits
+            )
+        )
+        return prefix_embs, pad_masks, att_masks
 
     def embed_suffix_with_language_context(self, noisy_actions, timestep):
         suffix_embs, pad_masks, att_masks = self._language_action_original_suffix(noisy_actions, timestep)
@@ -163,8 +252,38 @@ def attach_language_action_adapter(policy, *, bottleneck: int = 256):
 
     model._language_action_original_prefix = original_prefix
     model._language_action_original_suffix = original_suffix
+    model._language_action_original_sample_actions = original_sample_actions
+    model._language_action_scene_decoder_enabled = False
+    model._language_action_context_scene_decoder_enabled = False
     model.embed_prefix = types.MethodType(embed_prefix_with_language_context, model)
     model.embed_suffix = types.MethodType(embed_suffix_with_language_context, model)
+
+    def sample_actions_with_scene_decoder(
+        self, images, img_masks, lang_tokens, lang_masks, state, noise=None
+    ):
+        if getattr(self, "_language_action_context_scene_decoder_enabled", False):
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks, state=state
+            )
+            return compute_context_scene_action_chunk(
+                self,
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+            ).to(dtype=state.dtype, device=state.device)
+        if not getattr(self, "_language_action_scene_decoder_enabled", False):
+            return self._language_action_original_sample_actions(
+                images, img_masks, lang_tokens, lang_masks, state, noise=noise
+            )
+        self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        scene_chunk = getattr(self, "_language_action_scene_chunk", None)
+        if scene_chunk is None:
+            raise RuntimeError("Scene action decoder did not receive prefix context")
+        return scene_chunk.to(dtype=state.dtype, device=state.device)
+
+    model.sample_actions = types.MethodType(sample_actions_with_scene_decoder, model)
 
     def add_direct_language_action_residual(_module, _inputs, output):
         condition = getattr(model, "_language_action_condition", None)
@@ -204,6 +323,48 @@ def attach_language_action_adapter(policy, *, bottleneck: int = 256):
         apply_language_action_film
     )
     return adapter
+
+
+def set_scene_action_decoder_enabled(policy, enabled: bool = True) -> None:
+    model = policy.model
+    if not hasattr(model, ADAPTER_NAME):
+        raise RuntimeError("Language action adapter must be attached first")
+    model._language_action_scene_decoder_enabled = enabled
+
+
+def compute_context_scene_action_chunk(
+    model,
+    prefix_embs: torch.Tensor,
+    prefix_pad_masks: torch.Tensor,
+    prefix_att_masks: torch.Tensor,
+) -> torch.Tensor:
+    attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+    position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+    with torch.no_grad():
+        contextual_outputs, _ = model.vlm_with_expert.forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+    contextual_tokens = contextual_outputs[0]
+    context_chunk = model.language_action_adapter.decode_context_scene_action_chunk(
+        contextual_tokens,
+        prefix_pad_masks,
+        model._language_action_target_logits,
+        model._language_action_scene_chunk,
+    )
+    model._language_action_context_scene_chunk = context_chunk
+    return context_chunk
+
+
+def set_context_scene_action_decoder_enabled(policy, enabled: bool = True) -> None:
+    model = policy.model
+    if not hasattr(model, ADAPTER_NAME):
+        raise RuntimeError("Language action adapter must be attached first")
+    model._language_action_context_scene_decoder_enabled = enabled
 
 
 def adapter_parameter_names(policy) -> list[str]:

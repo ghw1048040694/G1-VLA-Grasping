@@ -1531,11 +1531,93 @@ invariant. No weights were updated and no closed loop was run. The next step is
 a cache-parity control audit across the source checkpoint and G1LANG-31, with
 the same exact inputs, before selecting a target decoder or starting training.
 
-## G1LANG-32B Cache-Parity Control (planned)
+## G1LANG-32B Result: Cache Mismatch Predates Target Suffix
 
-The same audit will be run on the G1LANG-30 33K source checkpoint, using a
-separate output directory. If the `t=1` mismatch is present there as well, it is
-a stock cached-inference numerical/path difference rather than a new adapter
-disconnect. If it appears only after G1LANG-31, the target suffix hook must be
-fixed before any decoder experiment. No training is allowed until this control
-is recorded.
+The identical audit on the G1LANG-30 33K source checkpoint measured `t=1`
+training-versus-cached-inference velocity RMSE `0.0019367116`. This differs from
+G1LANG-31's `0.0019361577` by only about `5.54e-7`. The source target posterior
+was distinct (`0.8160-0.8164` pairwise RMSE), its final flow velocity was also
+distinct (`0.0988-0.1469`), and all connected adapter gradients were finite.
+
+The strict `1e-5` parity invariant therefore still fails, but the controlled
+comparison localizes it to the shared cached-inference path rather than the new
+target suffix projection. No weights were updated. The next training
+intervention may bypass this ambiguity with an independently supervised,
+scene-and-target-conditioned action-chunk decoder; its output will still be
+judged by the unchanged four-seed `96/120` action gate.
+
+## G1LANG-33 Plan: Independently Supervised Scene Action Decoder
+
+G1LANG-33 starts from the G1LANG-31 step-34,000 checkpoint and adds a separate
+scene-and-target-conditioned decoder trained against normalized expert action
+chunks with explicit MSE. The old flow model, action expert, VLM, and existing
+adapter paths remain frozen; only `scene_input_proj` and
+`scene_action_decoder` are trainable. Decoder inference bypasses the cached
+flow path audited in G1LANG-32 and directly returns the normalized 50-step
+chunk before the standard policy unnormalization step.
+
+The pre-registered run continues from step 34,000 to 39,000 for 5,000 updates
+over exact-scene, same-frame triplets. A one-update smoke must first prove the
+four expected trainable tensors, finite connected gradients, and a real
+parameter update. The step-39,000 checkpoint will then be checked against its
+source before the unchanged seeds `20260727-20260730` are aggregated. Passing
+still requires at least `96/120`; otherwise no paired closed loop, formal 30
+episodes, or World Model/MPC run is allowed.
+
+The one-update smoke passed. The freeze audit found exactly four trainable
+tensors and `662,016` parameters (`0.1464%`). Every expected gradient tensor
+was present and finite; the zero-initialized output weight and bias had gradient
+norms `0.4160` and `0.0263` and changed by about `9.99e-8`. The scene input
+projection had a finite zero gradient on this first step, as expected while the
+downstream output weight was still exactly zero. The old optimizer state could
+not include the four new tensors and was explicitly reset at source step
+34,000. No checkpoint was written by the smoke.
+
+## G1LANG-33 Result: Direct Decoder Collapsed Across Language
+
+The 5,000-update run completed at step 39,000 with finite gradients throughout.
+Training MSE fell from about `0.50` to a `0.24-0.27` plateau. The checkpoint
+freeze audit passed: all 522 tensors shared with the 34K source are bitwise
+unchanged, exactly four decoder tensors were added, every new tensor is finite
+and nonzero, and the saved training step is exactly 39,000.
+
+The unchanged exact-scene four-seed gate produced `10/30` for every seed and
+`40/120 = 33.3%` overall. Red/yellow/green totals are `8/16/16`; mean predicted
+pairwise action RMSE is only `0.00735 rad` versus expert pairwise RMSE
+`0.25058 rad`, for a separation ratio of `0.02932`. Every reference scene has
+zero state and object-position mismatch. Since direct decoder inference is
+deterministic and bypasses flow noise, the identical seed results are expected.
+
+The explicit action objective and checkpoint update were real, but this
+additive scene-plus-target decoder learned nearly the same scene-average action
+for all three instructions. The `96/120` gate fails, so no paired closed loop,
+formal 30 episodes, or World Model/MPC run was started.
+
+## G1LANG-34 Plan: Final Contextual Target Decoder
+
+To meet the accelerated delivery schedule, G1LANG-34 is the final VLA
+architecture candidate rather than another adapter ablation. It starts from
+the audited G1LANG-33 39K checkpoint and retains that decoder as a frozen base.
+The frozen 16-layer VLM first contextualizes all valid multi-camera, language,
+and robot-state prefix tokens. A learned query derived from the already
+validated natural-language target posterior performs masked attention pooling,
+and three target-specific scene-to-action maps produce a routed action-chunk
+residual. This supplies both spatial token information and explicit
+scene-by-target interaction that the collapsed additive decoder lacked.
+
+The new output is zero initialized, so attaching the branch exactly preserves
+the 39K policy. Only `context_token_proj`, `target_query_proj`, and
+`target_scene_action_decoder` may train. After a single interface/gradient
+smoke, one 5,000-update production run continues to step 44,000 and is judged
+by the unchanged `96/120` gate. No parameter sweep or intermediate ablation is
+planned: a pass immediately starts formal closed-loop and World Model/MPC
+integration.
+
+The one-update smoke passed on the 8 GB GPU. The freeze audit found exactly the
+six expected tensors and `1,480,640` trainable parameters (`0.3263%`). All
+gradient tensors were present and finite; the zero-initialized target-specific
+output weight and bias had nonzero gradient norms `0.09450` and `0.01593` and
+both changed by about `9.99e-8`. The four upstream attention projections had
+finite zero gradients on the first step because the downstream residual output
+was still zero initialized. The missing optimizer slots were explicitly reset
+at source step 39,000, and the smoke wrote no checkpoint.
