@@ -30,19 +30,33 @@ These are project targets, not current results:
 - Language target-selection accuracy at least 90% across object/bin commands.
 - MuJoCo Sim2Sim success-rate loss no greater than 15 percentage points.
 
-## Current Delivery Snapshot (2026-07-26)
+## Current Delivery Snapshot (2026-07-27)
 
-The current practical demo is `G1FINAL-09`: the learned `G1LANG-34` router
-correctly maps language to one of three objects, and a verified classical
-IK/interpolation/assisted-grasp controller performs the requested pick and
-place. The nine-episode MuJoCo robustness run passes `9/9` instructions across
-three object-slot permutations. This is a modular
-hybrid result, not end-to-end learned SmolVLA control.
+The latest local validation is `G1FINAL-11`: each episode independently samples
+three separated object positions, checks that the corrected head camera sees all
+three objects, localizes them from RGB color centroids and a calibrated table
+plane, and then runs the classical IK/interpolation controller. The three target
+types use different hand closure profiles: asymmetric prism pinch, deeper rod
+power grasp, and wider cube grasp. All three episodes pass strict placement.
+This is a modular RGB-localized hybrid result, not end-to-end learned SmolVLA
+control.
 
 ```text
-outputs/G1FINAL-09_router_classical_9ep/summary.json
-outputs/G1FINAL-09_router_classical_9ep/episode_0000/language_pick_place.mp4
+outputs/G1FINAL-11_object_specific_grasp_3ep/summary.json
+outputs/G1FINAL-11_object_specific_grasp_3ep/episode_0000/head_camera.mp4
+outputs/G1FINAL-11_object_specific_grasp_3ep/head_camera_grasp_comparison.mp4
 ```
+
+The machine-readable audit reports `3/3` hybrid success, `3/3` all-object
+camera visibility, maximum RGB localization error `0.0160 m`, and three
+different grasp profiles. The language target router is intentionally reported
+as language-only: replacing all camera images with black images changes its
+logits by `0.0`. The controller's spatial target comes from the audited RGB
+localizer, not from privileged object coordinates.
+
+`G1FINAL-09` remains a reproducible public baseline, but is superseded as the
+visual-input demo because its controller used privileged object positions and a
+single generic hand closure profile.
 
 Public release with downloadable red/yellow/green videos and the complete
 nine-episode summary:
@@ -51,10 +65,16 @@ nine-episode summary:
 https://github.com/ghw1048040694/G1-UpperBody/releases/tag/g1final-09
 ```
 
-The preferred run can be reproduced with:
+The public baseline can be reproduced with:
 
 ```bash
 bash /home/ubuntu/G1-UpperBody/scripts/run_g1_final09.sh
+```
+
+The current random-layout RGB-localized run can be reproduced with:
+
+```bash
+bash /home/ubuntu/G1-UpperBody/scripts/run_g1_final11.sh
 ```
 
 The learned specialist plus World Model/MPC gate remains an honest `0/3`

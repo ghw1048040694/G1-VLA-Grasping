@@ -23,7 +23,6 @@ import run_g1_language_pick_place as classical
 from evaluate_g1_language_smolvla_heldout import load_policy as load_router
 from validate_g1_bimanual_actuation import apply_regularized_dynamics
 
-
 LOWER_BODY_JOINTS = 12
 
 
@@ -32,13 +31,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asset", type=Path, required=True)
     parser.add_argument("--router-checkpoint", type=Path, required=True)
     parser.add_argument("--train-root", type=Path, required=True)
-    parser.add_argument(
-        "--train-repo-id", default="local/g1_language_paired_train"
-    )
+    parser.add_argument("--train-repo-id", default="local/g1_language_paired_train")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20260725)
     parser.add_argument("--position-jitter-m", type=float, default=0.018)
+    parser.add_argument(
+        "--layout-mode",
+        choices=("slot_jitter", "random"),
+        default="slot_jitter",
+        help="Use legacy slot jitter or independently sampled, separated XY positions.",
+    )
+    parser.add_argument(
+        "--localization-source",
+        choices=("privileged", "head_rgb"),
+        default="privileged",
+    )
+    parser.add_argument(
+        "--experiment-id",
+        default="G1FINAL-07-learned-router-classical-controller",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--video-fps", type=int, default=15)
     parser.add_argument("--render-width", type=int, default=640)
@@ -117,6 +129,11 @@ def initial_router_batch(
     )
     renderer = mujoco.Renderer(model, height=240, width=320)
     try:
+        visibility = classical.audit_head_camera_visibility(renderer, data)
+        if not visibility["all_objects_visible"]:
+            raise RuntimeError(
+                "Router input head_camera misses task objects: " f"{visibility}"
+            )
         return policy_eval.render_observation(
             renderer, data, state, instruction, device
         )
@@ -125,7 +142,9 @@ def initial_router_batch(
 
 
 @torch.no_grad()
-def route_target(router, batch: dict, seed: int, device: str) -> tuple[str, list[float]]:
+def route_target(
+    router, batch: dict, seed: int, device: str
+) -> tuple[str, list[float]]:
     router.reset()
     router.predict_action_chunk(
         batch, noise=policy_eval.seeded_noise(router, seed, device)
@@ -136,6 +155,14 @@ def route_target(router, batch: dict, seed: int, device: str) -> tuple[str, list
     values = logits.detach().float().cpu()[0]
     target = classical.OBJECT_NAMES[int(torch.argmax(values).item())]
     return target, values.tolist()
+
+
+def blank_images(batch: dict) -> dict:
+    blank = dict(batch)
+    for key, value in batch.items():
+        if key.startswith("observation.images."):
+            blank[key] = torch.zeros_like(value)
+    return blank
 
 
 def posterior_metrics(logits: list[list[float]]) -> dict[str, float]:
@@ -173,6 +200,7 @@ def controller_args(
         video_fps=args.video_fps,
         render_width=args.render_width,
         render_height=args.render_height,
+        localization_source=args.localization_source,
     )
 
 
@@ -183,7 +211,7 @@ def main() -> None:
     expected_upper_names = train_meta.features["action"]["names"]
     router = load_router(args.router_checkpoint, train_meta, args.device)
     specs = policy_eval.evaluation_specs(
-        args.episodes, args.seed, args.position_jitter_m
+        args.episodes, args.seed, args.position_jitter_m, args.layout_mode
     )
     reports = []
 
@@ -205,6 +233,15 @@ def main() -> None:
             args.seed + spec["scene_index"] * 1000,
             args.device,
         )
+        blank_target, blank_logits = route_target(
+            router,
+            blank_images(batch),
+            args.seed + spec["scene_index"] * 1000,
+            args.device,
+        )
+        image_logit_max_abs_delta = float(
+            np.max(np.abs(np.asarray(logits) - np.asarray(blank_logits)))
+        )
         execution = classical.run_episode(
             controller_args(args, spec, episode_dir, routed_target)
         )
@@ -217,8 +254,15 @@ def main() -> None:
             "expected_target": spec["target_object"],
             "routed_target": routed_target,
             "router_logits": logits,
+            "blank_image_routed_target": blank_target,
+            "blank_image_router_logits": blank_logits,
+            "image_logit_max_abs_delta": image_logit_max_abs_delta,
+            "router_image_sensitive": image_logit_max_abs_delta > 1e-5,
             "router_correct": route_correct,
             "controller": "classical_ik_interpolation_assisted_grasp",
+            "layout_mode": spec["layout_mode"],
+            "localization_source": execution["localization_source"],
+            "visual_localization_error_m": execution["visual_localization_error_m"],
             "controller_passed": execution["passed"],
             "hybrid_success": hybrid_success,
             "target_in_box": execution["target_in_box"],
@@ -227,9 +271,7 @@ def main() -> None:
                 "joint_limit_violation_fraction"
             ],
             "video": execution["video"],
-            "execution_summary": str(
-                episode_dir / "language_pick_place_summary.json"
-            ),
+            "execution_summary": str(episode_dir / "language_pick_place_summary.json"),
         }
         (episode_dir / "hybrid_summary.json").write_text(
             json.dumps(report, indent=2) + "\n", encoding="utf-8"
@@ -238,31 +280,42 @@ def main() -> None:
         print(
             f"HYBRID_EPISODE={spec['episode_index'] + 1}/{args.episodes} "
             f"expected={spec['target_object']} routed={routed_target} "
+            f"image_delta={image_logit_max_abs_delta:.3e} "
             f"passed={hybrid_success}",
             flush=True,
         )
 
     summary = {
-        "experiment": "G1FINAL-07-learned-router-classical-controller",
+        "experiment": args.experiment_id,
         "claim_boundary": (
-            "Learned language target routing followed by a privileged classical "
-            "IK/interpolation controller; this is not end-to-end learned VLA control."
+            "Learned language-only target routing followed by classical RGB-centroid "
+            "table-plane localization and assisted IK/interpolation control; this is "
+            "not end-to-end learned VLA control."
+            if args.localization_source == "head_rgb"
+            else "Learned language-only target routing followed by a privileged "
+            "classical IK/interpolation controller; this is not end-to-end learned "
+            "VLA control."
         ),
+        "layout_mode": args.layout_mode,
+        "localization_source": args.localization_source,
         "router_checkpoint": str(args.router_checkpoint),
         "controller": "classical_ik_interpolation_assisted_grasp",
         "episodes": len(reports),
         "router_accuracy": sum(item["router_correct"] for item in reports)
         / len(reports),
-        "controller_success_rate": sum(
-            item["controller_passed"] for item in reports
+        "router_image_sensitive_fraction": sum(
+            item["router_image_sensitive"] for item in reports
         )
+        / len(reports),
+        "max_real_vs_blank_logit_delta": max(
+            item["image_logit_max_abs_delta"] for item in reports
+        ),
+        "controller_success_rate": sum(item["controller_passed"] for item in reports)
         / len(reports),
         "hybrid_success_rate": sum(item["hybrid_success"] for item in reports)
         / len(reports),
         "mean_joint_limit_violation_fraction": float(
-            np.mean(
-                [item["joint_limit_violation_fraction"] for item in reports]
-            )
+            np.mean([item["joint_limit_violation_fraction"] for item in reports])
         ),
         **posterior_metrics([item["router_logits"] for item in reports]),
         "reports": reports,
@@ -273,10 +326,12 @@ def main() -> None:
         and summary["mean_joint_limit_violation_fraction"] <= 0.01
     )
     summary_path = args.output_dir / "summary.json"
-    summary_path.write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(
+        json.dumps(
+            {key: value for key, value in summary.items() if key != "reports"}, indent=2
+        )
     )
-    print(json.dumps({key: value for key, value in summary.items() if key != "reports"}, indent=2))
     print(f"Saved {summary_path}")
     if not summary["passed"]:
         raise SystemExit(1)

@@ -47,6 +47,9 @@ CAMERAS = {
     "observation.images.right_wrist": "right_wrist_camera",
 }
 LOWER_BODY_JOINTS = 12
+RANDOM_X_RANGE_M = (0.30, 0.42)
+RANDOM_Y_RANGE_M = (-0.37, 0.27)
+RANDOM_MIN_SEPARATION_M = 0.22
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replan-steps", type=int, default=5)
     parser.add_argument("--assist-distance-m", type=float, default=0.075)
     parser.add_argument("--position-jitter-m", type=float, default=0.018)
+    parser.add_argument(
+        "--layout-mode",
+        choices=("slot_jitter", "random"),
+        default="slot_jitter",
+        help="Use legacy slot jitter or independently sampled, separated XY positions.",
+    )
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 
@@ -125,12 +134,52 @@ def seeded_noise(policy, seed: int, device: str) -> torch.Tensor:
     )
 
 
-def evaluation_specs(episodes: int, seed: int, jitter: float) -> list[dict]:
+def _sample_random_positions(rng: np.random.Generator) -> np.ndarray:
+    for _ in range(1000):
+        positions = np.column_stack(
+            (
+                rng.uniform(*RANDOM_X_RANGE_M, size=3),
+                rng.uniform(*RANDOM_Y_RANGE_M, size=3),
+            )
+        )
+        distances = np.linalg.norm(
+            positions[:, None, :] - positions[None, :, :], axis=-1
+        )
+        if np.all(distances[np.triu_indices(3, k=1)] >= RANDOM_MIN_SEPARATION_M):
+            return positions
+    raise RuntimeError("Could not sample a separated random object layout")
+
+
+def evaluation_specs(
+    episodes: int, seed: int, jitter: float, layout_mode: str = "slot_jitter"
+) -> list[dict]:
     if episodes < 3 or episodes % 3 != 0:
         raise ValueError("--episodes must be at least three and divisible by three")
     rng = np.random.default_rng(seed)
     permutations = tuple(itertools.permutations(range(3)))
     specs = []
+    if layout_mode == "random":
+        for episode_index in range(episodes):
+            target = OBJECT_NAMES[episode_index % len(OBJECT_NAMES)]
+            random_xy = _sample_random_positions(rng)
+            offsets = np.asarray(
+                [random_xy[index] - OBJECT_SLOTS_XY_M[index] for index in range(3)]
+            )
+            language_index = episode_index // len(OBJECT_NAMES)
+            specs.append(
+                {
+                    "episode_index": episode_index,
+                    "scene_index": episode_index,
+                    "target_object": target,
+                    "instruction": LANGUAGE_VARIANTS[target][
+                        language_index % len(LANGUAGE_VARIANTS[target])
+                    ],
+                    "permutation": (0, 1, 2),
+                    "offsets": offsets,
+                    "layout_mode": layout_mode,
+                }
+            )
+        return specs
     for scene_index in range(episodes // len(OBJECT_NAMES)):
         permutation = permutations[scene_index % len(permutations)]
         offsets = rng.uniform(-jitter, jitter, size=(3, 2))
@@ -146,6 +195,7 @@ def evaluation_specs(episodes: int, seed: int, jitter: float) -> list[dict]:
                     "instruction": instruction,
                     "permutation": permutation,
                     "offsets": offsets.copy(),
+                    "layout_mode": layout_mode,
                 }
             )
     return specs
@@ -387,9 +437,7 @@ def run_episode(
             for name, item in controlled.items():
                 low_limit, high_limit = model.jnt_range[item["joint_id"]]
                 qpos = float(data.qpos[item["qpos_id"]])
-                violated = int(
-                    qpos < low_limit - 1e-6 or qpos > high_limit + 1e-6
-                )
+                violated = int(qpos < low_limit - 1e-6 or qpos > high_limit + 1e-6)
                 joint_limit_violations += violated
                 joint_samples += 1
                 joint_limit_violations_by_joint[name] += violated
@@ -431,9 +479,7 @@ def run_episode(
     selected_correct_object = grabbed_object == spec["target_object"]
     violation_fraction = joint_limit_violations / max(joint_samples, 1)
     task_success = bool(
-        selected_correct_object
-        and target_in_box
-        and not wrong_objects_in_box
+        selected_correct_object and target_in_box and not wrong_objects_in_box
     )
     passed = bool(task_success and violation_fraction <= 0.01)
     report = {
@@ -455,8 +501,7 @@ def run_episode(
         "task_success": task_success,
         "joint_limit_violation_fraction": violation_fraction,
         "joint_limit_violation_fraction_by_joint": {
-            name: joint_limit_violations_by_joint[name]
-            / joint_samples_by_joint[name]
+            name: joint_limit_violations_by_joint[name] / joint_samples_by_joint[name]
             for name in controlled_names
             if joint_limit_violations_by_joint[name]
         },
@@ -485,9 +530,7 @@ def run_episode(
         object_names=np.asarray(OBJECT_NAMES),
         object_position_m=np.asarray(trajectory_object_position, dtype=np.float32),
         assist_active=np.asarray(trajectory_assist_active, dtype=np.int8),
-        grabbed_object_index=np.asarray(
-            trajectory_grabbed_object_index, dtype=np.int8
-        ),
+        grabbed_object_index=np.asarray(trajectory_grabbed_object_index, dtype=np.int8),
         grabbed_arm_index=np.asarray(trajectory_grabbed_arm_index, dtype=np.int8),
         task_target_index=np.full(
             control_frames, OBJECT_NAMES.index(spec["target_object"]), dtype=np.int8
@@ -524,8 +567,7 @@ def main() -> None:
             / len(subset),
             "put_in_box_success_rate": sum(item["task_success"] for item in subset)
             / len(subset),
-            "strict_success_rate": sum(item["passed"] for item in subset)
-            / len(subset),
+            "strict_success_rate": sum(item["passed"] for item in subset) / len(subset),
         }
     summary = {
         "experiment": "G1-Language-Grounded-Manipulation-Closed-Loop",
@@ -537,8 +579,7 @@ def main() -> None:
         / len(reports),
         "put_in_box_success_rate": sum(item["task_success"] for item in reports)
         / len(reports),
-        "strict_success_rate": sum(item["passed"] for item in reports)
-        / len(reports),
+        "strict_success_rate": sum(item["passed"] for item in reports) / len(reports),
         "wrong_object_grasp_rate": sum(
             item["grabbed_object"] is not None and not item["selected_correct_object"]
             for item in reports

@@ -14,6 +14,7 @@ import imageio.v2 as imageio
 import mujoco
 import numpy as np
 from scipy.optimize import least_squares
+from scipy.ndimage import find_objects, label
 from scipy.spatial.transform import Rotation
 
 from validate_g1_bimanual_actuation import (
@@ -44,11 +45,27 @@ OBJECT_SLOTS_XY_M = (
     np.array((0.34, -0.10)),
     np.array((0.36, 0.20)),
 )
-OBJECT_ASSIST_Z_M = {
-    "red_triangle": 0.055,
-    "yellow_rod": 0.050,
-    "green_cube": 0.055,
+# The palm site is near the finger tips in the G1 MJCF.  Put the object
+# center slightly behind and below that site so the closed fingers surround it.
+OBJECT_ASSIST_OFFSET_M = {
+    "red_triangle": np.array((0.055, 0.0, 0.025)),
+    "yellow_rod": np.array((0.080, 0.0, 0.020)),
+    "green_cube": np.array((0.055, 0.0, 0.025)),
 }
+# RGB centroids are biased toward the visible front/top faces.  These small,
+# fixed shape-calibration offsets are measured in the head-camera table frame.
+OBJECT_RGB_LOCALIZATION_BIAS_M = {
+    "red_triangle": np.array((0.007, 0.000, 0.0)),
+    "yellow_rod": np.array((0.013, 0.004, 0.0)),
+    "green_cube": np.array((0.001, 0.000, 0.0)),
+}
+OBJECT_HAND_CLOSURE_SCALE = {
+    "red_triangle": {"thumb": 0.46, "index": 0.42, "middle": 0.32},
+    "yellow_rod": {"thumb": 0.56, "index": 0.58, "middle": 0.58},
+    "green_cube": {"thumb": 0.38, "index": 0.36, "middle": 0.36},
+}
+HEAD_CAMERA_XYAXES = "0 -1 0 0.643 0 0.766"
+HEAD_CAMERA_FOVY = "85"
 OBJECT_SPAWN_Z_M = {
     "red_triangle": TABLE_TOP_Z_M + 0.030,
     "yellow_rod": TABLE_TOP_Z_M + 0.025,
@@ -59,6 +76,13 @@ OBJECT_SPAWN_Z_M = {
 def smoothstep(value: float) -> float:
     value = float(np.clip(value, 0.0, 1.0))
     return value * value * (3.0 - 2.0 * value)
+
+
+def object_hand_target(target_object: str, joint_name: str, closed: float) -> float:
+    for finger, scale in OBJECT_HAND_CLOSURE_SCALE[target_object].items():
+        if f"hand_{finger}_" in joint_name:
+            return scale * closed
+    raise ValueError(f"Unknown hand joint: {joint_name}")
 
 
 def object_name(model: mujoco.MjModel, kind: mujoco.mjtObj, index: int) -> str:
@@ -119,7 +143,7 @@ def add_free_object(
     name: str,
     position: np.ndarray,
 ) -> None:
-    assist_z = OBJECT_ASSIST_Z_M[name]
+    assist_offset = OBJECT_ASSIST_OFFSET_M[name]
     body = ET.SubElement(
         scene,
         "body",
@@ -197,7 +221,7 @@ def add_free_object(
         "site",
         name=f"{name}_assist_site",
         type="sphere",
-        pos=f"0 0 {assist_z}",
+        pos=" ".join(f"{value:.6f}" for value in assist_offset),
         size="0.009",
         rgba="1 1 0 0.35",
     )
@@ -267,6 +291,11 @@ def build_scene(
         raise RuntimeError("Source scene has no calibration table")
     table.set("pos", "0.52 0 0.72")
     table.set("size", "0.42 0.55 0.03")
+    head_camera = root.find(".//camera[@name='head_camera']")
+    if head_camera is None:
+        raise RuntimeError("Source scene has no head_camera")
+    head_camera.set("xyaxes", HEAD_CAMERA_XYAXES)
+    head_camera.set("fovy", HEAD_CAMERA_FOVY)
     add_blue_box(scene)
     for name in OBJECT_NAMES:
         add_free_object(scene, equality, name, positions[name])
@@ -371,6 +400,114 @@ def interpolate(start: np.ndarray, end: np.ndarray, alpha: float) -> np.ndarray:
     return (1.0 - alpha) * start + alpha * end
 
 
+def _largest_color_component(mask: np.ndarray) -> dict:
+    labels, count = label(mask)
+    if count == 0:
+        return {"pixel_count": 0, "centroid_xy": None, "bbox_xyxy": None}
+    slices = find_objects(labels)
+    best_label = 0
+    best_count = 0
+    for component_label, component_slice in enumerate(slices, start=1):
+        if component_slice is None:
+            continue
+        component_count = int(
+            np.count_nonzero(labels[component_slice] == component_label)
+        )
+        if component_count > best_count:
+            best_label = component_label
+            best_count = component_count
+    if best_label == 0:
+        return {"pixel_count": 0, "centroid_xy": None, "bbox_xyxy": None}
+    ys, xs = np.where(labels == best_label)
+    return {
+        "pixel_count": int(best_count),
+        "centroid_xy": [float(xs.mean()), float(ys.mean())],
+        "bbox_xyxy": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())],
+    }
+
+
+def audit_head_camera_visibility(
+    renderer: mujoco.Renderer, data: mujoco.MjData
+) -> dict:
+    """Audit RGB visibility at the initial pose; this is never used for control."""
+    renderer.update_scene(data, camera="head_camera")
+    image = np.asarray(renderer.render()).copy().astype(np.float32)
+    red = (
+        (image[:, :, 0] > 100)
+        & (image[:, :, 0] > 1.5 * image[:, :, 1])
+        & (image[:, :, 0] > 1.3 * image[:, :, 2])
+    )
+    yellow = (
+        (image[:, :, 0] > 120)
+        & (image[:, :, 1] > 90)
+        & (image[:, :, 2] < 130)
+        & (image[:, :, 0] > 1.2 * image[:, :, 2])
+    )
+    green = (
+        (image[:, :, 1] > 80)
+        & (image[:, :, 1] > 1.3 * image[:, :, 0])
+        & (image[:, :, 1] > 0.9 * image[:, :, 2])
+    )
+    detections = {
+        "red_triangle": _largest_color_component(red),
+        "yellow_rod": _largest_color_component(yellow),
+        "green_cube": _largest_color_component(green),
+    }
+    minimum_pixels = {"red_triangle": 100, "yellow_rod": 300, "green_cube": 100}
+    for name, detection in detections.items():
+        detection["visible"] = detection["pixel_count"] >= minimum_pixels[name]
+        detection["minimum_pixels"] = minimum_pixels[name]
+    return {
+        "camera": "head_camera",
+        "image_height": int(image.shape[0]),
+        "image_width": int(image.shape[1]),
+        "detections": detections,
+        "all_objects_visible": all(item["visible"] for item in detections.values()),
+    }
+
+
+def localize_objects_from_head_rgb(
+    model: mujoco.MjModel, data: mujoco.MjData, visibility: dict
+) -> dict[str, np.ndarray]:
+    """Back-project RGB centroids onto each object's known resting-height plane."""
+    camera_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_CAMERA, visibility["camera"]
+    )
+    if camera_id < 0:
+        raise RuntimeError(f"Camera not found: {visibility['camera']}")
+    height = visibility["image_height"]
+    width = visibility["image_width"]
+    focal_px = height / (2.0 * math.tan(math.radians(model.cam_fovy[camera_id]) / 2.0))
+    camera_position = data.cam_xpos[camera_id].copy()
+    camera_rotation = data.cam_xmat[camera_id].reshape(3, 3).copy()
+    estimates = {}
+    for name in OBJECT_NAMES:
+        centroid = visibility["detections"][name]["centroid_xy"]
+        if centroid is None:
+            raise RuntimeError(f"Cannot localize invisible object: {name}")
+        pixel_x, pixel_y = centroid
+        ray_camera = np.array(
+            (
+                (pixel_x - width / 2.0) / focal_px,
+                -(pixel_y - height / 2.0) / focal_px,
+                -1.0,
+            )
+        )
+        ray_world = camera_rotation @ ray_camera
+        object_z = OBJECT_SPAWN_Z_M[name]
+        if abs(float(ray_world[2])) < 1e-8:
+            raise RuntimeError(f"Head-camera ray is parallel to the table for {name}")
+        distance = (object_z - camera_position[2]) / ray_world[2]
+        if distance <= 0:
+            raise RuntimeError(f"Head-camera ray points away from {name}")
+        estimates[name] = (
+            camera_position
+            + distance * ray_world
+            + OBJECT_RGB_LOCALIZATION_BIAS_M[name]
+        )
+    return estimates
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--asset", type=Path, required=True)
@@ -383,6 +520,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-fps", type=int, default=15)
     parser.add_argument("--render-width", type=int, default=320)
     parser.add_argument("--render-height", type=int, default=240)
+    parser.add_argument(
+        "--localization-source",
+        choices=("privileged", "head_rgb"),
+        default="privileged",
+    )
     return parser.parse_args()
 
 
@@ -453,8 +595,40 @@ def run_episode(args: argparse.Namespace) -> dict:
         orientation_weight=0.06,
     )
     mujoco.mj_resetData(model, data)
+    data.qpos[selected_qpos_ids] = home_pose
+    open_hand_targets = {}
+    for name, item in controlled.items():
+        if "hand_" not in name:
+            continue
+        low, high = model.jnt_range[item["joint_id"]]
+        if abs(float(low)) < 1e-9:
+            value = 0.01
+        elif abs(float(high)) < 1e-9:
+            value = -0.01
+        else:
+            value = float(data.qpos[item["qpos_id"]])
+        open_hand_targets[name] = value
+        data.qpos[item["qpos_id"]] = value
     mujoco.mj_forward(model, data)
-    object_assist = data.site_xpos[object_site_ids[args.target_object]].copy()
+
+    renderer = mujoco.Renderer(
+        model, height=args.render_height, width=args.render_width
+    )
+    camera_visibility = audit_head_camera_visibility(renderer, data)
+    if not camera_visibility["all_objects_visible"]:
+        raise RuntimeError(
+            "head_camera does not visibly contain all task objects: "
+            f"{camera_visibility}"
+        )
+    visual_object_positions = localize_objects_from_head_rgb(
+        model, data, camera_visibility
+    )
+    localization_source = getattr(args, "localization_source", "privileged")
+    if localization_source == "head_rgb":
+        target_center = visual_object_positions[args.target_object]
+        object_assist = target_center + OBJECT_ASSIST_OFFSET_M[args.target_object]
+    else:
+        object_assist = data.site_xpos[object_site_ids[args.target_object]].copy()
     active_palm_index = (
         LEFT_PALM_INDEX if object_assist[1] >= 0.05 else RIGHT_PALM_INDEX
     )
@@ -542,19 +716,10 @@ def run_episode(args: argparse.Namespace) -> dict:
 
     mujoco.mj_resetData(model, data)
     data.qpos[selected_qpos_ids] = home_pose
-    open_hand_targets = {}
     for name, item in controlled.items():
         if "hand_" not in name:
             continue
-        low, high = model.jnt_range[item["joint_id"]]
-        if abs(float(low)) < 1e-9:
-            value = 0.01
-        elif abs(float(high)) < 1e-9:
-            value = -0.01
-        else:
-            value = float(data.qpos[item["qpos_id"]])
-        open_hand_targets[name] = value
-        data.qpos[item["qpos_id"]] = value
+        data.qpos[item["qpos_id"]] = open_hand_targets[name]
     mujoco.mj_forward(model, data)
     initial_targets = {
         name: float(data.qpos[item["qpos_id"]]) for name, item in controlled.items()
@@ -562,11 +727,16 @@ def run_episode(args: argparse.Namespace) -> dict:
     initial_object_positions = {
         name: data.xpos[body_id].copy() for name, body_id in object_body_ids.items()
     }
+    visual_localization_error_m = {
+        name: float(
+            np.linalg.norm(
+                visual_object_positions[name] - initial_object_positions[name]
+            )
+        )
+        for name in OBJECT_NAMES
+    }
     selected_index = {name: index for index, name in enumerate(selected_names)}
 
-    renderer = mujoco.Renderer(
-        model, height=args.render_height, width=args.render_width
-    )
     overview_camera = mujoco.MjvCamera()
     overview_camera.lookat[:] = (0.45, -0.05, 0.92)
     overview_camera.distance = 2.15
@@ -652,9 +822,10 @@ def run_episode(args: argparse.Namespace) -> dict:
             commanded[name] = float(selected_pose[index])
         for name, closed in HAND_TARGETS.items():
             if name.startswith(f"{active_side}_hand_"):
+                grasp_target = object_hand_target(args.target_object, name, closed)
                 commanded[name] = (1.0 - hand_alpha) * open_hand_targets[
                     name
-                ] + hand_alpha * 0.4 * closed
+                ] + hand_alpha * grasp_target
             else:
                 commanded[name] = open_hand_targets[name]
 
@@ -757,11 +928,16 @@ def run_episode(args: argparse.Namespace) -> dict:
         if abs(relative[0]) <= 0.105 and abs(relative[1]) <= 0.125:
             wrong_objects_in_box.append(name)
     violation_fraction = joint_limit_violations / max(joint_samples, 1)
+    localization_passed = bool(
+        camera_visibility["all_objects_visible"]
+        and max(visual_localization_error_m.values()) <= 0.04
+    )
     passed = bool(
         target_in_box
         and not wrong_objects_in_box
         and wrong_object_max_displacement <= 0.05
         and violation_fraction <= 0.01
+        and localization_passed
     )
     instruction = args.language_instruction or INSTRUCTIONS[args.target_object]
     summary = {
@@ -781,6 +957,22 @@ def run_episode(args: argparse.Namespace) -> dict:
             name: value.tolist() for name, value in final_positions.items()
         },
         "blue_box_position_m": BIN_POSITION_M.tolist(),
+        "camera_visibility_audit": camera_visibility,
+        "localization_source": localization_source,
+        "visual_object_position_estimate_m": {
+            name: value.tolist() for name, value in visual_object_positions.items()
+        },
+        "visual_localization_error_m": visual_localization_error_m,
+        "visual_localization_passed": localization_passed,
+        "grasp_object_center_offset_m": {
+            name: (-OBJECT_ASSIST_OFFSET_M[name]).tolist() for name in OBJECT_NAMES
+        },
+        "hand_grasp_profile": OBJECT_HAND_CLOSURE_SCALE[args.target_object],
+        "active_hand_closed_joint_targets_rad": {
+            name: object_hand_target(args.target_object, name, closed)
+            for name, closed in HAND_TARGETS.items()
+            if name.startswith(f"{active_side}_hand_")
+        },
         "target_in_box": target_in_box,
         "wrong_objects_in_box": wrong_objects_in_box,
         "wrong_object_max_displacement_m": wrong_object_max_displacement,

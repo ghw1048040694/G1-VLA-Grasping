@@ -25,4 +25,7 @@ exec "$PYTHON" "$PROJECT_ROOT/scripts/evaluate_g1_language_router_classical.py" 
   --train-root "$LEROBOT_ROOT/datasets/local/g1_language_paired_train" \
   --output-dir "$OUTPUT_DIR" \
   --episodes "${EPISODES:-3}" \
+  --layout-mode "${LAYOUT_MODE:-slot_jitter}" \
+  --localization-source "${LOCALIZATION_SOURCE:-privileged}" \
+  --experiment-id "${EXPERIMENT_ID:-G1FINAL-07-learned-router-classical-controller}" \
   --device "${DEVICE:-cuda}"

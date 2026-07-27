@@ -1,17 +1,17 @@
 # G1 Upper-Body VLA + World Model Evidence Report
 
-Date: 2026-07-26
+Date: 2026-07-27
 
 ## Status
 
 The project has a reproducible modular evidence package. The strict end-to-end
 language manipulation gate is not passed and must not be presented as passed.
-The latest task-level result is the `G1FINAL-09` extension of the `G1FINAL-07`
-hybrid: a learned language
-router selects the requested object, then the verified classical controller
-executes the pick-and-place sequence. The extended robustness run passes `9/9`
-registered instructions in MuJoCo. This is the current practical demo and is
-deliberately reported separately from end-to-end learned SmolVLA control.
+The latest task-level result is `G1FINAL-11`: a learned language-only target
+route is combined with RGB color-centroid localization on the corrected head
+camera and an object-specific classical assisted-grasp controller. Three
+independently randomized layouts pass strict placement. This is deliberately
+reported separately from end-to-end learned SmolVLA control. `G1FINAL-09` is
+kept as a superseded privileged-coordinate baseline.
 The validated architecture is:
 
 ```text
@@ -32,7 +32,7 @@ language instruction
 | World Model | `outputs/G1FINAL-02_language_world_model_10000step/summary.json` | screening checks passed; best step `9500`; H20 target position RMSE `0.00750 m` |
 | MPC integration | `outputs/G1FINAL-03_target_router_mpc_smoke_3ep/summary.json` | 108 replans; 82 non-baseline selections |
 | Isaac Sim transfer | `/mnt/d/G1-UpperBody-Sim2Sim/G1SIM-02/isaacsim_report.json` | 31-joint contract passed; final lift `0.16607 m`; transfer gate passed |
-| Learned router + classical execution | `outputs/G1FINAL-09_router_classical_9ep/summary.json` | router `9/9`; controller `9/9`; hybrid strict success `9/9` |
+| Learned language route + RGB localization + object-specific grasp | `outputs/G1FINAL-11_object_specific_grasp_3ep/summary.json` | router `3/3`; RGB-localized controller `3/3`; hybrid strict success `3/3`; max localization error `0.0160 m` |
 
 ## Failed Gates
 
@@ -54,12 +54,13 @@ supplies a separate strict hybrid source, whose Isaac replay is reported below.
 
 ## Videos
 
-Working MuJoCo videos (the latest hybrid demo):
+Working MuJoCo videos (the latest RGB-localized demo):
 
 ```text
-outputs/G1FINAL-09_router_classical_9ep/episode_0000/language_pick_place.mp4
-outputs/G1FINAL-09_router_classical_9ep/episode_0001/language_pick_place.mp4
-outputs/G1FINAL-09_router_classical_9ep/episode_0002/language_pick_place.mp4
+outputs/G1FINAL-11_object_specific_grasp_3ep/episode_0000/head_camera.mp4
+outputs/G1FINAL-11_object_specific_grasp_3ep/episode_0001/head_camera.mp4
+outputs/G1FINAL-11_object_specific_grasp_3ep/episode_0002/head_camera.mp4
+outputs/G1FINAL-11_object_specific_grasp_3ep/head_camera_grasp_comparison.mp4
 ```
 
 Public downloadable release:
@@ -116,13 +117,34 @@ The evidence is in:
 outputs/G1FINAL-09_router_classical_9ep/summary.json
 ```
 
-The nine videos are under the corresponding episode directories. The
-preferred launcher is `scripts/run_g1_final09.sh`; it refuses to overwrite an
-existing result directory. This is a
-learned-language-routing plus privileged/classical-control upper bound. It is
-valid evidence that the language route can select a target for a reliable
-controller, but it must not be reported as end-to-end learned SmolVLA success.
+The nine old videos remain under the corresponding `G1FINAL-09` episode
+directories. `G1FINAL-09` is a learned-language-routing plus
+privileged/classical-control upper bound; it must not be reported as visual
+grounding or end-to-end learned SmolVLA success.
 The end-to-end learned gate from `G1FINAL-03` remains `0/3`.
+
+## G1FINAL-10/11 Input-Output Audit
+
+`G1FINAL-10` first introduced independently sampled, separated layouts and
+RGB table-plane localization. `G1FINAL-11` retained that setup and added
+object-specific hand profiles. In each of three episodes, all red, yellow, and
+green objects are detected in the initial `head_camera` frame, the RGB
+back-projection error is at most `0.0160 m`, and the requested object is placed
+in the box without moving the other objects beyond `0.22 mm`.
+
+The router's target logits are exactly unchanged when all camera tensors are
+replaced with zeros (`max_real_vs_blank_logit_delta = 0.0` in both summaries).
+Therefore the router result is language-only target classification. The
+spatial target used by `G1FINAL-11` comes from the RGB color detector and
+calibrated camera geometry; the classical controller remains assisted and is
+not a learned VLA policy.
+
+The three hand profiles are recorded in each episode's
+`language_pick_place_summary.json` and visually compared in:
+
+```text
+outputs/G1FINAL-11_object_specific_grasp_3ep/head_camera_grasp_comparison.mp4
+```
 
 ## G1FINAL-08 Hybrid Sim2Sim Attempt
 
