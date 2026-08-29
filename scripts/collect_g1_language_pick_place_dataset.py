@@ -15,7 +15,7 @@ import numpy as np
 
 from run_g1_language_pick_place import EXPERT_CONTRACT_VERSION, OBJECT_NAMES
 
-DATASET_CONTRACT_VERSION = "g1lang_dataset_v3_exact_scene_triplets"
+DATASET_CONTRACT_VERSION = "g1lang_dataset_v4_contact_profile_triplets"
 LANGUAGE_VARIANTS = {
     "red_triangle": (
         "put the red triangular prism into the blue box",
@@ -45,7 +45,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260724)
     parser.add_argument("--position-jitter-m", type=float, default=0.018)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument(
+        "--render-skip",
+        type=int,
+        default=3,
+        help="Render every Nth simulation step while preserving the video frame rate.",
+    )
     parser.add_argument("--resume-successful", action="store_true")
+    parser.add_argument(
+        "--fixed-scene",
+        action="store_true",
+        help="Use the calibrated identity slot arrangement with zero jitter.",
+    )
+    parser.add_argument(
+        "--center-slot-x-shift-m",
+        type=float,
+        default=0.0,
+        help="Shift the middle workspace slot in x before applying jitter.",
+    )
+    parser.add_argument(
+        "--red-object-x-shift-m",
+        type=float,
+        default=0.0,
+        help="Shift the red triangle in x before applying jitter.",
+    )
+    parser.add_argument(
+        "--red-outer-y-jitter-m",
+        type=float,
+        default=None,
+        help="Optional narrower y jitter for red triangles in outer slots.",
+    )
+    parser.add_argument(
+        "--yellow-left-x-shift-m",
+        type=float,
+        default=0.0,
+        help="Shift yellow rods inward when assigned to the left outer slot.",
+    )
+    parser.add_argument(
+        "--yellow-outer-y-jitter-m",
+        type=float,
+        default=None,
+        help="Optional narrower y jitter for yellow rods in the right outer slot.",
+    )
+    parser.add_argument(
+        "--yellow-right-x-shift-m",
+        type=float,
+        default=0.0,
+        help="Shift yellow rods inward in the right outer slot.",
+    )
+    parser.add_argument(
+        "--yellow-right-y-shift-m",
+        type=float,
+        default=0.0,
+        help="Shift yellow rods toward the box in the right outer slot.",
+    )
     return parser.parse_args()
 
 
@@ -61,23 +114,71 @@ def required_episode_files(episode_dir: Path) -> dict[Path, int]:
 
 
 def build_episode_specs(
-    episodes: int, seed: int, position_jitter_m: float
+    episodes: int,
+    seed: int,
+    position_jitter_m: float,
+    fixed_scene: bool = False,
+    center_slot_x_shift_m: float = 0.0,
+    red_object_x_shift_m: float = 0.0,
+    red_outer_y_jitter_m: float | None = None,
+    yellow_left_x_shift_m: float = 0.0,
+    yellow_outer_y_jitter_m: float | None = None,
+    yellow_right_x_shift_m: float = 0.0,
+    yellow_right_y_shift_m: float = 0.0,
 ) -> list[dict]:
     rng = np.random.default_rng(seed)
     permutations = tuple(itertools.permutations(range(len(OBJECT_NAMES))))
     specs = []
     for scene_index in range(episodes // len(OBJECT_NAMES)):
-        permutation = permutations[scene_index % len(permutations)]
-        offsets = rng.uniform(
-            -position_jitter_m,
-            position_jitter_m,
-            size=(len(OBJECT_NAMES), 2),
+        permutation = (0, 1, 2) if fixed_scene else permutations[scene_index % len(permutations)]
+        offsets = (
+            np.zeros((len(OBJECT_NAMES), 2))
+            if fixed_scene
+            else rng.uniform(
+                -position_jitter_m,
+                position_jitter_m,
+                size=(len(OBJECT_NAMES), 2),
+            )
         )
+        if abs(center_slot_x_shift_m) > 0.0:
+            for object_index, slot_index in enumerate(permutation):
+                # The red triangle's right-hand center grasp is calibrated at
+                # the nominal x=0.34 m boundary; the yellow/green center
+                # profiles need the +2 cm inward shift.
+                if slot_index == 1 and object_index != 0:
+                    offsets[object_index, 0] += center_slot_x_shift_m
+        if permutation[0] == 1:
+            # The right-hand red-triangle center grasp has a narrow x
+            # feasibility window; retain y jitter while pinning x at 0.34 m.
+            offsets[0, 0] = 0.0
+        else:
+            # Both outer red-triangle grasps use the corresponding nominal
+            # x plus a small fixed inward margin; y remains randomized.
+            offsets[0, 0] = red_object_x_shift_m
+            if red_outer_y_jitter_m is not None:
+                offsets[0, 1] = float(
+                    np.clip(offsets[0, 1], -red_outer_y_jitter_m, red_outer_y_jitter_m)
+                )
+        if permutation[1] == 2:
+            offsets[1, 0] += yellow_left_x_shift_m
+        elif permutation[1] == 1:
+            # The yellow rod center grasp uses x=0.36 m; retain y jitter but
+            # avoid the lower-x edge where the rod loses the middle finger.
+            offsets[1, 0] = center_slot_x_shift_m
+        elif yellow_outer_y_jitter_m is not None:
+            offsets[1, 1] = float(
+                np.clip(offsets[1, 1], -yellow_outer_y_jitter_m, yellow_outer_y_jitter_m)
+            )
+        if permutation[1] == 0:
+            offsets[1, 0] += yellow_right_x_shift_m
+            offsets[1, 1] += yellow_right_y_shift_m
         permutation_cycle = scene_index // len(permutations)
         language_variant_index = (
             permutation_cycle + scene_index % len(permutations)
         ) % len(next(iter(LANGUAGE_VARIANTS.values())))
         for target_index, target in enumerate(OBJECT_NAMES):
+            slot_index = permutation[target_index]
+            profile = contact_profile_for_target_slot(target, slot_index)
             specs.append(
                 {
                     "dataset_contract_version": DATASET_CONTRACT_VERSION,
@@ -88,9 +189,40 @@ def build_episode_specs(
                     "instruction": LANGUAGE_VARIANTS[target][language_variant_index],
                     "slot_permutation": list(permutation),
                     "slot_offsets_xy_m": offsets.tolist(),
+                    "contact_profile": profile,
                 }
             )
     return specs
+
+
+def contact_profile_for_target_slot(target: str, slot_index: int) -> dict:
+    """Return the calibrated physical-contact expert profile for one slot."""
+    profile = {
+        "body_gain_scale": 5.0,
+        "hand_gain_scale": 6.0,
+        "grasp_yaw_deg": 45.0 if target == "green_cube" else 0.0,
+        "contact_grasp_compensation": "-0.015,0.030,-0.055",
+        "hand_closure_multiplier": 1.0,
+    }
+    if slot_index == 1:
+        if target == "red_triangle":
+            profile.update(
+                grasp_yaw_deg=30.0,
+                contact_grasp_compensation="-0.015,-0.030,-0.055",
+            )
+        elif target == "green_cube":
+            profile["hand_closure_multiplier"] = 1.2
+    elif slot_index == 2:
+        if target == "red_triangle":
+            profile["grasp_yaw_deg"] = 30.0
+        elif target == "yellow_rod":
+            profile.update(grasp_yaw_deg=30.0, hand_closure_multiplier=0.9)
+    elif slot_index == 0 and target == "yellow_rod":
+        profile.update(
+            grasp_yaw_deg=90.0,
+            contact_grasp_compensation="0.015,-0.050,-0.055",
+        )
+    return profile
 
 
 def validate_paired_scene_groups(specs: list[dict]) -> None:
@@ -124,6 +256,7 @@ def episode_spec_payload(spec: dict) -> dict:
             "instruction",
             "slot_permutation",
             "slot_offsets_xy_m",
+            "contact_profile",
         )
     }
 
@@ -166,6 +299,7 @@ def collect_episode(args: argparse.Namespace, spec: dict) -> dict:
         summary = existing
         print(f"Reusing episode {episode_index:04d}", flush=True)
     else:
+        profile = spec["contact_profile"]
         command = [
             str(args.python),
             str(args.collector),
@@ -190,6 +324,21 @@ def collect_episode(args: argparse.Namespace, spec: dict) -> dict:
             "320",
             "--render-height",
             "240",
+            "--render-skip",
+            str(args.render_skip),
+            "--disable-overview-video",
+            "--grasp-mode",
+            "contact",
+            "--body-gain-scale",
+            str(profile["body_gain_scale"]),
+            "--hand-gain-scale",
+            str(profile["hand_gain_scale"]),
+            "--grasp-yaw-deg",
+            str(profile["grasp_yaw_deg"]),
+            "--contact-grasp-compensation="
+            + profile["contact_grasp_compensation"],
+            "--hand-closure-multiplier",
+            str(profile["hand_closure_multiplier"]),
         ]
         completed = subprocess.run(
             command,
@@ -221,9 +370,21 @@ def main() -> None:
         raise ValueError("--position-jitter-m must be between 0 and 0.025")
     if not 1 <= args.workers <= 4:
         raise ValueError("--workers must be between one and four")
+    if args.render_skip < 1:
+        raise ValueError("--render-skip must be at least one")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     episode_specs = build_episode_specs(
-        args.episodes, args.seed, args.position_jitter_m
+        args.episodes,
+        args.seed,
+        args.position_jitter_m,
+        args.fixed_scene,
+        args.center_slot_x_shift_m,
+        args.red_object_x_shift_m,
+        args.red_outer_y_jitter_m,
+        args.yellow_left_x_shift_m,
+        args.yellow_outer_y_jitter_m,
+        args.yellow_right_x_shift_m,
+        args.yellow_right_y_shift_m,
     )
     validate_paired_scene_groups(episode_specs)
 
@@ -262,6 +423,13 @@ def main() -> None:
         "successful_episodes": sum(item["passed"] for item in results),
         "success_rate": sum(item["passed"] for item in results) / len(results),
         "position_jitter_m": args.position_jitter_m,
+        "center_slot_x_shift_m": args.center_slot_x_shift_m,
+        "red_object_x_shift_m": args.red_object_x_shift_m,
+        "red_outer_y_jitter_m": args.red_outer_y_jitter_m,
+        "yellow_left_x_shift_m": args.yellow_left_x_shift_m,
+        "yellow_outer_y_jitter_m": args.yellow_outer_y_jitter_m,
+        "yellow_right_x_shift_m": args.yellow_right_x_shift_m,
+        "yellow_right_y_shift_m": args.yellow_right_y_shift_m,
         "paired_scene_groups": args.episodes // len(OBJECT_NAMES),
         "paired_scene_contract_valid": True,
         "scene_group_shared_fields": [

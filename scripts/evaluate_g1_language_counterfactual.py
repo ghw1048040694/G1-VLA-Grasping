@@ -76,6 +76,7 @@ def main() -> None:
         reference_states = torch.stack([item["observation.state"] for item in items])
         base = items[0]
         predictions = []
+        target_posteriors = []
         for task in tasks:
             batch = {
                 key: value.unsqueeze(0).to(device)
@@ -83,13 +84,21 @@ def main() -> None:
                 if key.startswith("observation.") and isinstance(value, torch.Tensor)
             }
             batch["task"] = [task]
-            predictions.append(
-                policy.predict_action_chunk(
+            prediction = policy.predict_action_chunk(
                     batch,
                     noise=seeded_noise(policy, 1, args.seed + scene_index, device),
                 )[0]
+            predictions.append(prediction)
+            target_posteriors.append(
+                policy.model._language_action_target_logits.softmax(dim=-1)[0]
+                .detach()
+                .cpu()
+                .tolist()
             )
         predictions = torch.stack(predictions)
+        target_classifier_predictions = np.argmax(
+            np.asarray(target_posteriors), axis=1
+        )
         distance_matrix = np.asarray(
             [
                 [rmse(prediction, expert) for expert in expert_chunks]
@@ -112,6 +121,14 @@ def main() -> None:
                 "language_classification_correct": [
                     bool(index == nearest[index]) for index in range(len(TARGETS))
                 ],
+                "target_classifier_posteriors": target_posteriors,
+                "target_classifier_prediction": [
+                    TARGETS[index] for index in target_classifier_predictions
+                ],
+                "target_classifier_correct": [
+                    bool(index == target_classifier_predictions[index])
+                    for index in range(len(TARGETS))
+                ],
                 "predicted_pairwise_rmse_rad": predicted_pairwise,
                 "expert_pairwise_rmse_rad": expert_pairwise,
                 "reference_scene_max_object_position_delta_m": float(
@@ -124,6 +141,9 @@ def main() -> None:
         )
 
     correct = [value for row in records for value in row["language_classification_correct"]]
+    classifier_correct = [
+        value for row in records for value in row["target_classifier_correct"]
+    ]
     per_target = {}
     confusion_matrix = {
         target: {prediction: 0 for prediction in TARGETS} for target in TARGETS
@@ -164,6 +184,7 @@ def main() -> None:
         "scenes": scene_count,
         "queries": len(correct),
         "nearest_expert_classification_accuracy": float(np.mean(correct)),
+        "target_classifier_accuracy": float(np.mean(classifier_correct)),
         "per_target": per_target,
         "confusion_matrix_true_by_nearest_expert": confusion_matrix,
         "mean_predicted_pairwise_rmse_rad": float(np.mean(predicted_pairwise)),

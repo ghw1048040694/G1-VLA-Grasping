@@ -1,0 +1,47 @@
+{
+  "codebase_version": "g1-action31-contract-stub",
+  "robot_type": "unitree_g1_upper_body_action31",
+  "dataset_name": "g1_action31_train_root_stub",
+  "description": "Minimal train-root metadata used only to validate the 31D G1 upper-body action joint order for MuJoCo branch sampling. This is not a LeRobot training dataset.",
+  "features": {
+    "action": {
+      "dtype": "float32",
+      "shape": [
+        31
+      ],
+      "names": [
+        "waist_yaw_joint",
+        "waist_roll_joint",
+        "waist_pitch_joint",
+        "left_shoulder_pitch_joint",
+        "left_shoulder_roll_joint",
+        "left_shoulder_yaw_joint",
+        "left_elbow_joint",
+        "left_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        "left_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "left_hand_index_0_joint",
+        "left_hand_index_1_joint",
+        "right_shoulder_pitch_joint",
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint"
+      ]
+    }
+  }
+}

@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         "--experiment-id", default="G1SIM-01-isaacsim-offline-action-replay"
     )
     parser.add_argument("--activate-assisted-grasp", action="store_true")
+    parser.add_argument(
+        "--tracked-object-name",
+        default="warehouse_tote",
+        help="Object body name to track in the Isaac Sim report.",
+    )
     return parser.parse_args()
 
 
@@ -68,7 +73,7 @@ def main() -> None:
     if compiler is None:
         raise ValueError("MJCF scene has no <compiler> element")
     compiler.set("meshdir", "meshes")
-    scene_path = assets_dir / "g1_mpc04_episode0000.xml"
+    scene_path = assets_dir / "g1_contact_only_source.xml"
     scene_tree.write(scene_path, encoding="unicode")
 
     shutil.copy2(args.episode / "trajectory.npz", data_dir / "trajectory.npz")
@@ -82,18 +87,44 @@ def main() -> None:
     genesis_summary = json.loads(
         (args.episode / "summary.json").read_text(encoding="utf-8")
     )
+    if not args.activate_assisted_grasp and (
+        genesis_summary.get("assisted_grasp_enabled", False)
+        or genesis_summary.get("assisted_grasp_activated", False)
+    ):
+        raise ValueError(
+            "The selected episode used assisted grasp; choose a contact-only episode "
+            "or pass --activate-assisted-grasp explicitly."
+        )
     action_feature = dataset_info["features"]["action"]
+    source_policy = str(genesis_summary.get("policy", "unknown"))
+    checkpoint = genesis_summary.get("checkpoint")
     manifest = {
         "experiment": args.experiment_id,
-        "source_experiment": "G1MPC-04-rank-filtered-independent-heldout",
-        "source_policy": "scaled20000_world_model_mpc",
-        "source_episode": 0,
+        "source_experiment": args.episode.parent.parent.name,
+        "source_policy": source_policy,
+        "source_checkpoint": checkpoint,
+        "source_episode": genesis_summary.get("source_episode"),
+        "source_episode_directory": str(args.episode),
+        "mjcf_file": str(scene_path.relative_to(args.output)),
         "source_simulator": "MuJoCo",
         "target_simulator": "Isaac Sim 6.0.1 PhysX",
         "control_fps": dataset_info["fps"],
         "physics_fps": 60,
         "action_joint_names": action_feature["names"],
         "activate_assisted_grasp": args.activate_assisted_grasp,
+        "assisted_grasp_constraint": bool(
+            genesis_summary.get("assisted_grasp_enabled", False)
+            or genesis_summary.get("assisted_grasp_activated", False)
+        ),
+        "physical_tote_handles": bool(
+            genesis_summary.get("physical_tote_handles", False)
+        ),
+        "grasp_offset_m": genesis_summary.get("grasp_offset_m"),
+        "tote_sliding_friction": genesis_summary.get("tote_sliding_friction"),
+        "waist_pitch_command_limit_rad": genesis_summary.get(
+            "waist_pitch_command_limit_rad"
+        ),
+        "tracked_object_name": args.tracked_object_name,
         "assisted_grasp_activation_phase": 4,
         "source_passed": genesis_summary["passed"],
         "source_final_lift_height_m": genesis_summary["tote_lift_height_m"],

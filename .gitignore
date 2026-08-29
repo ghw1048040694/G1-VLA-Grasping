@@ -1,5 +1,7 @@
 outputs/
+.runtime/
 third_party/
+MUJOCO_LOG.TXT
 *.log
 __pycache__/
 *.pyc

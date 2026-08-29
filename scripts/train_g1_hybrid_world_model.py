@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 from pathlib import Path
 
@@ -162,7 +163,8 @@ def physical_joint_limits(scene: Path, joint_names: np.ndarray) -> tuple[np.ndar
             raise ValueError(f"Joint {name} is missing from {scene}")
         low, high = model.jnt_range[joint_id]
         if name == "waist_pitch_joint":
-            low, high = max(low, -0.10), min(high, 0.10)
+            waist_limit = float(os.environ.get("G1_WAIST_PITCH_LIMIT_RAD", "0.10"))
+            low, high = max(low, -waist_limit), min(high, waist_limit)
         elif name in ("waist_yaw_joint", "waist_roll_joint"):
             low, high = max(low, -0.05), min(high, 0.05)
         lower.append(low)

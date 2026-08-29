@@ -20,10 +20,12 @@ import torch
 if lerobot_site_packages := os.environ.get("LEROBOT_SITE_PACKAGES"):
     sys.path.append(lerobot_site_packages)
 
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.policies.factory import make_policy
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+try:
+    from evaluate_g1_language_smolvla_heldout import (
+        load_policy as load_project_adapter_policy,
+    )
+except ImportError:
+    load_project_adapter_policy = None
 
 from run_g1_language_pick_place import (
     BIN_POSITION_M,
@@ -39,6 +41,7 @@ from run_g1_language_pick_place import (
     solve_pose,
 )
 from collect_g1_language_pick_place_dataset import LANGUAGE_VARIANTS
+from g1_finger_contact_geometry import finger_contact_geom_ids
 from validate_g1_bimanual_actuation import apply_regularized_dynamics, unitree_gains
 
 CAMERAS = {
@@ -73,10 +76,44 @@ def parse_args() -> argparse.Namespace:
         help="Use legacy slot jitter or independently sampled, separated XY positions.",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--disable-assisted-grasp",
+        action="store_true",
+        help="Keep equality/connect constraints disabled and require physical contact.",
+    )
+    parser.add_argument(
+        "--project-adapter",
+        action="store_true",
+        help=(
+            "Load project-owned language/action adapter checkpoints, including "
+            "context-scene decoder weights."
+        ),
+    )
+    parser.add_argument(
+        "--disable-video",
+        action="store_true",
+        help="Skip EGL video rendering while retaining physics and trajectory logs.",
+    )
+    parser.add_argument(
+        "--save-observation-videos",
+        action="store_true",
+        help="Save the three camera streams used by the policy for DAgger diagnostics.",
+    )
+    parser.add_argument(
+        "--initial-state-from-train",
+        action="store_true",
+        help="Initialize the upper body from training episode 0000 frame 0.",
+    )
     return parser.parse_args()
 
 
 def load_policy(checkpoint: Path, train_meta: LeRobotDatasetMetadata, device: str):
+    # Local VLA/MPC evaluators reuse run_episode but do not instantiate a
+    # LeRobot policy, so keep this optional dependency off their import path.
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.factory import make_policy
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
     config = PreTrainedConfig.from_pretrained(checkpoint)
     if not isinstance(config, SmolVLAConfig):
         raise TypeError(f"Expected SmolVLAConfig, found {type(config)}")
@@ -246,6 +283,13 @@ def run_episode(
     palm_ids = [
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) for name in PALM_NAMES
     ]
+    contact_pad_ids = [
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{side}_palm_contact_pad")
+        for side in ("left", "right")
+    ]
+    if min(contact_pad_ids) < 0:
+        raise RuntimeError("Scene is missing the generated physical palm contact pads")
+    finger_contact_ids = finger_contact_geom_ids(model)
     object_body_ids = {
         name: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
         for name in OBJECT_NAMES
@@ -263,6 +307,56 @@ def run_episode(
         for arm_index in range(len(PALM_NAMES))
         for name in OBJECT_NAMES
     }
+
+    def body_side(body_id: int) -> int | None:
+        # MuJoCo uses body 0 for the world and its parent id is also 0;
+        # stopping at the world body avoids an infinite root traversal.
+        while body_id > 0:
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+            if name.startswith("left_"):
+                return 0
+            if name.startswith("right_"):
+                return 1
+            body_id = int(model.body_parentid[body_id])
+        return None
+
+    object_geom_ids = {
+        name: {
+            geom_id
+            for geom_id in range(model.ngeom)
+            if int(model.geom_bodyid[geom_id]) == body_id
+        }
+        for name, body_id in object_body_ids.items()
+    }
+
+    def physical_contact_candidates() -> list[tuple[int, str]]:
+        candidates = []
+        for contact_index in range(data.ncon):
+            contact = data.contact[contact_index]
+            body_a = int(model.geom_bodyid[contact.geom1])
+            body_b = int(model.geom_bodyid[contact.geom2])
+            side = body_side(body_a)
+            object_name = next(
+                (
+                    name
+                    for name, geom_ids in object_geom_ids.items()
+                    if contact.geom1 in geom_ids
+                ),
+                None,
+            )
+            if side is None or object_name is None:
+                side = body_side(body_b)
+                object_name = next(
+                    (
+                        name
+                        for name, geom_ids in object_geom_ids.items()
+                        if contact.geom2 in geom_ids
+                    ),
+                    None,
+                )
+            if side is not None and object_name is not None:
+                candidates.append((side, object_name))
+        return candidates
 
     mujoco.mj_resetData(model, data)
     mujoco.mj_forward(model, data)
@@ -294,6 +388,25 @@ def run_episode(
         [data.qpos[controlled[name]["qpos_id"]] for name in controlled_names],
         dtype=np.float64,
     )
+    if getattr(args, "initial_state_from_train", False):
+        import pyarrow.parquet as pq
+
+        state_path = (
+            args.train_root
+            / "data"
+            / "chunk-000"
+            / "episode_000000.parquet"
+        )
+        train_state = np.asarray(
+            pq.read_table(state_path).column("observation.state")[0].as_py(),
+            dtype=np.float64,
+        )
+        if train_state.shape != (len(upper_names),):
+            raise ValueError(f"Unexpected training initial state shape: {train_state.shape}")
+        for name, value in zip(upper_names, train_state):
+            data.qpos[controlled[name]["qpos_id"]] = value
+        mujoco.mj_forward(model, data)
+        initial_targets[LOWER_BODY_JOINTS:] = train_state
     action_lower = np.asarray(
         [model.jnt_range[controlled[name]["joint_id"], 0] for name in upper_names]
     )
@@ -301,17 +414,41 @@ def run_episode(
         [model.jnt_range[controlled[name]["joint_id"], 1] for name in upper_names]
     )
 
-    task_renderer = mujoco.Renderer(model, height=240, width=320)
-    video_renderer = mujoco.Renderer(model, height=480, width=640)
+    task_renderer = mujoco.Renderer(
+        model,
+        height=getattr(args, "observation_height", 120),
+        width=getattr(args, "observation_width", 160),
+    )
+    video_renderer = mujoco.Renderer(
+        model,
+        height=getattr(args, "video_height", 240),
+        width=getattr(args, "video_width", 320),
+    )
     camera = mujoco.MjvCamera()
     camera.lookat[:] = (0.45, -0.05, 0.92)
     camera.distance = 2.15
     camera.azimuth = 145
     camera.elevation = -12
     video_path = output_dir / "closed_loop.mp4"
-    writer = imageio.get_writer(
-        video_path, fps=args.control_fps, codec="libx264", quality=8
-    )
+    writer = None
+    if not getattr(args, "disable_video", False):
+        writer = imageio.get_writer(
+            video_path, fps=args.control_fps, codec="libx264", quality=8
+        )
+    observation_writers = {}
+    if getattr(args, "save_observation_videos", False):
+        observation_writers = {
+            camera: imageio.get_writer(
+                output_dir / f"{camera}.mp4",
+                fps=args.control_fps,
+                codec="libx264",
+                quality=8,
+                # Recovery caches must see the exact RGB geometry supplied to
+                # the policy. The imageio default pads 160x120 to 160x128.
+                macro_block_size=1,
+            )
+            for camera in CAMERAS.values()
+        }
 
     policy.reset()
     physics_per_control = max(1, round(1.0 / (args.control_fps * model.opt.timestep)))
@@ -324,30 +461,44 @@ def run_episode(
     inference_times = []
     action_clip_values = 0
     action_values = 0
+    action_safety_clip_values = 0
     joint_limit_violations = 0
     joint_samples = 0
     joint_limit_violations_by_joint = {name: 0 for name in controlled_names}
     joint_samples_by_joint = {name: 0 for name in controlled_names}
+    contact_candidate_steps = 0
+    contact_candidate_pairs: dict[str, int] = {}
+    max_hand_object_contacts = 0
     action_delta_squared_sum = 0.0
     action_delta_count = 0
     action_delta_max_abs = 0.0
     previous_action = initial_targets[LOWER_BODY_JOINTS:].copy()
     trajectory_joint_position = []
+    trajectory_joint_velocity = []
     trajectory_action = []
     trajectory_object_position = []
+    trajectory_palm_position = []
     trajectory_assist_active = []
     trajectory_grabbed_object_index = []
     trajectory_grabbed_arm_index = []
+    progress_enabled = os.environ.get("G1_EVAL_PROGRESS") == "1"
+    progress_started = time.perf_counter()
 
     for frame in range(control_frames):
+        frame_started = time.perf_counter()
         state = np.asarray(
             [data.qpos[controlled[name]["qpos_id"]] for name in upper_names],
             dtype=np.float32,
         )
         chunk_index = frame % args.replan_steps
-        if chunk_index == 0:
+        history_observer = (
+            getattr(policy, "observe_history", None)
+            if getattr(policy, "needs_temporal_history", False)
+            else None
+        )
+        if history_observer is not None or chunk_index == 0:
             planner_context_setter = getattr(policy, "set_planner_context", None)
-            if planner_context_setter is not None:
+            if chunk_index == 0 and planner_context_setter is not None:
                 planner_context_setter(
                     {
                         "model": model,
@@ -356,6 +507,8 @@ def run_episode(
                         "upper_names": upper_names,
                         "object_body_ids": object_body_ids,
                         "palm_ids": palm_ids,
+                        "contact_pad_ids": contact_pad_ids,
+                        "finger_contact_geom_ids": finger_contact_ids,
                         "initial_object_positions": positions,
                         "grabbed_object": grabbed_object,
                         "grabbed_arm_index": grabbed_arm_index,
@@ -373,6 +526,9 @@ def run_episode(
             batch = render_observation(
                 task_renderer, data, state, spec["instruction"], args.device
             )
+            if history_observer is not None:
+                history_observer(batch)
+        if chunk_index == 0:
             started = time.perf_counter()
             current_chunk = (
                 policy.predict_action_chunk(
@@ -388,8 +544,24 @@ def run_episode(
                 .numpy()
             )
             inference_times.append(time.perf_counter() - started)
+            if os.environ.get("G1_EVAL_PROGRESS") == "1":
+                print(
+                    f"FRAME={frame} inference_s={inference_times[-1]:.3f}",
+                    flush=True,
+                )
         action = current_chunk[min(chunk_index, len(current_chunk) - 1), :31]
+        if not np.all(np.isfinite(action)):
+            raise RuntimeError(f"Non-finite learned action at frame {frame}")
         clipped = np.clip(action, action_lower, action_upper)
+        delta_limit = float(getattr(args, "action_delta_limit_rad", 0.0))
+        if delta_limit > 0.0:
+            bounded = previous_action + np.clip(
+                clipped - previous_action, -delta_limit, delta_limit
+            )
+            action_safety_clip_values += int(
+                np.count_nonzero(np.abs(bounded - clipped) > 1e-8)
+            )
+            clipped = bounded
         action_clip_values += int(np.count_nonzero(np.abs(clipped - action) > 1e-8))
         action_values += len(action)
         action_delta = clipped - previous_action
@@ -400,7 +572,11 @@ def run_episode(
         )
         previous_action = clipped.copy()
 
-        if grabbed_object is None and frame >= args.control_fps:
+        if (
+            grabbed_object is None
+            and frame >= args.control_fps
+            and not getattr(args, "disable_assisted_grasp", False)
+        ):
             distances = {
                 (arm_index, name): float(
                     np.linalg.norm(data.site_xpos[palm_id] - data.site_xpos[site_id])
@@ -413,12 +589,16 @@ def run_episode(
                 grabbed_object = nearest_object
                 grabbed_arm_index = nearest_arm
                 assist_activation_frame = frame
-                data.eq_active[equality_ids[(nearest_arm, nearest_object)]] = 1
-        if grabbed_object is not None and assist_release_frame is None:
+                model.eq_active[equality_ids[(nearest_arm, nearest_object)]] = 1
+        if (
+            grabbed_object is not None
+            and assist_release_frame is None
+            and not getattr(args, "disable_assisted_grasp", False)
+        ):
             object_position = data.xpos[object_body_ids[grabbed_object]]
             relative = object_position - BIN_POSITION_M
             if abs(relative[0]) <= 0.105 and abs(relative[1]) <= 0.125:
-                data.eq_active[equality_ids[(grabbed_arm_index, grabbed_object)]] = 0
+                model.eq_active[equality_ids[(grabbed_arm_index, grabbed_object)]] = 0
                 assist_release_frame = frame
 
         commanded = initial_targets.copy()
@@ -426,14 +606,23 @@ def run_episode(
         for _ in range(physics_per_control):
             for name, item in controlled.items():
                 kp, kd = unitree_gains(name)
-                kp *= 1.5
-                kd *= math.sqrt(1.5)
+                gain_scale = (
+                    getattr(args, "hand_gain_scale", 1.5)
+                    if "hand_" in name
+                    else getattr(args, "body_gain_scale", 1.5)
+                )
+                kp *= gain_scale
+                kd *= math.sqrt(gain_scale)
                 qpos = float(data.qpos[item["qpos_id"]])
                 qvel = float(data.qvel[item["qvel_id"]])
                 torque = kp * (commanded[item["actuator_id"]] - qpos) - kd * qvel
                 torque += float(data.qfrc_bias[item["qvel_id"]])
                 data.ctrl[item["actuator_id"]] = torque
             mujoco.mj_step(model, data)
+            if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
+                raise RuntimeError(
+                    f"MuJoCo became non-finite at control frame {frame}"
+                )
             for name, item in controlled.items():
                 low_limit, high_limit = model.jnt_range[item["joint_id"]]
                 qpos = float(data.qpos[item["qpos_id"]])
@@ -442,12 +631,46 @@ def run_episode(
                 joint_samples += 1
                 joint_limit_violations_by_joint[name] += violated
                 joint_samples_by_joint[name] += 1
+        if (
+            grabbed_object is None
+            and getattr(args, "disable_assisted_grasp", False)
+            and frame >= args.control_fps
+        ):
+            contacts = physical_contact_candidates()
+            max_hand_object_contacts = max(max_hand_object_contacts, len(contacts))
+            for side_index, object_name in contacts:
+                pair = f"{PALM_NAMES[side_index]}:{object_name}"
+                contact_candidate_pairs[pair] = contact_candidate_pairs.get(pair, 0) + 1
+            contact_candidate_steps += int(bool(contacts))
+            if contacts:
+                grabbed_arm_index, grabbed_object = contacts[0]
+                assist_activation_frame = frame
+        if os.environ.get("G1_EVAL_PROGRESS") == "1":
+            print(
+                f"FRAME_DONE={frame} total_s={time.perf_counter() - frame_started:.3f} ncon={data.ncon}",
+                flush=True,
+            )
+        if (
+            grabbed_object is not None
+            and assist_release_frame is None
+            and getattr(args, "disable_assisted_grasp", False)
+        ):
+            object_position = data.xpos[object_body_ids[grabbed_object]]
+            relative = object_position - BIN_POSITION_M
+            if abs(relative[0]) <= 0.105 and abs(relative[1]) <= 0.125:
+                assist_release_frame = frame
         trajectory_joint_position.append(
             [data.qpos[controlled[name]["qpos_id"]] for name in upper_names]
+        )
+        trajectory_joint_velocity.append(
+            [data.qvel[controlled[name]["qvel_id"]] for name in upper_names]
         )
         trajectory_action.append(clipped.copy())
         trajectory_object_position.append(
             np.stack([data.xpos[object_body_ids[name]].copy() for name in OBJECT_NAMES])
+        )
+        trajectory_palm_position.append(
+            np.stack([data.site_xpos[site].copy() for site in palm_ids])
         )
         trajectory_assist_active.append(
             int(grabbed_object is not None and assist_release_frame is None)
@@ -458,12 +681,31 @@ def run_episode(
         trajectory_grabbed_arm_index.append(
             grabbed_arm_index if grabbed_arm_index is not None else -1
         )
-        video_renderer.update_scene(data, camera=camera)
-        writer.append_data(video_renderer.render())
+        if writer is not None:
+            video_renderer.update_scene(data, camera=camera)
+            writer.append_data(video_renderer.render())
+        if observation_writers:
+            for camera_name in CAMERAS.values():
+                task_renderer.update_scene(data, camera=camera_name)
+                observation_writers[camera_name].append_data(task_renderer.render())
+        if progress_enabled and (frame % max(1, args.control_fps) == 0):
+            print(
+                f"EVAL_PROGRESS frame={frame + 1}/{control_frames} "
+                f"sim_time={data.time:.3f} wall_s={time.perf_counter() - progress_started:.1f}",
+                flush=True,
+            )
 
-    writer.close()
-    task_renderer.close()
-    video_renderer.close()
+    if writer is not None:
+        writer.close()
+    for observation_writer in observation_writers.values():
+        observation_writer.close()
+    # MuJoCo 3.x releases the EGL context through object lifetime and does
+    # not expose Renderer.close(); older builds did.  Support both without
+    # turning a completed episode into a post-processing failure.
+    for renderer in (task_renderer, video_renderer):
+        close = getattr(renderer, "close", None)
+        if close is not None:
+            close()
     final_positions = {
         name: data.xpos[body_id].copy() for name, body_id in object_body_ids.items()
     }
@@ -506,10 +748,14 @@ def run_episode(
             if joint_limit_violations_by_joint[name]
         },
         "action_clip_fraction": action_clip_values / max(action_values, 1),
+        "action_safety_clip_fraction": action_safety_clip_values / max(action_values, 1),
         "action_delta_rmse_rad": math.sqrt(
             action_delta_squared_sum / max(action_delta_count, 1)
         ),
         "action_delta_max_abs_rad": action_delta_max_abs,
+        "hand_object_contact_candidate_steps": contact_candidate_steps,
+        "hand_object_contact_candidate_pairs": contact_candidate_pairs,
+        "max_hand_object_contacts": max_hand_object_contacts,
         "assist_activation_frame": assist_activation_frame,
         "assist_release_frame": assist_release_frame,
         "mean_policy_inference_s": float(np.mean(inference_times)),
@@ -517,7 +763,7 @@ def run_episode(
             name: value.tolist() for name, value in final_positions.items()
         },
         "passed": passed,
-        "video": str(video_path),
+        "video": str(video_path) if writer is not None else None,
         "trajectory": str(output_dir / "trajectory.npz"),
     }
     np.savez_compressed(
@@ -526,9 +772,13 @@ def run_episode(
         observation_joint_position_rad=np.asarray(
             trajectory_joint_position, dtype=np.float32
         ),
+        observation_joint_velocity_rad_s=np.asarray(
+            trajectory_joint_velocity, dtype=np.float32
+        ),
         action_joint_position_rad=np.asarray(trajectory_action, dtype=np.float32),
         object_names=np.asarray(OBJECT_NAMES),
         object_position_m=np.asarray(trajectory_object_position, dtype=np.float32),
+        palm_position_m=np.asarray(trajectory_palm_position, dtype=np.float32),
         assist_active=np.asarray(trajectory_assist_active, dtype=np.int8),
         grabbed_object_index=np.asarray(trajectory_grabbed_object_index, dtype=np.int8),
         grabbed_arm_index=np.asarray(trajectory_grabbed_arm_index, dtype=np.int8),
@@ -547,11 +797,23 @@ def run_episode(
 
 
 def main() -> None:
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     train_meta = LeRobotDatasetMetadata(args.train_repo_id, root=args.train_root)
     expected_names = train_meta.features["action"]["names"]
-    policy = load_policy(args.checkpoint, train_meta, args.device)
+    if args.project_adapter:
+        if load_project_adapter_policy is None:
+            raise RuntimeError(
+                "Project adapter loader is unavailable; set PYTHONPATH to the "
+                "project scripts directory."
+            )
+        policy = load_project_adapter_policy(
+            args.checkpoint, train_meta, args.device
+        )
+    else:
+        policy = load_policy(args.checkpoint, train_meta, args.device)
     reports = [
         run_episode(policy, spec, args, expected_names)
         for spec in evaluation_specs(args.episodes, args.seed, args.position_jitter_m)

@@ -81,7 +81,9 @@ def dataset_features(joint_names: list[str]) -> dict:
     return features
 
 
-def load_episode(episode_dir: Path) -> tuple[dict, dict, list[str]]:
+def load_episode(
+    episode_dir: Path, expected_assisted_grasp_constraint: bool
+) -> tuple[dict, dict, list[str]]:
     summary = json.loads(
         (episode_dir / "assisted_tote_lift_summary.json").read_text(encoding="utf-8")
     )
@@ -90,6 +92,18 @@ def load_episode(episode_dir: Path) -> tuple[dict, dict, list[str]]:
     )
     if not summary["passed"] or not metadata["episode_success"]:
         raise ValueError(f"Refusing failed episode: {episode_dir}")
+    summary_assisted = bool(summary.get("assisted_grasp_constraint", True))
+    metadata_assisted = bool(metadata.get("assisted_grasp_constraint", True))
+    if not (
+        summary_assisted
+        == metadata_assisted
+        == expected_assisted_grasp_constraint
+    ):
+        raise ValueError(
+            f"Assisted-grasp contract mismatch in {episode_dir}: "
+            f"summary={summary_assisted}, metadata={metadata_assisted}, "
+            f"expected={expected_assisted_grasp_constraint}"
+        )
     arrays = np.load(episode_dir / "expert_lift_episode.npz")
     joint_names = arrays["joint_names"].tolist()
     if len(joint_names) != 43 or any(
@@ -110,25 +124,30 @@ def convert_split(
     overwrite: bool,
     phase_conditioned_language: bool,
     split_by_phase: bool,
+    assisted_grasp_constraint: bool,
 ) -> dict:
     if root.exists():
         if not overwrite:
             raise FileExistsError(f"Dataset already exists: {root}")
         shutil.rmtree(root)
-    first_arrays, _, joint_names = load_episode(episode_dirs[0])
+    first_arrays, _, joint_names = load_episode(
+        episode_dirs[0], assisted_grasp_constraint
+    )
     first_arrays.close()
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
         root=root,
-        robot_type="unitree_g1_upper_body_assisted_lift",
+        robot_type="unitree_g1_upper_body_tote_lift",
         features=dataset_features(joint_names),
         use_videos=True,
         image_writer_threads=4,
     )
     per_episode = []
     for episode_dir in episode_dirs:
-        arrays, metadata, names = load_episode(episode_dir)
+        arrays, metadata, names = load_episode(
+            episode_dir, assisted_grasp_constraint
+        )
         if names != joint_names:
             raise ValueError(f"Joint names changed in {episode_dir}")
         readers = {
@@ -245,6 +264,7 @@ def convert_split(
         "camera_keys": metadata.camera_keys,
         "video_decode_backend": "pyav",
         "decoded_endpoint_samples": decoded_samples,
+        "assisted_grasp_constraint": assisted_grasp_constraint,
         "episode_records": per_episode,
     }
 
@@ -260,6 +280,9 @@ def main() -> None:
     )
     if not source_summary["experiment_passed"]:
         raise ValueError("Source dataset did not pass its collection contract")
+    assisted_grasp_constraint = bool(
+        source_summary.get("assisted_grasp_constraint", True)
+    )
     episode_dirs = sorted(args.source_root.glob("episode_*"))
     if args.episode_limit is not None:
         if args.episode_limit < 2:
@@ -296,7 +319,7 @@ def main() -> None:
         "source_experiment": source_summary["experiment"],
         "source_episodes": len(episode_dirs),
         "lower_body_dimensions_removed": LOWER_BODY_JOINTS,
-        "assisted_grasp_constraint": True,
+        "assisted_grasp_constraint": assisted_grasp_constraint,
         "phase_conditioned_language": args.phase_conditioned_language,
         "split_by_phase": args.split_by_phase,
         "phase_instructions": (
@@ -321,6 +344,7 @@ def main() -> None:
             args.overwrite,
             args.phase_conditioned_language,
             args.split_by_phase,
+            assisted_grasp_constraint,
         ),
         "validation": convert_split(
             val_dirs,
@@ -330,6 +354,7 @@ def main() -> None:
             args.overwrite,
             args.phase_conditioned_language,
             args.split_by_phase,
+            assisted_grasp_constraint,
         ),
     }
     episodes_per_source = len(PHASE_INSTRUCTIONS) if args.split_by_phase else 1

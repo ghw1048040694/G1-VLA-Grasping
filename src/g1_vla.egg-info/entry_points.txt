@@ -1,0 +1,2 @@
+[console_scripts]
+g1-vla = g1_vla.cli:main

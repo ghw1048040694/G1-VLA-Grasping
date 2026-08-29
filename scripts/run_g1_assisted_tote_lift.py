@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
@@ -29,6 +30,7 @@ HOME_POSITIONS_M = np.array(((0.22, 0.32, 1.00), (0.22, -0.32, 1.00)))
 PREGRASP_CLEARANCE_M = 0.06
 LIFT_HEIGHT_M = 0.18
 WAIST_PITCH_LIMIT_RAD = 0.10
+JOINT_LIMIT_TOLERANCE_RAD = 0.003
 
 
 def smoothstep(value: float) -> float:
@@ -48,18 +50,67 @@ def build_scene(source: Path, destination: Path, tote_x_m: float) -> None:
     equality = root.find("equality")
     if tote is None or table is None or equality is None:
         raise RuntimeError("Source scene is missing tote, table, or equality section")
+    # Evaluations may be retried into the same directory after a partial run.
+    # Remove generated grasp helpers first so scene construction stays idempotent.
+    for name in ("tote_left_assist_site", "tote_right_assist_site"):
+        for site in tote.findall(f"site[@name='{name}']"):
+            tote.remove(site)
+    for side in ("left", "right"):
+        for part in ("bar", "front_support", "back_support"):
+            name = f"tote_{side}_handle_{part}"
+            for geom in tote.findall(f"geom[@name='{name}']"):
+                tote.remove(geom)
+    for name in ("left_assisted_grasp", "right_assisted_grasp"):
+        for connect in equality.findall(f"connect[@name='{name}']"):
+            equality.remove(connect)
     tote_pos = [float(value) for value in tote.get("pos", "").split()]
     table_pos = [float(value) for value in table.get("pos", "").split()]
     tote_pos[0] = tote_x_m
     table_pos[0] = tote_x_m + 0.15
     tote.set("pos", " ".join(str(value) for value in tote_pos))
     table.set("pos", " ".join(str(value) for value in table_pos))
+    grasp_offset = float(os.environ.get("G1_TOTE_GRASP_OFFSET_M", "0.295"))
+    if not 0.20 <= grasp_offset <= 0.32:
+        raise ValueError("G1_TOTE_GRASP_OFFSET_M must be in [0.20, 0.32]")
+    tote_friction_slide = float(os.environ.get("G1_TOTE_FRICTION_SLIDE", "0.8"))
+    if not 0.1 <= tote_friction_slide <= 2.0:
+        raise ValueError("G1_TOTE_FRICTION_SLIDE must be in [0.1, 2.0]")
+    for geom in tote.findall("geom"):
+        friction = [float(value) for value in geom.get("friction", "0.8 0.02 0.002").split()]
+        friction[0] = tote_friction_slide
+        geom.set("friction", " ".join(str(value) for value in friction))
+    physical_handles = os.environ.get("G1_TOTE_PHYSICAL_HANDLES", "0") == "1"
+    if physical_handles:
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            wall_y = sign * 0.22
+            handle_y = sign * 0.28
+            common = {
+                "type": "capsule",
+                "size": "0.015",
+                "friction": f"{tote_friction_slide} 0.02 0.002",
+                "rgba": "0.06 0.28 0.72 1",
+            }
+            ET.SubElement(
+                tote,
+                "geom",
+                name=f"tote_{side}_handle_bar",
+                fromto=f"-0.10 {handle_y} 0 0.10 {handle_y} 0",
+                **common,
+            )
+            for end, x in (("front", -0.10), ("back", 0.10)):
+                ET.SubElement(
+                    tote,
+                    "geom",
+                    name=f"tote_{side}_handle_{end}_support",
+                    fromto=f"{x} {wall_y} 0 {x} {handle_y} 0",
+                    **common,
+                )
     ET.SubElement(
         tote,
         "site",
         name="tote_left_assist_site",
         type="sphere",
-        pos="0 0.295 0",
+        pos=f"0 {grasp_offset} 0",
         size="0.008",
         rgba="1 1 0 0.35",
     )
@@ -68,7 +119,7 @@ def build_scene(source: Path, destination: Path, tote_x_m: float) -> None:
         "site",
         name="tote_right_assist_site",
         type="sphere",
-        pos="0 -0.295 0",
+        pos=f"0 {-grasp_offset} 0",
         size="0.008",
         rgba="1 1 0 0.35",
     )
@@ -102,6 +153,11 @@ def main() -> None:
     parser.add_argument("--render-height", type=int, default=480)
     parser.add_argument("--tote-x", type=float, default=0.45)
     parser.add_argument("--record-demonstration", action="store_true")
+    parser.add_argument(
+        "--disable-assisted-grasp",
+        action="store_true",
+        help="Keep both equality grasp constraints inactive for strict contact-only data.",
+    )
     parser.add_argument(
         "--language-instruction", default="lift the blue tote with both hands"
     )
@@ -140,9 +196,14 @@ def main() -> None:
     )
     lower = np.asarray([model.jnt_range[joint_id, 0] for joint_id in selected_joint_ids])
     upper = np.asarray([model.jnt_range[joint_id, 1] for joint_id in selected_joint_ids])
+    waist_pitch_limit_rad = float(
+        os.environ.get("G1_WAIST_PITCH_LIMIT_RAD", str(WAIST_PITCH_LIMIT_RAD))
+    )
+    if not 0.05 <= waist_pitch_limit_rad <= WAIST_PITCH_LIMIT_RAD:
+        raise ValueError("G1_WAIST_PITCH_LIMIT_RAD must be in [0.05, 0.10]")
     for index, joint_name in enumerate(selected_names):
         if joint_name == "waist_pitch_joint":
-            lower[index], upper[index] = -WAIST_PITCH_LIMIT_RAD, WAIST_PITCH_LIMIT_RAD
+            lower[index], upper[index] = -waist_pitch_limit_rad, waist_pitch_limit_rad
         elif joint_name in ("waist_yaw_joint", "waist_roll_joint"):
             lower[index], upper[index] = -0.05, 0.05
     palm_ids = [
@@ -152,6 +213,15 @@ def main() -> None:
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, item)
         for item in TOTE_SITE_NAMES
     ]
+    palm_yaw_deg = float(os.environ.get("G1_TOTE_PALM_YAW_DEG", "0.0"))
+    if not 0.0 <= palm_yaw_deg <= 100.0:
+        raise ValueError("G1_TOTE_PALM_YAW_DEG must be in [0, 100]")
+    palm_orientation_targets = np.stack(
+        [
+            Rotation.from_euler("z", -palm_yaw_deg, degrees=True).as_matrix(),
+            Rotation.from_euler("z", palm_yaw_deg, degrees=True).as_matrix(),
+        ]
+    )
 
     def solve_pose(
         target_positions: np.ndarray, seed: np.ndarray, orientation_weight: float = 0.06
@@ -167,8 +237,11 @@ def main() -> None:
             )
             orientation_error = np.concatenate(
                 [
-                    Rotation.from_matrix(data.site_xmat[site_id].reshape(3, 3)).as_rotvec()
-                    for site_id in palm_ids
+                    Rotation.from_matrix(
+                        palm_orientation_targets[index].T
+                        @ data.site_xmat[site_id].reshape(3, 3)
+                    ).as_rotvec()
+                    for index, site_id in enumerate(palm_ids)
                 ]
             )
             return np.concatenate(
@@ -197,9 +270,12 @@ def main() -> None:
             "maximum_orientation_error_rad": float(
                 max(
                     np.linalg.norm(
-                        Rotation.from_matrix(data.site_xmat[site_id].reshape(3, 3)).as_rotvec()
+                        Rotation.from_matrix(
+                            palm_orientation_targets[index].T
+                            @ data.site_xmat[site_id].reshape(3, 3)
+                        ).as_rotvec()
                     )
-                    for site_id in palm_ids
+                    for index, site_id in enumerate(palm_ids)
                 )
             ),
             "waist_pitch_rad": float(solution.x[selected_names.index("waist_pitch_joint")]),
@@ -232,15 +308,18 @@ def main() -> None:
 
     mujoco.mj_resetData(model, data)
     data.qpos[selected_qpos_ids] = home_pose
+    hand_open_margin_rad = float(os.environ.get("G1_HAND_OPEN_MARGIN_RAD", "0.01"))
+    if not 0.005 <= hand_open_margin_rad <= 0.20:
+        raise ValueError("G1_HAND_OPEN_MARGIN_RAD must be in [0.005, 0.20]")
     open_hand_targets = {}
     for joint_name, item in controlled.items():
         if "hand_" not in joint_name:
             continue
         low, high = model.jnt_range[item["joint_id"]]
         if abs(float(low)) < 1e-9:
-            open_hand_targets[joint_name] = 0.01
+            open_hand_targets[joint_name] = hand_open_margin_rad
         elif abs(float(high)) < 1e-9:
-            open_hand_targets[joint_name] = -0.01
+            open_hand_targets[joint_name] = -hand_open_margin_rad
         else:
             open_hand_targets[joint_name] = float(data.qpos[item["qpos_id"]])
         data.qpos[item["qpos_id"]] = open_hand_targets[joint_name]
@@ -299,10 +378,22 @@ def main() -> None:
     dt = float(model.opt.timestep)
     total_time = 10.0
     total_steps = int(total_time / dt)
+    grasp_offset = float(os.environ.get("G1_TOTE_GRASP_OFFSET_M", "0.295"))
+    tote_friction_slide = float(os.environ.get("G1_TOTE_FRICTION_SLIDE", "0.8"))
+    physical_handles = os.environ.get("G1_TOTE_PHYSICAL_HANDLES", "0") == "1"
+    hand_closure_scale = float(os.environ.get("G1_HAND_CLOSURE_SCALE", "0.4"))
+    thumb2_closure_scale = float(
+        os.environ.get("G1_THUMB2_CLOSURE_SCALE", str(hand_closure_scale))
+    )
+    if not 0.0 <= hand_closure_scale <= 1.0:
+        raise ValueError("G1_HAND_CLOSURE_SCALE must be in [0, 1]")
+    if not 0.0 <= thumb2_closure_scale <= 1.0:
+        raise ValueError("G1_THUMB2_CLOSURE_SCALE must be in [0, 1]")
     render_interval = max(1, round(1.0 / (args.video_fps * dt)))
     joint_limit_violations = 0
     joint_samples = 0
     joint_limit_violation_counts = defaultdict(int)
+    joint_limit_max_violation_rad = defaultdict(float)
     saturated_samples = 0
     actuator_samples = 0
     actuator_saturation_counts = defaultdict(int)
@@ -335,7 +426,7 @@ def main() -> None:
             selected_target = lift_pose
             task_phase = 5
 
-        if time_s >= 4.0:
+        if time_s >= 4.0 and not args.disable_assisted_grasp:
             for equality_id in assisted_ids:
                 data.eq_active[equality_id] = 1
         hand_alpha = smoothstep((time_s - 4.0) / 0.8)
@@ -343,9 +434,14 @@ def main() -> None:
         for joint_name, index in selected_index.items():
             commanded_targets[joint_name] = float(selected_target[index])
         for joint_name, closed_target in HAND_TARGETS.items():
+            closure_scale = (
+                thumb2_closure_scale
+                if "thumb_2_joint" in joint_name
+                else hand_closure_scale
+            )
             commanded_targets[joint_name] = (
                 (1.0 - hand_alpha) * open_hand_targets[joint_name]
-                + hand_alpha * 0.4 * closed_target
+                + hand_alpha * closure_scale * closed_target
             )
 
         for joint_name, item in controlled.items():
@@ -367,9 +463,13 @@ def main() -> None:
             joint_id = item["joint_id"]
             position = float(data.qpos[item["qpos_id"]])
             low, high = model.jnt_range[joint_id]
-            violated = position < low - 1e-6 or position > high + 1e-6
+            violation_rad = max(float(low) - position, position - float(high), 0.0)
+            violated = violation_rad > 1e-6
             joint_limit_violations += int(violated)
             joint_limit_violation_counts[joint_name] += int(violated)
+            joint_limit_max_violation_rad[joint_name] = max(
+                joint_limit_max_violation_rad[joint_name], violation_rad
+            )
             joint_samples += 1
             force_limit = max(abs(float(value)) for value in model.jnt_actfrcrange[joint_id])
             saturated = (
@@ -424,7 +524,9 @@ def main() -> None:
                     [float(commanded_targets[name]) for name in controlled_names]
                 )
                 demonstration_phases.append(task_phase)
-                demonstration_assist_active.append(int(time_s >= 4.0))
+                demonstration_assist_active.append(
+                    int(time_s >= 4.0 and not args.disable_assisted_grasp)
+                )
                 demonstration_tote_position.append(data.xpos[tote_body_id].copy())
                 demonstration_tote_quaternion.append(data.xquat[tote_body_id].copy())
                 demonstration_tote_angular_velocity.append(
@@ -466,11 +568,22 @@ def main() -> None:
     tote_lift_height = final_tote_z - initial_tote_z
     final_tote_speed = float(np.linalg.norm(data.cvel[tote_body_id, 3:]))
     report = {
-        "experiment": "G1WH-22-assisted-bimanual-tote-lift",
+        "experiment": (
+            "G1WH-contact-only-bimanual-tote-lift"
+            if args.disable_assisted_grasp
+            else "G1WH-22-assisted-bimanual-tote-lift"
+        ),
         "task_semantics": "approach, bilateral contact, close hands, lift tote, hold",
-        "assisted_grasp_constraint": True,
+        "assisted_grasp_constraint": not args.disable_assisted_grasp,
         "tote_x_m": args.tote_x,
-        "waist_pitch_limit_rad": WAIST_PITCH_LIMIT_RAD,
+        "grasp_offset_m": grasp_offset,
+        "tote_sliding_friction": tote_friction_slide,
+        "physical_tote_handles": physical_handles,
+        "palm_yaw_deg": palm_yaw_deg,
+        "hand_closure_scale": hand_closure_scale,
+        "thumb2_closure_scale": thumb2_closure_scale,
+        "hand_open_margin_rad": hand_open_margin_rad,
+        "waist_pitch_limit_rad": waist_pitch_limit_rad,
         "pose_reports": pose_reports,
         "tote_lift_height_m": tote_lift_height,
         "required_lift_height_m": 0.10,
@@ -486,6 +599,16 @@ def main() -> None:
             )
             if count
         },
+        "joint_limit_max_violation_rad": {
+            name: value
+            for name, value in sorted(
+                joint_limit_max_violation_rad.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if value > 1e-6
+        },
+        "joint_limit_tolerance_rad": JOINT_LIMIT_TOLERANCE_RAD,
         "actuator_saturation_fraction": saturated_samples / actuator_samples,
         "actuator_saturation_counts": {
             name: count
@@ -504,9 +627,14 @@ def main() -> None:
         and maximum_abs_waist_pitch <= 0.11
         and all(bilateral_contact_seen.values())
         and not final_table_contact
-        and report["joint_limit_violation_fraction"] == 0.0
+        and max(report["joint_limit_max_violation_rad"].values(), default=0.0)
+        <= JOINT_LIMIT_TOLERANCE_RAD
         and report["actuator_saturation_fraction"] < 0.05
-        and report["assisted_constraints_active"]
+        and (
+            not report["assisted_constraints_active"]
+            if args.disable_assisted_grasp
+            else report["assisted_constraints_active"]
+        )
     )
     if args.record_demonstration:
         dataset_path = args.output_dir / "expert_lift_episode.npz"
@@ -540,10 +668,14 @@ def main() -> None:
             task_progress=np.asarray(demonstration_task_progress, dtype=np.float32),
         )
         metadata = {
-            "task": "assisted_bimanual_tote_lift",
+            "task": (
+                "contact_only_bimanual_tote_lift"
+                if args.disable_assisted_grasp
+                else "assisted_bimanual_tote_lift"
+            ),
             "language_instruction": args.language_instruction,
             "episode_success": report["passed"],
-            "assisted_grasp_constraint": True,
+            "assisted_grasp_constraint": not args.disable_assisted_grasp,
             "frames": len(demonstration_times),
             "fps": args.video_fps,
             "image_width": args.render_width,

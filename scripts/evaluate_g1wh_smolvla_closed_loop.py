@@ -54,7 +54,71 @@ PHASE_INSTRUCTIONS = {
     4: "lift the blue tote upward with both hands",
     5: "hold the blue tote steady in the air",
 }
+PHASE_TIME_BOUNDARIES_S = (0.5, 2.0, 3.0, 4.0, 7.0)
 LOWER_BODY_JOINTS = 12
+
+SOURCE_SCENE_ENV_FIELDS = {
+    "grasp_offset_m": "G1_TOTE_GRASP_OFFSET_M",
+    "tote_sliding_friction": "G1_TOTE_FRICTION_SLIDE",
+    "physical_tote_handles": "G1_TOTE_PHYSICAL_HANDLES",
+    "palm_yaw_deg": "G1_TOTE_PALM_YAW_DEG",
+    "hand_closure_scale": "G1_HAND_CLOSURE_SCALE",
+    "thumb2_closure_scale": "G1_THUMB2_CLOSURE_SCALE",
+    "hand_open_margin_rad": "G1_HAND_OPEN_MARGIN_RAD",
+    "waist_pitch_limit_rad": "G1_WAIST_PITCH_LIMIT_RAD",
+}
+
+
+def effective_waist_pitch_limit_rad() -> float:
+    return float(
+        os.environ.get("G1_WAIST_PITCH_LIMIT_RAD", str(WAIST_PITCH_LIMIT_RAD))
+    )
+
+
+def inherit_source_scene_contract(
+    source_summary: Path, episodes: list[dict]
+) -> dict[str, object]:
+    contracts = []
+    for episode in episodes:
+        episode_dir = Path(episode["episode_dir"])
+        candidates = [
+            episode_dir / "assisted_tote_lift_summary.json",
+            source_summary.parent
+            / episode_dir.name
+            / "assisted_tote_lift_summary.json",
+        ]
+        episode_summary_path = next((path for path in candidates if path.is_file()), None)
+        if episode_summary_path is None:
+            raise FileNotFoundError(
+                f"Missing source episode summary for episode {episode['episode_index']}: "
+                f"{candidates}"
+            )
+        episode_summary = json.loads(episode_summary_path.read_text(encoding="utf-8"))
+        missing = [key for key in SOURCE_SCENE_ENV_FIELDS if key not in episode_summary]
+        if missing:
+            raise ValueError(
+                f"Source episode {episode['episode_index']} lacks scene contract: {missing}"
+            )
+        contract = {key: episode_summary[key] for key in SOURCE_SCENE_ENV_FIELDS}
+        contract["assisted_grasp_constraint"] = episode_summary[
+            "assisted_grasp_constraint"
+        ]
+        contracts.append(contract)
+
+    reference = contracts[0]
+    for episode, contract in zip(episodes[1:], contracts[1:], strict=True):
+        if contract != reference:
+            raise ValueError(
+                "Validation episodes have inconsistent scene contracts; "
+                f"episode {episode['episode_index']} differs from the first episode"
+            )
+    for field, environment_name in SOURCE_SCENE_ENV_FIELDS.items():
+        value = reference[field]
+        if isinstance(value, bool):
+            os.environ[environment_name] = "1" if value else "0"
+        else:
+            os.environ[environment_name] = str(value)
+    return reference
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,6 +163,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-s", type=float, default=10.0)
     parser.add_argument("--assist-distance-m", type=float, default=0.08)
     parser.add_argument(
+        "--disable-assisted-grasp",
+        action="store_true",
+        help=(
+            "Disable the MuJoCo equality grasp entirely. This is the strict "
+            "contact-only learned evaluation mode."
+        ),
+    )
+    parser.add_argument(
         "--assist-solref-timeconst",
         type=float,
         default=0.02,
@@ -106,6 +178,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--align-distance-m", type=float, default=0.12)
     parser.add_argument("--phase-language-scheduler", action="store_true")
+    parser.add_argument(
+        "--contact-only-grasp-dwell-s",
+        type=float,
+        default=0.5,
+        help=(
+            "In strict contact-only mode, require uninterrupted bilateral contact "
+            "for this duration before advancing from close to lift language."
+        ),
+    )
+    parser.add_argument(
+        "--inherit-source-scene-contract",
+        action="store_true",
+        help=(
+            "Recreate the physical scene using the grasp geometry, friction, hand "
+            "and waist settings recorded by every selected source episode."
+        ),
+    )
+    parser.add_argument(
+        "--time-phase-language-scheduler",
+        action="store_true",
+        help="Advance phase-language prompts by fixed time boundaries for an ablation.",
+    )
     parser.add_argument(
         "--hold-action-blend-alpha",
         type=float,
@@ -129,7 +223,30 @@ def parse_args() -> argparse.Namespace:
             "of continuing policy inference."
         ),
     )
+    parser.add_argument(
+        "--terminal-hold-on-lift",
+        action="store_true",
+        help=(
+            "Enter phase 5 and latch the last VLA joint target as soon as the "
+            "measured tote lift reaches the task threshold."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=2707)
+    parser.add_argument(
+        "--policy-noise-scale",
+        type=float,
+        default=1.0,
+        help="Scale of SmolVLA action-sampling noise; zero evaluates its deterministic mean.",
+    )
+    parser.add_argument(
+        "--planner-exploration-noise-scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional SmolVLA noise scale for MPC candidates after candidate 0; "
+            "candidate 0 always uses --policy-noise-scale."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--world-model-checkpoint", type=Path)
     parser.add_argument(
@@ -167,6 +284,31 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Fraction of each hand joint range reserved as a planner safety margin.",
+    )
+    parser.add_argument(
+        "--planner-waist-pitch-safety-margin-rad",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional symmetric waist-pitch margin in radians for MPC scoring "
+            "and candidate screening."
+        ),
+    )
+    parser.add_argument(
+        "--planner-baseline-trust-region-rmse-rad",
+        type=float,
+        default=None,
+        help=(
+            "Maximum RMS joint-action deviation from the first VLA candidate "
+            "that MPC may select. The first candidate is always retained as a "
+            "safe baseline."
+        ),
+    )
+    parser.add_argument(
+        "--planner-max-phase",
+        type=int,
+        default=5,
+        help="Only run WM/MPC while the scheduled language phase is at or below this value.",
     )
     parser.add_argument(
         "--compare-world-model-planner",
@@ -279,9 +421,10 @@ def solve_home_pose(
     qpos_ids = np.asarray([model.jnt_qposadr[joint_id] for joint_id in joint_ids])
     lower = np.asarray([model.jnt_range[joint_id, 0] for joint_id in joint_ids])
     upper = np.asarray([model.jnt_range[joint_id, 1] for joint_id in joint_ids])
+    waist_pitch_limit_rad = effective_waist_pitch_limit_rad()
     for index, name in enumerate(names):
         if name == "waist_pitch_joint":
-            lower[index], upper[index] = -WAIST_PITCH_LIMIT_RAD, WAIST_PITCH_LIMIT_RAD
+            lower[index], upper[index] = -waist_pitch_limit_rad, waist_pitch_limit_rad
         elif name in ("waist_yaw_joint", "waist_roll_joint"):
             lower[index], upper[index] = -0.05, 0.05
     palm_ids = [
@@ -347,12 +490,12 @@ def render_observation(
 
 
 def seeded_noise(
-    policy, seed: int, device: str, batch_size: int = 1
+    policy, seed: int, device: str, batch_size: int = 1, scale: float = 1.0
 ) -> torch.Tensor:
     torch.manual_seed(seed)
     if device.startswith("cuda"):
         torch.cuda.manual_seed_all(seed)
-    return torch.randn(
+    return scale * torch.randn(
         batch_size,
         policy.config.chunk_size,
         policy.config.max_action_dim,
@@ -459,8 +602,22 @@ def select_world_model_candidate(
         for candidate_index in range(planner["candidate_count"])
     ]
     if planner["batched_candidates"]:
+        exploration_scale = planner["exploration_noise_scale"]
         noises = torch.cat(
-            [seeded_noise(policy, seed, device) for seed in candidate_seeds], dim=0
+            [
+                seeded_noise(
+                    policy,
+                    seed,
+                    device,
+                    scale=(
+                        planner["policy_noise_scale"]
+                        if candidate_index == 0 or exploration_scale is None
+                        else exploration_scale
+                    ),
+                )
+                for candidate_index, seed in enumerate(candidate_seeds)
+            ],
+            dim=0,
         )
         raw_batch = (
             policy.predict_action_chunk(
@@ -472,10 +629,21 @@ def select_world_model_candidate(
         )
         raw_candidates.extend(raw_batch)
     else:
-        for seed in candidate_seeds:
+        exploration_scale = planner["exploration_noise_scale"]
+        for candidate_index, seed in enumerate(candidate_seeds):
             raw = (
                 policy.predict_action_chunk(
-                    batch, noise=seeded_noise(policy, seed, device)
+                    batch,
+                    noise=seeded_noise(
+                        policy,
+                        seed,
+                        device,
+                        scale=(
+                            planner["policy_noise_scale"]
+                            if candidate_index == 0 or exploration_scale is None
+                            else exploration_scale
+                        ),
+                    ),
                 )[0]
                 .detach()
                 .cpu()
@@ -486,6 +654,10 @@ def select_world_model_candidate(
     policy_inference_s = time.perf_counter() - inference_started
     horizon = min(planner["horizon"], min(len(item) for item in candidates))
     candidate_actions = np.stack([item[:horizon] for item in candidates]).astype(np.float32)
+    baseline_action = candidate_actions[0]
+    baseline_delta_rmse = np.sqrt(
+        np.mean((candidate_actions - baseline_action[None, :, :]) ** 2, axis=(1, 2))
+    )
     prediction_started = time.perf_counter()
     member_predictions = []
     for model, stats in zip(
@@ -579,6 +751,7 @@ def select_world_model_candidate(
                 "action_clip_rmse_rad": clip_rmse,
                 "predicted_joint_violation_rmse_rad": predicted_violation,
                 "action_smoothness_rmse_rad": smoothness,
+                "baseline_delta_rmse_rad": float(baseline_delta_rmse[index]),
                 "normalized_ensemble_disagreement": float(
                     candidate_uncertainty[index]
                 ),
@@ -593,6 +766,12 @@ def select_world_model_candidate(
         eligible[np.argsort(candidate_uncertainty)[:keep_count]] = True
     elif threshold is not None and len(planner["models"]) > 1:
         eligible = candidate_uncertainty <= threshold
+    trust_region = planner.get("baseline_trust_region_rmse_rad")
+    if trust_region is not None:
+        eligible &= baseline_delta_rmse <= float(trust_region)
+        # Candidate 0 is the exact VLA baseline action for this replan. Keep it
+        # available even when the ensemble rejects every exploratory candidate.
+        eligible[0] = True
     all_candidates_uncertain = not bool(np.any(eligible))
     if all_candidates_uncertain:
         selected = 0
@@ -611,6 +790,8 @@ def select_world_model_candidate(
         "selected_uncertainty": float(candidate_uncertainty[selected]),
         "uncertainty_rejected_fraction": float(np.mean(~eligible)),
         "all_candidates_uncertain": all_candidates_uncertain,
+        "baseline_trust_region_rmse_rad": trust_region,
+        "selected_baseline_delta_rmse_rad": float(baseline_delta_rmse[selected]),
         "candidate_scores": components,
     }
 
@@ -729,11 +910,12 @@ def run_episode(
     upper_upper = np.asarray(
         [model.jnt_range[controlled[name]["joint_id"], 1] for name in upper_names]
     )
+    waist_pitch_limit_rad = effective_waist_pitch_limit_rad()
     for index, name in enumerate(upper_names):
         if name == "waist_pitch_joint":
             upper_lower[index], upper_upper[index] = (
-                -WAIST_PITCH_LIMIT_RAD,
-                WAIST_PITCH_LIMIT_RAD,
+                -waist_pitch_limit_rad,
+                waist_pitch_limit_rad,
             )
         elif name in ("waist_yaw_joint", "waist_roll_joint"):
             upper_lower[index], upper_upper[index] = -0.05, 0.05
@@ -748,6 +930,10 @@ def run_episode(
         margin = margin_fraction * (upper_upper[index] - upper_lower[index])
         planner_lower[index] += margin
         planner_upper[index] -= margin
+        if name == "waist_pitch_joint":
+            waist_margin = args.planner_waist_pitch_safety_margin_rad
+            planner_lower[index] += waist_margin
+            planner_upper[index] -= waist_margin
 
     palm_ids = [
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
@@ -767,8 +953,9 @@ def run_episode(
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, name)
         for name in ("left_assisted_grasp", "right_assisted_grasp")
     ]
-    for equality_id in assisted_ids:
-        model.eq_solref[equality_id] = (args.assist_solref_timeconst, 1.0)
+    if not args.disable_assisted_grasp:
+        for equality_id in assisted_ids:
+            model.eq_solref[equality_id] = (args.assist_solref_timeconst, 1.0)
     initial_tote_z = float(data.site_xpos[tote_site_ids[0], 2])
 
     task_renderer = mujoco.Renderer(model, height=240, width=320)
@@ -812,6 +999,7 @@ def run_episode(
     planner_uncertainty_rejected_fractions = []
     planner_all_candidates_uncertain = 0
     scheduler_phase = 0
+    phase3_bilateral_contact_started_s = None
     hold_latched = False
     phase_history = []
     phase_transitions = []
@@ -836,6 +1024,9 @@ def run_episode(
     hold_assist_position_error_count = 0
     hold_assist_position_error_max_m = 0.0
     started = time.perf_counter()
+    language_scheduler_enabled = (
+        args.phase_language_scheduler or args.time_phase_language_scheduler
+    )
 
     for frame in range(control_frames):
         upper_state = np.asarray(
@@ -843,24 +1034,49 @@ def run_episode(
         )
         chunk_index = frame % args.replan_steps
         if chunk_index == 0:
-            if args.phase_language_scheduler:
+            if language_scheduler_enabled:
                 distances = [
                     np.linalg.norm(data.site_xpos[palm] - data.site_xpos[tote])
                     for palm, tote in zip(palm_ids, tote_site_ids, strict=True)
                 ]
-                if data.time >= 0.5 and scheduler_phase == 0:
-                    scheduler_phase = 1
-                if scheduler_phase in (1, 2):
-                    if max(distances) <= args.assist_distance_m:
-                        scheduler_phase = 3
-                    elif max(distances) <= args.align_distance_m:
-                        scheduler_phase = max(scheduler_phase, 2)
-                if assist_activation_s is not None:
-                    scheduler_phase = max(scheduler_phase, 4)
-                current_lift = float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z
-                if hold_latched or current_lift >= 0.10:
-                    hold_latched = True
-                    scheduler_phase = 5
+                if args.time_phase_language_scheduler:
+                    scheduler_phase = sum(
+                        data.time >= boundary
+                        for boundary in PHASE_TIME_BOUNDARIES_S
+                    )
+                else:
+                    if data.time >= 0.5 and scheduler_phase == 0:
+                        scheduler_phase = 1
+                    if scheduler_phase in (1, 2):
+                        if max(distances) <= args.assist_distance_m:
+                            scheduler_phase = 3
+                        elif max(distances) <= args.align_distance_m:
+                            scheduler_phase = max(scheduler_phase, 2)
+                    if assist_activation_s is not None:
+                        scheduler_phase = max(scheduler_phase, 4)
+                    elif args.disable_assisted_grasp and scheduler_phase == 3:
+                        bilateral_now, _ = contact_state(model, data)
+                        if all(bilateral_now.values()):
+                            if phase3_bilateral_contact_started_s is None:
+                                phase3_bilateral_contact_started_s = float(data.time)
+                            contact_dwell_s = (
+                                float(data.time) - phase3_bilateral_contact_started_s
+                            )
+                            if contact_dwell_s >= args.contact_only_grasp_dwell_s:
+                                scheduler_phase = 4
+                        else:
+                            phase3_bilateral_contact_started_s = None
+                    current_lift = float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z
+                    if hold_latched or current_lift >= 0.10:
+                        hold_latched = True
+                        scheduler_phase = 5
+                if args.terminal_hold_on_lift:
+                    current_lift = (
+                        float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z
+                    )
+                    if hold_latched or current_lift >= 0.10:
+                        hold_latched = True
+                        scheduler_phase = 5
                 task = PHASE_INSTRUCTIONS[scheduler_phase]
                 transition = {
                     "frame": frame,
@@ -890,12 +1106,20 @@ def run_episode(
                     else policy
                 )
                 base_seed = args.seed + episode_index * 10_000 + frame
-                if world_model_planner is None:
+                if (
+                    world_model_planner is None
+                    or scheduler_phase > args.planner_max_phase
+                ):
                     inference_started = time.perf_counter()
                     current_chunk = (
                         active_policy.predict_action_chunk(
                             batch,
-                            noise=seeded_noise(active_policy, base_seed, device),
+                            noise=seeded_noise(
+                                active_policy,
+                                base_seed,
+                                device,
+                                scale=args.policy_noise_scale,
+                            ),
                         )[0]
                         .detach()
                         .cpu()
@@ -963,7 +1187,10 @@ def run_episode(
                     for palm, tote in zip(palm_ids, tote_site_ids, strict=True)
                 ]
                 phase_allows_assist = (
-                    not args.phase_language_scheduler or scheduler_phase >= 3
+                    not args.disable_assisted_grasp
+                    and (
+                        not language_scheduler_enabled or scheduler_phase >= 3
+                    )
                 )
                 if phase_allows_assist and max(distances) <= args.assist_distance_m:
                     for equality_id in assisted_ids:
@@ -1035,7 +1262,7 @@ def run_episode(
                     float(np.max(assist_error)),
                 )
             if (
-                args.phase_language_scheduler
+                language_scheduler_enabled
                 and float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z >= 0.10
             ):
                 hold_latched = True
@@ -1077,7 +1304,7 @@ def run_episode(
         states.append(upper_state.astype(np.float32))
         commands.append(action.astype(np.float32))
         tote_heights.append(float(data.site_xpos[tote_site_ids[0], 2]) - initial_tote_z)
-        phase_history.append(scheduler_phase if args.phase_language_scheduler else -1)
+        phase_history.append(scheduler_phase if language_scheduler_enabled else -1)
 
     writer.close()
     task_renderer.close()
@@ -1100,7 +1327,9 @@ def run_episode(
         "source_episode": episode_index,
         "episode_instruction": episode_instruction,
         "task_mode": (
-            "phase_language_scheduler"
+            "time_phase_language_scheduler"
+            if args.time_phase_language_scheduler
+            else "state_phase_language_scheduler"
             if args.phase_language_scheduler
             else "episode_instruction"
         ),
@@ -1109,12 +1338,15 @@ def run_episode(
             str(phase): phase_history.count(phase)
             for phase in sorted(set(phase_history))
         },
+        "contact_only_grasp_dwell_s": args.contact_only_grasp_dwell_s,
         "tote_x_m": float(episode["tote_x_m"]),
         "control_fps": args.control_fps,
         "replan_steps": args.replan_steps,
+        "policy_noise_scale": args.policy_noise_scale,
         "hold_action_blend_alpha": args.hold_action_blend_alpha,
         "hold_gain_scale": args.hold_gain_scale,
         "terminal_hold_controller": args.terminal_hold_controller,
+        "terminal_hold_on_lift": args.terminal_hold_on_lift,
         "terminal_hold_activation_s": terminal_hold_activation_s,
         "terminal_hold_capture_error_rmse_rad": (
             terminal_hold_capture_error_rmse_rad
@@ -1122,8 +1354,16 @@ def run_episode(
         "action_chunk_size": int(policy.config.chunk_size),
         "assisted_grasp_activation_distance_m": args.assist_distance_m,
         "assisted_grasp_solref_timeconst_s": args.assist_solref_timeconst,
+        "assisted_grasp_enabled": not args.disable_assisted_grasp,
         "assisted_grasp_activated": assist_activation_s is not None,
         "assisted_grasp_activation_s": assist_activation_s,
+        "physical_tote_handles": os.environ.get("G1_TOTE_PHYSICAL_HANDLES", "0")
+        == "1",
+        "grasp_offset_m": float(os.environ.get("G1_TOTE_GRASP_OFFSET_M", "0.295")),
+        "tote_sliding_friction": float(
+            os.environ.get("G1_TOTE_FRICTION_SLIDE", "0.8")
+        ),
+        "waist_pitch_command_limit_rad": waist_pitch_limit_rad,
         "tote_lift_height_m": final_lift,
         "maximum_tote_lift_height_m": max(tote_heights),
         "required_lift_height_m": 0.10,
@@ -1170,6 +1410,17 @@ def run_episode(
             if world_model_planner
             else False
         ),
+        "planner_exploration_noise_scale": (
+            world_model_planner["exploration_noise_scale"]
+            if world_model_planner
+            else None
+        ),
+        "planner_baseline_trust_region_rmse_rad": (
+            world_model_planner["baseline_trust_region_rmse_rad"]
+            if world_model_planner
+            else None
+        ),
+        "planner_max_phase": args.planner_max_phase if world_model_planner else None,
         "planner_body_safety_margin_fraction": (
             args.planner_body_safety_margin_fraction
             if world_model_planner
@@ -1282,7 +1533,11 @@ def run_episode(
         and not final_table_contact
         and report["joint_limit_violation_fraction"] == 0.0
         and report["actuator_saturation_fraction"] < 0.05
-        and report["assisted_grasp_activated"]
+        and (
+            report["assisted_grasp_activated"]
+            if not args.disable_assisted_grasp
+            else not report["assisted_grasp_enabled"]
+        )
     )
     np.savez_compressed(
         output_dir / "trajectory.npz",
@@ -1432,20 +1687,45 @@ def aggregate(reports: list[dict]) -> dict:
 
 def main() -> None:
     args = parse_args()
+    source = json.loads(args.source_summary.read_text(encoding="utf-8"))
+    episodes = source["episodes"][
+        args.validation_start : args.validation_start + args.episodes
+    ]
+    if len(episodes) != args.episodes or not all(item["success"] for item in episodes):
+        raise ValueError("Requested validation episodes are missing or failed")
+    source_scene_contract = None
+    if args.inherit_source_scene_contract:
+        source_scene_contract = inherit_source_scene_contract(
+            args.source_summary.resolve(), episodes
+        )
+        if (
+            args.disable_assisted_grasp
+            and source_scene_contract["assisted_grasp_constraint"]
+        ):
+            raise ValueError(
+                "Strict contact-only evaluation requires contact-only source episodes"
+            )
+    waist_pitch_limit_rad = effective_waist_pitch_limit_rad()
     if args.episodes < 1 or args.control_fps < 1 or args.replan_steps < 1:
         raise ValueError("episodes, control-fps, and replan-steps must be positive")
+    if args.contact_only_grasp_dwell_s < 0.0:
+        raise ValueError("contact-only-grasp-dwell-s must be nonnegative")
     if args.align_distance_m <= args.assist_distance_m:
         raise ValueError("align-distance-m must be larger than assist-distance-m")
     if args.assist_solref_timeconst < 2 * 0.002:
         raise ValueError("assist-solref-timeconst must be at least 0.004 s")
     if not 0.0 < args.hold_action_blend_alpha <= 1.0:
         raise ValueError("hold-action-blend-alpha must be in (0, 1]")
-    if not 0.0 < args.hold_gain_scale <= 1.0:
-        raise ValueError("hold-gain-scale must be in (0, 1]")
-    if args.terminal_hold_controller and not args.phase_language_scheduler:
+    if not 0.0 < args.hold_gain_scale <= 2.0:
+        raise ValueError("hold-gain-scale must be in (0, 2]")
+    if args.terminal_hold_controller and not (
+        args.phase_language_scheduler or args.time_phase_language_scheduler
+    ):
         raise ValueError(
-            "--terminal-hold-controller requires --phase-language-scheduler"
+            "--terminal-hold-controller requires a phase-language scheduler"
         )
+    if args.terminal_hold_on_lift and not args.terminal_hold_controller:
+        raise ValueError("--terminal-hold-on-lift requires --terminal-hold-controller")
     if args.compare_world_model_planner and args.world_model_checkpoint is None:
         raise ValueError(
             "--compare-world-model-planner requires --world-model-checkpoint"
@@ -1499,13 +1779,26 @@ def main() -> None:
         value = getattr(args, name)
         if not 0.0 <= value < 0.5:
             raise ValueError(f"--{name.replace('_', '-')} must be in [0, 0.5)")
+    if not 0.0 <= args.planner_waist_pitch_safety_margin_rad < waist_pitch_limit_rad:
+        raise ValueError(
+            "--planner-waist-pitch-safety-margin-rad must be in "
+            f"[0, {waist_pitch_limit_rad})"
+        )
+    if (
+        args.planner_baseline_trust_region_rmse_rad is not None
+        and args.planner_baseline_trust_region_rmse_rad <= 0.0
+    ):
+        raise ValueError("--planner-baseline-trust-region-rmse-rad must be positive")
+    if args.policy_noise_scale < 0.0:
+        raise ValueError("--policy-noise-scale must be non-negative")
+    if (
+        args.planner_exploration_noise_scale is not None
+        and args.planner_exploration_noise_scale < 0.0
+    ):
+        raise ValueError("--planner-exploration-noise-scale must be non-negative")
+    if not 0 <= args.planner_max_phase <= 5:
+        raise ValueError("--planner-max-phase must be in [0, 5]")
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
-    source = json.loads(args.source_summary.read_text(encoding="utf-8"))
-    episodes = source["episodes"][
-        args.validation_start : args.validation_start + args.episodes
-    ]
-    if len(episodes) != args.episodes or not all(item["success"] for item in episodes):
-        raise ValueError("Requested validation episodes are missing or failed")
     train_meta = LeRobotDatasetMetadata(args.train_repo_id, root=args.train_root)
     expected_upper_names = train_meta.features["action"]["names"]
     specs = checkpoint_specs(args)
@@ -1533,12 +1826,15 @@ def main() -> None:
             "candidate_count": args.world_model_candidates,
             "horizon": args.world_model_horizon,
             "batched_candidates": args.world_model_batched_candidates,
+            "policy_noise_scale": args.policy_noise_scale,
+            "exploration_noise_scale": args.planner_exploration_noise_scale,
             "checkpoint": str(args.world_model_checkpoint),
             "checkpoint_paths": [str(path) for path in checkpoint_paths],
             "uncertainty_threshold": args.world_model_uncertainty_threshold,
             "uncertainty_keep_fraction": (
                 args.world_model_uncertainty_keep_fraction
             ),
+            "baseline_trust_region_rmse_rad": args.planner_baseline_trust_region_rmse_rad,
         }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.skip_standalone and not hybrids:
@@ -1603,8 +1899,8 @@ def main() -> None:
         )
         base_policy = load_policy(specs[base_name], train_meta, device)
         hold_policy = load_policy(specs[hold_name], train_meta, device)
-        if not args.phase_language_scheduler:
-            raise ValueError("Hybrid policies require --phase-language-scheduler")
+        if not (args.phase_language_scheduler or args.time_phase_language_scheduler):
+            raise ValueError("Hybrid policies require a phase-language scheduler")
         all_reports[policy_name] = [
             run_episode(
                 base_policy,
@@ -1626,10 +1922,18 @@ def main() -> None:
         "validation_source_episodes": [item["episode_index"] for item in episodes],
         "control_fps": args.control_fps,
         "replan_steps": args.replan_steps,
+        "policy_noise_scale": args.policy_noise_scale,
+        "planner_exploration_noise_scale": args.planner_exploration_noise_scale,
         "phase_language_scheduler": args.phase_language_scheduler,
+        "time_phase_language_scheduler": args.time_phase_language_scheduler,
+        "assisted_grasp_enabled": not args.disable_assisted_grasp,
+        "source_scene_contract_inherited": args.inherit_source_scene_contract,
+        "source_scene_contract": source_scene_contract,
+        "contact_only_grasp_dwell_s": args.contact_only_grasp_dwell_s,
         "hold_action_blend_alpha": args.hold_action_blend_alpha,
         "hold_gain_scale": args.hold_gain_scale,
         "terminal_hold_controller": args.terminal_hold_controller,
+        "terminal_hold_on_lift": args.terminal_hold_on_lift,
         "world_model_checkpoint": (
             str(args.world_model_checkpoint)
             if args.world_model_checkpoint is not None
@@ -1653,6 +1957,13 @@ def main() -> None:
         "planner_hand_safety_margin_fraction": (
             args.planner_hand_safety_margin_fraction
         ),
+        "planner_waist_pitch_safety_margin_rad": (
+            args.planner_waist_pitch_safety_margin_rad
+        ),
+        "planner_baseline_trust_region_rmse_rad": (
+            args.planner_baseline_trust_region_rmse_rad
+        ),
+        "planner_max_phase": args.planner_max_phase,
         "assist_solref_timeconst_s": args.assist_solref_timeconst,
         "executed_chunk_duration_s": args.replan_steps / args.control_fps,
         "policies": {

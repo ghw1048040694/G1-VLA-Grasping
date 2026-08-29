@@ -12,6 +12,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--inspect-only", action="store_true")
+    parser.add_argument(
+        "--renderer",
+        choices=("RaytracedLighting", "Default"),
+        default=None,
+        help="Override Isaac Sim renderer; headless mode omits the renderer override by default.",
+    )
     parser.add_argument("--warmup-seconds", type=float, default=2.0)
     parser.add_argument("--hold-seconds", type=float, default=3.0)
     return parser.parse_known_args()[0]
@@ -22,14 +28,20 @@ ARGS = parse_args()
 from isaacsim import SimulationApp
 
 
-simulation_app = SimulationApp(
-    {
-        "headless": ARGS.headless,
-        "width": 1280,
-        "height": 720,
-        "renderer": "RaytracedLighting",
-    }
-)
+simulation_config = {
+    "headless": ARGS.headless,
+    "hide_ui": ARGS.headless,
+    "width": 1280,
+    "height": 720,
+}
+# RTX renderer startup itself caused ERROR_DEVICE_LOST on the 8 GiB laptop GPU.
+# Leave Isaac Sim's renderer selection untouched in headless mode unless explicit.
+if ARGS.renderer is not None:
+    simulation_config["renderer"] = ARGS.renderer
+elif not ARGS.headless:
+    simulation_config["renderer"] = "RaytracedLighting"
+
+simulation_app = SimulationApp(simulation_config)
 
 import numpy as np
 import omni.kit.app

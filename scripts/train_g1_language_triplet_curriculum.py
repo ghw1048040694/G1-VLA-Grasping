@@ -52,12 +52,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--total-steps", type=int, default=22000)
     parser.add_argument("--max-frame-exclusive", type=int, default=16)
+    parser.add_argument(
+        "--early-replay-max-frame-exclusive",
+        type=int,
+        default=0,
+        help="Replay frames [0, N) in addition to the full-frame sampler.",
+    )
+    parser.add_argument(
+        "--early-replay-fraction",
+        type=float,
+        default=0.0,
+        help="Target fraction of sampler batches drawn from the early replay range.",
+    )
     parser.add_argument("--save-freq", type=int, default=2000)
     parser.add_argument("--log-freq", type=int, default=20)
     parser.add_argument("--contrastive-margin", type=float, default=0.0)
     parser.add_argument("--contrastive-weight", type=float, default=0.0)
     parser.add_argument("--target-classification-weight", type=float, default=0.0)
     parser.add_argument("--scene-action-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--scene-difference-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for matching pairwise target-action differences within each "
+            "exact-scene triplet."
+        ),
+    )
     parser.add_argument("--unfreeze-vlm-text-layers", type=int, default=0)
     parser.add_argument("--freeze-action-path", action="store_true")
     parser.add_argument("--scene-decoder-only", action="store_true")
@@ -68,7 +89,13 @@ def parse_args() -> argparse.Namespace:
 
 
 class ExactSceneTripletBatchSampler:
-    def __init__(self, episode_data_index: dict, max_frame_exclusive: int):
+    def __init__(
+        self,
+        episode_data_index: dict,
+        max_frame_exclusive: int,
+        early_replay_max_frame_exclusive: int = 0,
+        early_replay_fraction: float = 0.0,
+    ):
         starts = [int(value) for value in episode_data_index["from"]]
         ends = [int(value) for value in episode_data_index["to"]]
         if len(starts) % TARGET_COUNT != 0:
@@ -84,10 +111,33 @@ class ExactSceneTripletBatchSampler:
             for scene_index in range(self.scene_count)
             for frame_index in range(max_frame_exclusive)
         ]
+        self.early_replay_frames = [
+            (scene_index, frame_index)
+            for scene_index in range(self.scene_count)
+            for frame_index in range(early_replay_max_frame_exclusive)
+        ]
+        self.early_replay_fraction = early_replay_fraction
+        self.early_replay_count = (
+            round(
+                len(self.scene_frames)
+                * early_replay_fraction
+                / (1.0 - early_replay_fraction)
+            )
+            if early_replay_fraction > 0.0
+            else 0
+        )
 
     def __iter__(self) -> Iterator[list[int]]:
-        for shuffled_index in torch.randperm(len(self.scene_frames)).tolist():
-            scene_index, frame_index = self.scene_frames[shuffled_index]
+        epoch_frames = list(self.scene_frames)
+        if self.early_replay_count:
+            replay_indices = torch.randint(
+                len(self.early_replay_frames), (self.early_replay_count,)
+            ).tolist()
+            epoch_frames.extend(
+                self.early_replay_frames[index] for index in replay_indices
+            )
+        for shuffled_index in torch.randperm(len(epoch_frames)).tolist():
+            scene_index, frame_index = epoch_frames[shuffled_index]
             episode_start = scene_index * TARGET_COUNT
             yield [
                 self.starts[episode_start + target_index] + frame_index
@@ -95,7 +145,7 @@ class ExactSceneTripletBatchSampler:
             ]
 
     def __len__(self) -> int:
-        return len(self.scene_frames)
+        return len(self.scene_frames) + self.early_replay_count
 
 
 def validate_triplet_batch(batch: dict) -> None:
@@ -143,6 +193,7 @@ def configure_trainable_parameters(
             f"{ADAPTER_NAME}.context_token_proj.",
             f"{ADAPTER_NAME}.target_query_proj.",
             f"{ADAPTER_NAME}.target_scene_action_decoder.",
+            f"{ADAPTER_NAME}.target_classifier.",
         )
         for name, parameter in policy.named_parameters():
             parameter.requires_grad = any(
@@ -190,6 +241,8 @@ def configure_trainable_parameters(
                 f"model.{ADAPTER_NAME}.target_query_proj.bias",
                 f"model.{ADAPTER_NAME}.target_scene_action_decoder.weight",
                 f"model.{ADAPTER_NAME}.target_scene_action_decoder.bias",
+                f"model.{ADAPTER_NAME}.target_classifier.weight",
+                f"model.{ADAPTER_NAME}.target_classifier.bias",
             }
             if context_scene_decoder_only
             else {
@@ -301,6 +354,7 @@ def update_policy_with_shared_flow(
     contrastive_weight: float,
     target_classification_weight: float,
     scene_action_weight: float,
+    scene_difference_weight: float,
     monitored_parameters: list[torch.nn.Parameter],
     scene_decoder_only: bool,
     context_scene_decoder_only: bool,
@@ -349,7 +403,8 @@ def update_policy_with_shared_flow(
             targets,
         )
     scene_action_loss = torch.zeros((), device=device)
-    if scene_action_weight > 0.0:
+    scene_difference_loss = torch.zeros((), device=device)
+    if scene_action_weight > 0.0 or scene_difference_weight > 0.0:
         scene_prediction = (
             policy.model._language_action_context_scene_chunk
             if context_scene_decoder_only
@@ -359,19 +414,37 @@ def update_policy_with_shared_flow(
             {"action": batch["action"]}
         )["action"]
         target_action = policy.prepare_action({"action": normalized_action})
-        scene_losses = F.mse_loss(
-            scene_prediction, target_action, reduction="none"
-        )
-        action_is_pad = batch.get("action_is_pad")
-        if action_is_pad is not None:
-            valid = (~action_is_pad).unsqueeze(-1).expand_as(scene_losses)
-            scene_action_loss = (scene_losses * valid).sum() / valid.sum().clamp_min(1)
-        else:
-            scene_action_loss = scene_losses.mean()
+        if scene_action_weight > 0.0:
+            scene_losses = F.mse_loss(
+                scene_prediction, target_action, reduction="none"
+            )
+            action_is_pad = batch.get("action_is_pad")
+            if action_is_pad is not None:
+                valid = (~action_is_pad).unsqueeze(-1).expand_as(scene_losses)
+                scene_action_loss = (scene_losses * valid).sum() / valid.sum().clamp_min(1)
+            else:
+                scene_action_loss = scene_losses.mean()
+        if scene_difference_weight > 0.0:
+            predicted_differences = torch.stack(
+                [
+                    scene_prediction[left] - scene_prediction[right]
+                    for left, right in ((0, 1), (0, 2), (1, 2))
+                ]
+            )
+            target_differences = torch.stack(
+                [
+                    target_action[left] - target_action[right]
+                    for left, right in ((0, 1), (0, 2), (1, 2))
+                ]
+            )
+            scene_difference_loss = F.mse_loss(
+                predicted_differences, target_differences
+            )
     total_loss = (
         loss
         + target_classification_weight * target_loss
         + scene_action_weight * scene_action_loss
+        + scene_difference_weight * scene_difference_loss
     )
     grad_scaler.scale(total_loss).backward()
     ranking_losses = []
@@ -456,6 +529,7 @@ def update_policy_with_shared_flow(
     )
     tracker.target_loss = float(target_loss.detach())
     tracker.scene_action_loss = float(scene_action_loss.detach())
+    tracker.scene_difference_loss = float(scene_difference_loss.detach())
     return tracker.vlm_grad_norm.val, gradient_audit
 
 
@@ -471,28 +545,46 @@ def main() -> None:
         raise FileExistsError(f"Output directory already exists: {args.output_dir}")
     if args.max_frame_exclusive < 1:
         raise ValueError("--max-frame-exclusive must be positive")
+    if not 0.0 <= args.early_replay_fraction < 1.0:
+        raise ValueError("--early-replay-fraction must be in [0, 1)")
+    if not 0 <= args.early_replay_max_frame_exclusive <= args.max_frame_exclusive:
+        raise ValueError(
+            "--early-replay-max-frame-exclusive must be in "
+            "[0, --max-frame-exclusive]"
+        )
+    if (
+        args.early_replay_fraction > 0.0
+        and args.early_replay_max_frame_exclusive == 0
+    ):
+        raise ValueError(
+            "Positive --early-replay-fraction requires a positive "
+            "--early-replay-max-frame-exclusive"
+        )
     if args.contrastive_margin < 0.0 or args.contrastive_weight < 0.0:
         raise ValueError("Contrastive margin and weight must be non-negative")
     if args.target_classification_weight < 0.0:
         raise ValueError("Target classification weight must be non-negative")
-    if args.scene_action_weight < 0.0:
-        raise ValueError("Scene action weight must be non-negative")
+    if args.scene_action_weight < 0.0 or args.scene_difference_weight < 0.0:
+        raise ValueError("Scene action and difference weights must be non-negative")
     direct_decoder_only = (
         args.scene_decoder_only or args.context_scene_decoder_only
     )
     if args.scene_decoder_only and args.context_scene_decoder_only:
         raise ValueError("Choose only one direct scene decoder mode")
-    if direct_decoder_only and args.scene_action_weight <= 0.0:
-        raise ValueError("Direct scene decoder training requires --scene-action-weight > 0")
+    if direct_decoder_only and (
+        args.scene_action_weight <= 0.0 and args.scene_difference_weight <= 0.0
+    ):
+        raise ValueError(
+            "Direct scene decoder training requires a positive scene loss weight"
+        )
     if direct_decoder_only and args.freeze_action_path:
         raise ValueError("Choose either a direct scene decoder or --freeze-action-path")
     if direct_decoder_only and (
         args.contrastive_weight > 0.0
-        or args.target_classification_weight > 0.0
         or args.unfreeze_vlm_text_layers > 0
     ):
         raise ValueError(
-            "Direct scene decoder training cannot update contrastive, classifier, or VLM paths"
+            "Direct scene decoder training cannot update contrastive or VLM paths"
         )
     if args.unfreeze_vlm_text_layers < 0:
         raise ValueError("--unfreeze-vlm-text-layers must be non-negative")
@@ -520,7 +612,10 @@ def main() -> None:
     logging.info("Creating paired curriculum dataset")
     dataset = make_dataset(cfg)
     sampler = ExactSceneTripletBatchSampler(
-        dataset.episode_data_index, args.max_frame_exclusive
+        dataset.episode_data_index,
+        args.max_frame_exclusive,
+        args.early_replay_max_frame_exclusive,
+        args.early_replay_fraction,
     )
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -544,6 +639,19 @@ def main() -> None:
         "target_order": list(TARGET_NAMES),
         "scene_groups": sampler.scene_count,
         "frame_range": [0, args.max_frame_exclusive - 1],
+        "base_triplets_per_sampler_epoch": len(sampler.scene_frames),
+        "early_replay_frame_range": (
+            [0, args.early_replay_max_frame_exclusive - 1]
+            if args.early_replay_max_frame_exclusive > 0
+            else None
+        ),
+        "requested_early_replay_fraction": args.early_replay_fraction,
+        "early_replay_triplets_per_sampler_epoch": sampler.early_replay_count,
+        "effective_early_replay_fraction": (
+            sampler.early_replay_count / len(sampler)
+            if len(sampler) > 0
+            else 0.0
+        ),
         "triplets_per_sampler_epoch": len(sampler),
         "batch_size": TARGET_COUNT,
         "shared_flow_noise_within_triplet": True,
@@ -552,6 +660,7 @@ def main() -> None:
         "contrastive_weight": args.contrastive_weight,
         "target_classification_weight": args.target_classification_weight,
         "scene_action_weight": args.scene_action_weight,
+        "scene_difference_weight": args.scene_difference_weight,
         "negative_task_shifts": [1, 2] if args.contrastive_weight > 0.0 else [],
         "requested_unfreeze_vlm_text_layers": args.unfreeze_vlm_text_layers,
         "requested_freeze_action_path": args.freeze_action_path,
@@ -638,6 +747,7 @@ def main() -> None:
         "vlm_grad_norm": AverageMeter("vlmg", ":.3f"),
         "target_loss": AverageMeter("tgt", ":.3f"),
         "scene_action_loss": AverageMeter("scene", ":.3f"),
+        "scene_difference_loss": AverageMeter("sdiff", ":.3f"),
     }
     tracker = MetricsTracker(
         TARGET_COUNT,
@@ -674,6 +784,7 @@ def main() -> None:
             args.contrastive_weight,
             args.target_classification_weight,
             args.scene_action_weight,
+            args.scene_difference_weight,
             monitored_parameters,
             args.scene_decoder_only,
             args.context_scene_decoder_only,
@@ -731,6 +842,7 @@ def main() -> None:
             args.contrastive_weight,
             args.target_classification_weight,
             args.scene_action_weight,
+            args.scene_difference_weight,
             monitored_parameters,
             args.scene_decoder_only,
             args.context_scene_decoder_only,

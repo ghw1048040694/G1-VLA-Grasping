@@ -52,6 +52,11 @@ def main() -> None:
     parser.add_argument("--tote-x-min", type=float, default=0.43)
     parser.add_argument("--tote-x-max", type=float, default=0.46)
     parser.add_argument(
+        "--disable-assisted-grasp",
+        action="store_true",
+        help="Collect only episodes with equality grasp constraints disabled.",
+    )
+    parser.add_argument(
         "--resume-successful",
         action="store_true",
         help="Reuse already completed successful episodes in the output directory.",
@@ -87,6 +92,8 @@ def main() -> None:
             args.resume_successful
             and existing_summary
             and existing_summary.get("passed")
+            and bool(existing_summary.get("assisted_grasp_constraint", True))
+            == (not args.disable_assisted_grasp)
             and abs(float(existing_summary.get("tote_x_m", float("inf"))) - tote_x)
             < 1e-12
             and all(path.is_file() for path in required_outputs)
@@ -98,26 +105,29 @@ def main() -> None:
             returncode = 0
         else:
             summary_path.unlink(missing_ok=True)
+            command = [
+                str(args.python),
+                str(args.collector),
+                "--asset",
+                str(args.asset.resolve()),
+                "--output-dir",
+                str(episode_dir),
+                "--tote-x",
+                str(tote_x),
+                "--record-demonstration",
+                "--video-fps",
+                "15",
+                "--render-width",
+                "320",
+                "--render-height",
+                "240",
+                "--language-instruction",
+                instruction,
+            ]
+            if args.disable_assisted_grasp:
+                command.append("--disable-assisted-grasp")
             result = subprocess.run(
-                [
-                    str(args.python),
-                    str(args.collector),
-                    "--asset",
-                    str(args.asset.resolve()),
-                    "--output-dir",
-                    str(episode_dir),
-                    "--tote-x",
-                    str(tote_x),
-                    "--record-demonstration",
-                    "--video-fps",
-                    "15",
-                    "--render-width",
-                    "320",
-                    "--render-height",
-                    "240",
-                    "--language-instruction",
-                    instruction,
-                ],
+                command,
                 check=False,
                 env={**os.environ, "MUJOCO_GL": "egl"},
             )
@@ -160,6 +170,7 @@ def main() -> None:
         "successful_episodes": len(successful),
         "success_rate": len(successful) / args.episodes,
         "tote_x_range_m": [args.tote_x_min, args.tote_x_max],
+        "assisted_grasp_constraint": not args.disable_assisted_grasp,
         "language_variants": list(INSTRUCTIONS),
         "episodes": episodes,
         "successful_manifest": str(manifest_path),

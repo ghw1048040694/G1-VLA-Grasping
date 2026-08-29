@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Raw multi-view temporal VLA with an explicit causal execution-progress memory."""
+from __future__ import annotations
+from pathlib import Path
+import torch
+from torch import nn
+from g1_raw_multiview_servo_vla import ACTION_DIM,ARM_COUNT,TARGET_COUNT,ViewEncoder
+
+class ProgressTemporalVLA(nn.Module):
+ def __init__(self,vocab_size:int,contact_site_dim:int=108,history_frames:int=4,action_chunk:int=8,hidden_dim:int=384):
+  super().__init__();self.vocab_size=vocab_size;self.contact_site_dim=contact_site_dim;self.history_frames=history_frames;self.action_chunk=action_chunk;self.hidden_dim=hidden_dim;self.encoder=ViewEncoder();self.view_embedding=nn.Parameter(torch.randn(3,192)*.02);self.vision=nn.Sequential(nn.Linear(576,320),nn.LayerNorm(320),nn.SiLU());self.text=nn.Embedding(vocab_size,64,padding_idx=0);self.text_context=nn.Sequential(nn.Linear(64,96),nn.SiLU(),nn.Linear(96,96),nn.SiLU());self.proprio=nn.Sequential(nn.Linear(31+31+contact_site_dim+1,224),nn.LayerNorm(224),nn.SiLU());self.pose_progress=nn.Sequential(nn.Linear(10,64),nn.LayerNorm(64),nn.SiLU());self.temporal_input=nn.Sequential(nn.Linear(320+96+224+64,hidden_dim),nn.LayerNorm(hidden_dim),nn.SiLU());self.temporal=nn.GRU(hidden_dim,hidden_dim,2,batch_first=True);self.object_residual=nn.Linear(hidden_dim,9);self.target_head=nn.Linear(96,TARGET_COUNT);self.arm_head=nn.Linear(hidden_dim,ARM_COUNT);self.action_context=nn.Sequential(nn.Linear(hidden_dim+9+ARM_COUNT,hidden_dim),nn.SiLU(),nn.Linear(hidden_dim,hidden_dim),nn.SiLU());self.action_mean_head=nn.Linear(hidden_dim,action_chunk*ACTION_DIM);self.action_log_std_head=nn.Linear(hidden_dim,action_chunk*ACTION_DIM)
+ def forward(self,images,state,velocity,sites,tactile,visual_pose,progress,ids,mask):
+  b,t=images.shape[:2]
+  if images.shape[1]!=self.history_frames or images.shape[2:4]!=(3,3): raise ValueError('Unexpected raw RGB history')
+  pixels=torch.nn.functional.interpolate(images.reshape(b*t*3,3,*images.shape[-2:]).float(),size=(64,96),mode='bilinear',align_corners=False);view=self.encoder(pixels).reshape(b,t,3,-1)+self.view_embedding[None,None];vision=self.vision(view.flatten(2));word=self.text(ids);m=mask.to(word.dtype).unsqueeze(-1);text=self.text_context((word*m).sum(1)/m.sum(1).clamp_min(1));prop=self.proprio(torch.cat((state,velocity,sites,tactile),-1));pp=self.pose_progress(torch.cat((visual_pose,progress),-1));seq=self.temporal_input(torch.cat((vision,text[:,None].expand(-1,t,-1),prop,pp),-1));context=self.temporal(seq)[0][:,-1];object_mean=visual_pose[:,-1]+.25*torch.tanh(self.object_residual(context));arm=self.arm_head(context);act=self.action_context(torch.cat((context,object_mean,arm.softmax(-1)),-1));return {'action_mean':self.action_mean_head(act).reshape(b,self.action_chunk,ACTION_DIM),'action_log_std':self.action_log_std_head(act).reshape(b,self.action_chunk,ACTION_DIM).clamp(-5.,-1.),'object_mean':object_mean,'target_logits':self.target_head(text),'active_arm_logits':arm}
+def save_checkpoint(path:Path,model:ProgressTemporalVLA,vocab,stats):
+ path.parent.mkdir(parents=True,exist_ok=True);torch.save({'model':model.state_dict(),'vocab':vocab,'stats':{k:v.detach().cpu() for k,v in stats.items()},'config':{'vocab_size':model.vocab_size,'contact_site_dim':model.contact_site_dim,'history_frames':model.history_frames,'action_chunk':model.action_chunk,'hidden_dim':model.hidden_dim},'input_contract':'raw RGB x3 + language + state31 + qvel31 + finger sites + tactile + causal execution progress; visual pose is learned from raw RGB','privileged_positions_at_inference':False},path)
+def load_checkpoint(path:Path,device:str):
+ v=torch.load(path,map_location=device,weights_only=False);m=ProgressTemporalVLA(**v['config']).to(device);m.load_state_dict(v['model']);m.eval();return m,v['vocab'],{k:x.to(device) for k,x in v['stats'].items()}

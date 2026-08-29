@@ -20,7 +20,7 @@ CAMERAS = {
 }
 OBJECT_NAMES = ("red_triangle", "yellow_rod", "green_cube")
 LOWER_BODY_JOINTS = 12
-PAIRED_DATASET_CONTRACT_VERSION = "g1lang_dataset_v3_exact_scene_triplets"
+PAIRED_DATASET_CONTRACT_VERSION = "g1lang_dataset_v4_contact_profile_triplets"
 
 
 def parse_args() -> argparse.Namespace:
