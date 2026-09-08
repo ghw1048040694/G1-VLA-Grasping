@@ -49,3 +49,13 @@ The output directory is local runtime data and should not be committed.
 
 Results are not implied by the presence of the scripts; evaluate on held-out
 layouts and report success metrics with the exact model and environment used.
+
+## Demo preview
+
+A small MuJoCo preview is included for a quick visual overview of the
+manipulation scene. It is an illustrative rollout/reference trajectory, not a
+claim of end-to-end VLA benchmark performance.
+
+![G1 grasping rollout](media/g1-grasping-rollout.jpg)
+
+[Download the G1 grasping rollout video](media/g1-grasping-rollout.mp4)
