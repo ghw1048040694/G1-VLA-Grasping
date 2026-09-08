@@ -57,5 +57,3 @@ manipulation scene. It is an illustrative rollout/reference trajectory, not a
 claim of end-to-end VLA benchmark performance.
 
 ![G1 grasping rollout](media/g1-grasping-rollout.jpg)
-
-[Download the G1 grasping rollout video](media/g1-grasping-rollout.mp4)
