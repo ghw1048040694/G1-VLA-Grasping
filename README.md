@@ -1,122 +1,90 @@
-# G1 VLA Grasping
+# Unitree G1 语言驱动双臂抓取与 World Model
 
-**G1 VLA Grasping** is a compact MuJoCo research codebase for language-conditioned object grasping and pick-and-place with the Unitree G1 upper body.
+<p align="center">
+  <strong>多视角视觉 · 语言目标理解 · SmolVLA 动作生成 · 闭环抓取 · Sim2Sim</strong>
+</p>
 
-The project focuses on turning a natural-language instruction such as *“put the yellow rod into the blue box”* into a grounded, contact-aware bimanual manipulation episode.
+<p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white">
+  <img alt="MuJoCo" src="https://img.shields.io/badge/MuJoCo-3.3-00599C">
+  <img alt="LeRobot" src="https://img.shields.io/badge/LeRobot-SmolVLA-FFD21E">
+  <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white">
+  <img alt="Purpose" src="https://img.shields.io/badge/用途-研究与作品展示-6A5ACD">
+</p>
 
-> This is an intentionally small public snapshot. It contains reusable source code and a lightweight visual preview, but no checkpoints, datasets, experiment logs, private robot assets, or machine-specific paths.
+<p align="center">
+  <img src="media/g1-grasping-rollout.jpg" width="820" alt="G1 双臂抓取仿真演示">
+</p>
 
-## What it demonstrates
+面向仓储分拣搬运场景，构建从自然语言指令到 G1 双臂动作执行的完整闭环：机器人读取头部与双腕三路 RGB 图像、语言指令和上半身状态，由 VLA（Vision-Language-Action，视觉-语言-动作模型）生成动作块，经安全约束和滚动重规划后完成目标选择、接近、抓取、抬升与放置。
 
-- **Language grounding** — map an object description to a scene object.
-- **Visual target localization** — use RGB observations to estimate the target in the tabletop scene.
-- **Bimanual reach and grasp** — coordinate arms, palms, fingers, contact geometry, and object-specific closure profiles.
-- **Pick-and-place** — approach, close, transport, and place the selected object into the blue receptacle.
-- **Reproducible episodes** — emit local summaries and optional rendered artifacts for inspection.
-- **Policy integration points** — provide adapters and evaluation entry points without bundling a trained policy.
+## 项目亮点
 
-## Pipeline
+| 模块 | 完成内容 |
+| --- | --- |
+| 多模态输入 | 头部 + 双腕三路 RGB、自然语言指令、31 维腰臂手状态 |
+| 双臂操作 | 面向红色三角体、黄色杆、绿色方块的目标选择与双臂协同操作 |
+| 闭环执行 | Action Chunk 滚动执行、状态反馈、失败轨迹分析与 Recovery/DAgger 数据聚合 |
+| 物理验证 | 43-DoF 资产适配、接触/碰撞/限位检查、MuJoCo → Isaac Sim 的 Sim2Sim 链路 |
+| World Model | 预测接触、掉落、碰撞与关节风险，为 VLA 候选动作提供短时滚动评分 |
 
-```text
-language instruction
-        │
-        ▼
-object selection / RGB target localization
-        │
-        ▼
-reachability and contact-aware target generation
-        │
-        ▼
- bimanual arm + finger actuation
-        │
-        ▼
- grasp → lift → transport → place
-        │
-        ▼
- episode summary / visual inspection
+## 系统架构
+
+```mermaid
+flowchart LR
+    A["三路 RGB"] --> D["SmolVLA"]
+    B["语言指令"] --> D
+    C["31 维机器人状态"] --> D
+    D --> E["50 步 Action Chunk"]
+    E --> F["安全约束与滚动重规划"]
+    F --> G["MuJoCo / Isaac Sim"]
+    G --> H["新图像与新状态"]
+    H --> D
+    G --> I["World Model 风险评估"]
+    I --> F
 ```
 
-The public implementation keeps target generation and actuation explicit so that failures can be inspected in the simulator. Object-specific offsets, hand closure scales, grasp yaw, and collision dimensions are part of the scene contract rather than hidden in a checkpoint.
+## 核心成果
 
-## Public demo
+- 建立三路视觉、语言、31 维状态/动作对齐的 LeRobot 数据合同，完成数据采集、转换、微调和留出集评估链路。
+- 冻结视觉语言主干并微调约 9990 万个动作相关参数；训练损失由 `2.6847` 降至 `0.1251`，留出集动作误差相对基础模型下降 `56.6%～61.3%`。
+- 通过 Action Chunk 重规划与 DAgger 式数据聚合，补充策略真实失败状态下的恢复样本，覆盖减速、重新抬升和稳定持物阶段。
+- 完成 MuJoCo 到 Isaac Sim 的 43-DoF 资产及 31 维动作映射，150 帧 / 10 s 回放关节跟踪 RMSE 为 `0.099 rad`。
 
-A small MuJoCo reference preview is included for a quick visual overview. It is an illustrative rollout, not a claim of end-to-end VLA benchmark performance or real-robot success.
+## 代码导航
 
-![G1 grasping rollout](media/g1-grasping-rollout.jpg)
+| 路径 | 说明 |
+| --- | --- |
+| `scripts/run_g1_language_pick_place.py` | 语言条件双臂抓取与放置主流程 |
+| `scripts/validate_g1_bimanual_actuation.py` | 关节映射、接触、限位与执行器检查 |
+| `scripts/g1_language_action_adapter.py` | 语言、状态与动作空间适配 |
+| `scripts/collect_g1_language_pick_place_dataset.py` | 多视角专家数据采集 |
+| `scripts/evaluate_g1_language_pick_place.py` | 闭环任务评估与结果汇总 |
+| `scripts/g1_finger_contact_geometry.py` | 手指接触几何与抓取配置 |
 
-## Requirements
-
-Install the minimal public runtime dependencies:
+## 快速开始
 
 ```bash
 python3 -m pip install -r requirements.txt
-```
 
-The core simulation uses Python 3.10+, MuJoCo 3.3.x, NumPy, SciPy, ImageIO, and Pillow. Policy evaluation and LeRobot integration require an additional compatible PyTorch/LeRobot environment.
-
-The G1 XML model and mesh assets are not redistributed here. Provide a compatible local scene asset through `--asset`; its mesh paths must resolve on the local machine.
-
-## Quick start
-
-```bash
 python scripts/run_g1_language_pick_place.py \
   --asset /path/to/g1_scene.xml \
   --target-object yellow_rod \
   --output-dir /tmp/g1-language-demo
 ```
 
-The reference scene supports these target identifiers:
-
-```text
-red_triangle
-yellow_rod
-green_cube
-```
-
-Generated files are runtime data and should remain outside the repository.
-
-## Validation and integration entry points
+可选目标：`red_triangle`、`yellow_rod`、`green_cube`。
 
 ```bash
-python scripts/validate_g1_bimanual_actuation.py \
-  --asset /path/to/g1_scene.xml \
-  --output-dir /tmp/g1-actuation-check
-
-python scripts/play_g1_language_episode.py --help
+python scripts/validate_g1_bimanual_actuation.py --help
 python scripts/collect_g1_language_pick_place_dataset.py --help
 python scripts/evaluate_g1_language_pick_place.py --help
 ```
 
-The validation script checks simulator-side actuation, contact, joint-limit, and saturation behavior. Passing it does not establish grasp robustness, policy generalization, or real-hardware safety.
+## 数据与模型
 
-## Repository layout
+公开仓库保留核心代码、接口合同和轻量演示素材。受体积、设备资产与部署安全限制，完整数据集、模型权重、私有机器人资产和训练日志未上传；运行时可通过命令行传入本地资产与输出目录。
 
-| Path | Role |
-| --- | --- |
-| `scripts/run_g1_language_pick_place.py` | Reference language-conditioned pick-and-place episode generator |
-| `scripts/validate_g1_bimanual_actuation.py` | Bimanual actuation and contact checks |
-| `scripts/g1_finger_contact_geometry.py` | Finger/contact-pad geometry helpers |
-| `scripts/g1_language_action_adapter.py` | Optional language/action adapter boundary |
-| `scripts/collect_g1_language_pick_place_dataset.py` | Reproducible local collection wrapper |
-| `scripts/evaluate_g1_language_pick_place.py` | Optional closed-loop evaluation entry point |
-| `scripts/play_g1_language_episode.py` | Local episode viewer |
-| `requirements.txt` | Minimal public Python dependencies |
-| `media/` | Small public preview assets only |
+## 关键词
 
-## Design principles
-
-1. **No privileged target pose in the intended policy path.** Use permitted visual/state observations instead of simulator-only object coordinates.
-2. **Contact is observable and inspectable.** Grasp quality should be checked through contact and object motion, not inferred from a hidden equality constraint.
-3. **Actuation remains explicit.** Gains, targets, limits, and hand closure profiles are inspectable in source.
-4. **Evaluation is separate from training.** Offline loss is not a pick-and-place success metric; use held-out layouts and per-episode outcomes.
-5. **Public code stays small.** Models, datasets, logs, and generated outputs belong in private storage.
-
-## Scope and limitations
-
-This repository covers the G1 upper-body grasping direction. It is not a complete Unitree hardware driver, whole-body locomotion stack, or production deployment package. The reference path is simulator-oriented and depends on a compatible local G1 asset.
-
-Results depend on the exact XML model, mesh versions, actuator parameters, camera calibration, object layout, contact solver settings, and evaluation seed. Do not interpret the demo image or the presence of an evaluation script as a performance claim.
-
-## Reproducibility checklist
-
-For each private experiment, preserve the code/asset revision, object layout, instruction, dynamics and contact settings, controller profile, random seed, per-episode success, grasp retention, placement error, and failure reason. Keep these records in private experiment storage rather than committing them here.
+`Embodied AI` · `VLA` · `SmolVLA` · `LeRobot` · `Bimanual Manipulation` · `World Model` · `MuJoCo` · `Isaac Sim` · `Sim2Sim`
