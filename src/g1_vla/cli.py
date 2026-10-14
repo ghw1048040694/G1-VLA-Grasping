@@ -11,9 +11,9 @@ from pathlib import Path
 from .artifacts import BASELINE_EXPERIMENTS, inventory_artifacts, sha256_file, write_manifest
 from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
-from .runtime.experiment import ExperimentRun, canonical_hash
+from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -55,7 +55,7 @@ def readiness(config):
             "training_enabled": False, "wm_enabled": False, "training_started": False,
             "ready_for_inventory": True, "ready_for_execution": not blockers,
             "checks": checks, "execution_blockers": blockers,
-            "pipeline_status": "Preparation only: physical collection/build/replay/policy evaluation and optimizer runner are not admitted."}
+            "pipeline_status": "Source limits/pairing audits and green-right physical teacher acceptance are admitted; training and policy evaluation remain disabled."}
 
 
 def _protection(inventory):
@@ -66,6 +66,25 @@ def _protection(inventory):
 
 def execute_stage(stage, config, run):
     report = readiness(config)
+    if stage == "limits":
+        from .control_limits import audit_control_limits
+        limits = audit_control_limits(config["paths"]["root"], config)
+        path = run.path / "reports" / "control_limits.json"
+        write_new_json(path, limits)
+        report.update(stage=stage, control_limits=limits, control_limits_path=str(path))
+        return report, limits["status"] == "passed"
+    if stage == "pairing":
+        from .data_pairing import audit_raw_pairing
+        pairing = audit_raw_pairing(config["paths"]["root"], config, run_dir=run.path / "reports")
+        report.update(stage=stage, raw_pairing_summary=pairing["summary"],
+                      raw_pairing_path=str(run.path / "reports" / "raw_pairing.json"),
+                      errors=pairing["errors"], split_leakage=pairing["split_leakage"])
+        return report, not pairing["errors"] and not pairing["split_leakage"]
+    if stage in ("teacher-smoke", "teacher"):
+        from .teacher_acceptance import run_teacher_acceptance
+        acceptance = run_teacher_acceptance(config, run.path, smoke=stage == "teacher-smoke")
+        report.update(stage=stage, teacher_acceptance=acceptance)
+        return report, bool(acceptance["passed"])
     if stage == "inventory":
         scan = list(config["data"]["source_roots"]) + ["resources", ".runtime", "../../notes/Lerobot.md"]
         inventory = inventory_artifacts(config["paths"]["root"], scan_paths=scan, exclude_paths=["outputs/rebuild", ".g1-rebuild", config["artifacts"]["runs_dir"]])

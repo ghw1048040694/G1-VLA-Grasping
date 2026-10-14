@@ -17,6 +17,10 @@ g1-vla experiment --config configs/experiment.json --stage plan
 g1-vla experiment --config configs/experiment.json --stage inventory
 g1-vla experiment --config configs/experiment.json --stage registry
 g1-vla experiment --config configs/experiment.json --stage audit
+g1-vla experiment --config configs/experiment.json --stage limits
+g1-vla experiment --config configs/experiment.json --stage pairing
+MUJOCO_GL=egl g1-vla experiment --config configs/experiment.json --stage teacher-smoke
+MUJOCO_GL=egl g1-vla experiment --config configs/experiment.json --stage teacher
 g1-vla experiment --config configs/experiment.json --stage report
 ```
 
@@ -27,7 +31,10 @@ g1-vla experiment --config configs/experiment.json --stage report
 - `configs/experiment.json` is the only active configuration; unknown or duplicate JSON keys are rejected.
 - Actions are eight future joint targets relative to one planning state, with four commands executed per plan. Joint ordering, normalization and vocabulary are checkpoint compatibility requirements.
 - The historical controller called its rate 15 Hz but advanced 33 physics steps of 0.002 s per command. The configuration records the actual `500/33` Hz cadence separately. No timing change is hidden in the migration.
-- The new adjacent-command speed limit has not been physically audited and remains null. The execution gate refuses incomplete limits. This is not a hardware-calibrated controller.
+- The 31 adjacent-command speed limits come from the observed successful green/right grasp-lift command envelope, rounded upward to 0.01 rad/s. Zero holds the command fixed. This is a simulation command bound, not hardware calibration; `limits` preserves the source audit.
+- `pairing` audits raw observation/command timing without repairing, resampling or clipping historical labels. Old sampled commands cannot prove next actual control-command pairing.
+- `teacher-smoke` checks the historical source position separately; `teacher` runs the predeclared 20 unique layouts in `configs/teacher_layouts.json`. The formal gate requires at least 18/20 strict contact lifts of 0.1 m held for 0.5 s, complete RGB pairs, finite physics and declared joint safety. This local grid does not cover the full workspace.
+- Teacher commands use the same anchored codec, velocity limiter and PD executor. Post-step `mj_forward` synchronizes sensors/FK/contact without advancing time. Raw evidence stays diagnostic with training disabled even when a physical episode passes. Inconsistent eight-step chunks are reported and never clipped into compatible labels.
 - Raw successful and failed episodes, source rollouts, journal and research baselines are protected. Historical caches are not automatically accepted as new training data.
 - Old evaluations become regression evidence. A new independent holdout must be sealed before future model selection.
 - Event metrics separate physical contact, sustained lift, stable released placement and strict safety. An in-box flag or text classification alone cannot establish task success.

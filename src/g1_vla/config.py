@@ -100,10 +100,31 @@ def _limit(value: Any, path: str) -> None:
         _positive(value, path)
 
 
+def _velocity_limit(value: Any, path: str) -> None:
+    values = value if isinstance(value, list) else [value]
+    if isinstance(value, list) and len(value) != 31:
+        _error(path, "joint velocity vector must contain exactly 31 values")
+    for index, item in enumerate(values):
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or item < 0:
+            _error("{}[{}]".format(path, index), "velocity must be finite and non-negative; zero freezes a command")
+
+
 def _hash(value: Any, path: str) -> None:
     _text(value, path)
     if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
         _error(path, "must be a lowercase SHA-256 hex digest")
+
+
+def _finite(value: Any, path: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        _error(path, "must be a finite number")
+
+
+def _triple(value: Any, path: str) -> None:
+    if not isinstance(value, list) or len(value) != 3:
+        _error(path, "must contain three finite numbers")
+    for index, item in enumerate(value):
+        _finite(item, "{}[{}]".format(path, index))
 
 
 def _object(value: Any, schema: Dict[str, Any], path: str) -> None:
@@ -150,7 +171,7 @@ SCHEMA = {
         "physics_substeps": _optional(_positive_integer),
         "body_gain_scale": _positive, "hand_gain_scale": _positive,
         "max_anchor_delta_rad": _optional(_limit),
-        "max_velocity_rad_s": _optional(_limit),
+        "max_velocity_rad_s": _optional(_velocity_limit),
     },
     "action": {
         "protocol": _literal("anchor_relative_target_chunk"),
@@ -164,6 +185,20 @@ SCHEMA = {
         "label_alignment": _literal("next_control_command"),
         "include_restart_wait_labels": _literal(False),
         "separate_waypoint_recovery": _literal(True),
+        "teacher": {
+            "profile": _literal("green_right_recovery_v1"),
+            "grasp_yaw_deg": _finite, "closure_multiplier": _positive,
+            "finger_scale": _triple, "contact_compensation_m": _triple,
+            "pregrasp_height_m": _positive, "pregrasp_lateral_m": _positive,
+            "high_pregrasp_height_m": _positive, "home_settle_s": _positive,
+            "high_approach_s": _positive, "pregrasp_s": _positive,
+            "contact_approach_s": _positive, "close_duration_s": _positive,
+            "grasp_hold_s": _positive, "lift_height_m": _positive,
+            "lift_duration_s": _positive, "final_hold_s": _positive,
+            "adaptive_regrasp": _boolean, "ik_max_error_m": _positive,
+            "record_rgb": _literal(True), "palm_position_tolerance_m": _positive,
+            "joint_target_tolerance_rad": _positive, "phase_timeout_scale": _positive,
+        },
     },
     "data": {
         "registry_path": _text, "source_roots": _strings,
@@ -188,6 +223,7 @@ SCHEMA = {
         "checkpoint": _optional(_text), "layouts_path": _optional(_text),
         "num_layouts": _positive_integer,
         "lift_height_m": _positive, "hold_duration_s": _positive,
+        "joint_limit_tolerance_rad": _positive,
         "assisted_grasp": _literal(False),
         "gates": {"expert_lift_rate": _probability,
                   "policy_contact_rate": _probability,
@@ -246,6 +282,13 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.data.split_group_fields", "must include layout_fingerprint and parent_rollout_id")
     if config["train"]["resume_checkpoint"] and config["train"]["warm_start_checkpoint"]:
         _error("config.train", "resume_checkpoint and warm_start_checkpoint are mutually exclusive")
+    teacher = config["expert"]["teacher"]
+    if any(value <= 0 for value in teacher["finger_scale"]):
+        _error("config.expert.teacher.finger_scale", "must be positive")
+    if teacher["phase_timeout_scale"] < 1:
+        _error("config.expert.teacher.phase_timeout_scale", "must be at least one")
+    if teacher["final_hold_s"] < config["eval"]["hold_duration_s"]:
+        _error("config.expert.teacher.final_hold_s", "must cover the acceptance hold")
     return copy.deepcopy(config)
 
 

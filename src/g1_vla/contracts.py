@@ -75,11 +75,11 @@ def _vector(values: Sequence[float], size: int, name: str) -> Tuple[float, ...]:
     return tuple(result)
 
 
-def _limits(value: Any, size: int, name: str) -> Tuple[float, ...]:
+def _limits(value: Any, size: int, name: str, allow_zero: bool = False) -> Tuple[float, ...]:
     values = [value] * size if isinstance(value, (int, float)) and not isinstance(value, bool) else value
     result = _vector(values, size, name)
-    if any(item <= 0 for item in result):
-        raise ContractError("{} values must be positive".format(name))
+    if any(item < 0 if allow_zero else item <= 0 for item in result):
+        raise ContractError("{} values must be {}".format(name, "non-negative" if allow_zero else "positive"))
     return result
 
 
@@ -99,13 +99,14 @@ class ActionContract:
     hand_gain_scale: float = 6.0
     dynamics_profile: str = "robot_regularized_v1"
     scene_protocol: str = "g1_strict_scene_force_transfer_v1"
+    controller_protocol: str = "g1_pd_substep_feedback_v2"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "joint_names", _joint_names(self.joint_names))
         object.__setattr__(self, "max_anchor_delta_rad", _limits(
             self.max_anchor_delta_rad, 31, "max_anchor_delta_rad"))
         object.__setattr__(self, "max_velocity_rad_s", _limits(
-            self.max_velocity_rad_s, 31, "max_velocity_rad_s"))
+            self.max_velocity_rad_s, 31, "max_velocity_rad_s", allow_zero=True))
         for name in ("control_hz", "physics_dt_s", "body_gain_scale", "hand_gain_scale"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
@@ -117,7 +118,8 @@ class ActionContract:
         actual = (self.protocol, self.history_steps, self.chunk_steps, self.execute_steps, self.anchor)
         if actual != expected or any(isinstance(getattr(self, key), bool) for key in ("history_steps", "chunk_steps", "execute_steps")):
             raise ContractError("rebuild contract requires history=4, chunk=8, execute=4 and one qpos_at_plan anchor")
-        if self.dynamics_profile != "robot_regularized_v1" or self.scene_protocol != "g1_strict_scene_force_transfer_v1":
+        if (self.dynamics_profile != "robot_regularized_v1" or self.scene_protocol != "g1_strict_scene_force_transfer_v1"
+                or self.controller_protocol != "g1_pd_substep_feedback_v2"):
             raise ContractError("execution dynamics/scene protocol differs from the rebuild controller")
 
     @classmethod
@@ -233,6 +235,7 @@ class ActionContract:
             "body_gain_scale": float(self.body_gain_scale),
             "hand_gain_scale": float(self.hand_gain_scale),
             "dynamics_profile": self.dynamics_profile, "scene_protocol": self.scene_protocol,
+            "controller_protocol": self.controller_protocol,
         }
 
     @property

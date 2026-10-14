@@ -42,6 +42,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["paths"]["root"], str(PROJECT))
         self.assertEqual(config["action"]["joint_metadata_path"], str(
             PROJECT / "resources" / "g1_action31_train_root_stub" / "meta" / "info.json"))
+        self.assertEqual(len(ActionContract.from_config(config).max_velocity_rad_s), 31)
+        config["control"]["max_velocity_rad_s"] = None
         with self.assertRaisesRegex(ContractError, "unresolved"):
             ActionContract.from_config(config)
 
@@ -51,6 +53,15 @@ class ConfigTests(unittest.TestCase):
             owner = config if path == "root" else config[path]
             owner["quiet_typo"] = 1
             with self.subTest(path=path), self.assertRaisesRegex(ConfigError, "unknown keys"):
+                validate_config(config)
+
+    def test_velocity_zero_is_hold_and_bad_limits_are_rejected(self):
+        config = config_fixture()
+        config["control"]["max_velocity_rad_s"] = [0.] * 31
+        self.assertEqual(ActionContract.from_config(config, metadata=source_metadata()).max_velocity_rad_s, (0.,) * 31)
+        for values in ([0.] * 30, [-1.] * 31, [float("nan")] * 31):
+            config["control"]["max_velocity_rad_s"] = values
+            with self.subTest(values=values), self.assertRaises(ConfigError):
                 validate_config(config)
 
     def test_train_and_wm_enabled_rejected(self):
@@ -97,6 +108,16 @@ class ConfigTests(unittest.TestCase):
 
 
 class ActionTests(unittest.TestCase):
+    def test_frozen_command_cannot_hide_physical_drift_beyond_anchor(self):
+        config = config_fixture()
+        config["control"]["max_velocity_rad_s"] = [0.] * 31
+        contract = ActionContract.from_config(config, metadata=source_metadata())
+        targets = contract.limit_targets([0.] * 31, [[1.] * 31] * 8, joint_names=contract.joint_names)
+        self.assertEqual(targets, ((0.,) * 31,) * 8)
+        with self.assertRaisesRegex(ContractError, "bounds conflict"):
+            contract.limit_targets([.1] * 31, [[.1] * 31] * 8,
+                                  joint_names=contract.joint_names, previous_target=[0.] * 31)
+
     def test_joint_order_comes_from_source_and_mismatch_fails(self):
         metadata = source_metadata()
         names = read_joint_order(metadata)

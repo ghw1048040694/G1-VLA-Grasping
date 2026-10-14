@@ -51,7 +51,39 @@
     "body_gain_scale": 5,
     "hand_gain_scale": 6,
     "max_anchor_delta_rad": 0.08,
-    "max_velocity_rad_s": null
+    "max_velocity_rad_s": [
+      0.05,
+      0.12,
+      0.34,
+      0.21,
+      0.06,
+      0.21,
+      0.2,
+      0.27,
+      0.23,
+      0.06,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.87,
+      0.29,
+      0.66,
+      2.01,
+      0.56,
+      1.71,
+      0.51,
+      0.6,
+      0.9,
+      1.76,
+      1.47,
+      1.76,
+      1.47,
+      1.76
+    ]
   },
   "action": {
     "protocol": "anchor_relative_target_chunk",
@@ -66,7 +98,40 @@
   "expert": {
     "label_alignment": "next_control_command",
     "include_restart_wait_labels": false,
-    "separate_waypoint_recovery": true
+    "separate_waypoint_recovery": true,
+    "teacher": {
+      "profile": "green_right_recovery_v1",
+      "grasp_yaw_deg": 45.0,
+      "closure_multiplier": 1.2,
+      "finger_scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "contact_compensation_m": [
+        -0.015,
+        -0.03,
+        -0.055
+      ],
+      "pregrasp_height_m": 0.12,
+      "pregrasp_lateral_m": 0.015,
+      "high_pregrasp_height_m": 0.28,
+      "home_settle_s": 0.5,
+      "high_approach_s": 1.8,
+      "pregrasp_s": 0.8,
+      "contact_approach_s": 0.9,
+      "close_duration_s": 0.6,
+      "grasp_hold_s": 0.8,
+      "lift_height_m": 0.22,
+      "lift_duration_s": 2.0,
+      "final_hold_s": 1.0,
+      "adaptive_regrasp": true,
+      "ik_max_error_m": 0.08,
+      "record_rgb": true,
+      "palm_position_tolerance_m": 0.03,
+      "joint_target_tolerance_rad": 0.06,
+      "phase_timeout_scale": 3.0
+    }
   },
   "data": {
     "registry_path": ".g1-rebuild/raw_registry.jsonl",
@@ -99,7 +164,7 @@
   },
   "eval": {
     "checkpoint": null,
-    "layouts_path": null,
+    "layouts_path": "configs/teacher_layouts.json",
     "num_layouts": 20,
     "lift_height_m": 0.1,
     "hold_duration_s": 0.5,
@@ -108,7 +173,8 @@
       "expert_lift_rate": 0.9,
       "policy_contact_rate": 0.9,
       "policy_lift_rate": 0.8
-    }
+    },
+    "joint_limit_tolerance_rad": 0.003
   },
   "artifacts": {
     "runs_dir": ".runtime/rebuild",

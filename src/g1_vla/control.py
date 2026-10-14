@@ -221,7 +221,7 @@ class PDController:
                         raise ControlError("limited command outside mechanical joint range for {}".format(name))
 
     def execute_chunk(self, anchor_qpos: Sequence[float], delta_chunk: Sequence[Sequence[float]],
-                      *, joint_names: Sequence[str]):
+                      *, joint_names: Sequence[str], observer=None, substep_observer=None):
         self.contract.assert_joint_order(joint_names)
         actual_anchor = tuple(float(self.data.qpos[item["qpos_id"]]) for item in self.bindings)
         if len(anchor_qpos) != 31 or any(not math.isclose(_finite(a, "anchor_qpos"), b, abs_tol=1e-7, rel_tol=1e-7)
@@ -230,24 +230,59 @@ class PDController:
         assert_fixed_stance(self.model, self.data, mujoco_api=self.api)
         targets = self.contract.executable_targets(anchor_qpos, delta_chunk, joint_names=joint_names,
                                                    previous_target=self.previous_target)
+        requested = self.contract.decode_chunk(anchor_qpos, delta_chunk, joint_names=joint_names)[:self.contract.execute_steps]
+        return self._execute_targets(targets, requested, joint_names, observer, substep_observer)
+
+    def execute_target(self, requested_target: Sequence[float], *, joint_names: Sequence[str],
+                       observer=None, substep_observer=None):
+        """An expert's one feedback step, through the same codec/limits/PD.
+
+        The model still produces eight anchored targets and executes four.
+        Expert recording observes every command interval rather than holding an
+        unavailable future observation. It never bypasses the command limits.
+        """
+        self.contract.assert_joint_order(joint_names)
+        anchor = tuple(float(self.data.qpos[item["qpos_id"]]) for item in self.bindings)
+        requested = (tuple(requested_target),) * self.contract.chunk_steps
+        encoded = self.contract.encode_chunk(anchor, requested, joint_names=joint_names)
+        limited = self.contract.executable_targets(anchor, encoded, joint_names=joint_names,
+                                                   previous_target=self.previous_target)
+        return self._execute_targets(limited[:1], requested[:1], joint_names, observer, substep_observer)[0]
+
+    def _execute_targets(self, targets, requested, joint_names, observer, substep_observer):
+        assert_fixed_stance(self.model, self.data, mujoco_api=self.api)
         self._validate_joint_ranges(targets)
-        for target in targets:
+        for index, target in enumerate(targets):
+            start_time = float(getattr(self.data, "time", 0.0))
+            if observer is not None:
+                observer(event="before", step_index=index, requested_target=requested[index],
+                         executed_target=target, model=self.model, data=self.data, start_time_s=start_time)
             commanded = map_action_targets(target, joint_names, self.controlled, self.hold_targets)
-            for _ in range(self.cadence.physics_substeps):
+            for substep in range(self.cadence.physics_substeps):
                 for name, item in self.controlled.items():
                     torque = pd_torque(name, commanded[name], self.data.qpos[item["qpos_id"]],
                                        self.data.qvel[item["qvel_id"]], self.data.qfrc_bias[item["qvel_id"]],
                                        body_gain_scale=self.body_gain_scale, hand_gain_scale=self.hand_gain_scale)
                     self.data.ctrl[item["actuator_id"]] = torque
                 self.api.mj_step(self.model, self.data)
-                if any(not math.isfinite(float(value)) for values in (self.data.qpos, self.data.qvel) for value in values):
+                # mj_step integrates qpos/time after evaluating geometry. Refresh
+                # FK/contact/sensors at the new state without advancing time.
+                self.api.mj_forward(self.model, self.data)
+                if any(not math.isfinite(float(value)) for values in (self.data.qpos, self.data.qvel, getattr(self.data, "qacc", ())) for value in values):
                     raise ControlError("MuJoCo became non-finite during physical execution")
+                if substep_observer is not None:
+                    substep_observer(substep_index=substep, control_step_index=index,
+                                     model=self.model, data=self.data)
             self.previous_target = target
+            if observer is not None:
+                observer(event="after", step_index=index, requested_target=requested[index],
+                         executed_target=target, model=self.model, data=self.data, start_time_s=start_time)
         return targets
 
     def metadata(self):
         return {
-            "protocol": "g1_pd_substep_feedback_v1", "profile": "unitree_regularized_robot_only_v1",
+            "protocol": "g1_pd_substep_feedback_v2", "profile": "unitree_regularized_robot_only_v1",
+            "post_step_state_sync": "mj_forward_after_each_mj_step_no_time_advance",
             "nominal_control_hz": self.cadence.nominal_control_hz,
             "actual_control_hz": self.cadence.control_hz,
             "physics_substeps": self.cadence.physics_substeps,

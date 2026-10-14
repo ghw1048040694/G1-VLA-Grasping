@@ -24,6 +24,7 @@ class PreparationCLITests(unittest.TestCase):
         config["action"]["joint_metadata_path"] = "resources/info.json"
         (root / "resources/scene.xml").write_text("<mujoco><worldbody/></mujoco>")
         config["scene"]["asset_path"] = "resources/scene.xml"
+        config["control"]["max_velocity_rad_s"] = None
         path = root / "configs/experiment.json"
         path.write_text(json.dumps(config))
         return root, path

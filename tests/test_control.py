@@ -63,6 +63,10 @@ def fake_control_model():
         state.qpos[model.jnt_qposadr[upper_joint_id]] += 0.001
         state.qfrc_bias[model.jnt_dofadr[upper_joint_id]] += 0.01
     api.mj_step = fake_step
+    api.forward_calls = 0
+    def fake_forward(_model, state):
+        api.forward_calls += 1
+    api.mj_forward = fake_forward
     return model, data, api
 
 
@@ -114,8 +118,10 @@ class ControlTests(unittest.TestCase):
             ControlCadence.from_config(config)
 
     def test_unresolved_speed_blocks_before_mujoco_import(self):
+        config = configuration()
+        config["control"]["max_velocity_rad_s"] = None
         with self.assertRaisesRegex(ContractError, "unresolved"):
-            PDController(None, None, configuration())
+            PDController(None, None, config)
 
     def test_pd_feedback_is_recomputed_each_substep(self):
         model, data, api = fake_control_model()
@@ -125,8 +131,26 @@ class ControlTests(unittest.TestCase):
         targets = controller.execute_chunk([0.0] * 31, [[0.08] * 31] * 8, joint_names=source_joint_names())
         self.assertEqual(len(targets), 4)
         self.assertEqual(len(api.traces), 4 * 33)
+        self.assertEqual(api.forward_calls, 4 * 33)
         self.assertNotEqual(api.traces[0], api.traces[1])
         self.assertTrue(all(abs(value) <= 0.08 for row in targets for value in row))
+
+    def test_expert_one_interval_uses_shared_limits_and_observers(self):
+        model, data, api = fake_control_model()
+        config = configuration()
+        config["control"]["max_velocity_rad_s"] = [1.0] * 30 + [0.0]
+        controller = PDController(model, data, config, mujoco_api=api)
+        events, substeps = [], []
+        target = controller.execute_target([1.0] * 31, joint_names=source_joint_names(),
+            observer=lambda **event: events.append(event),
+            substep_observer=lambda **event: substeps.append(event))
+        self.assertEqual(len(api.traces), 33)
+        self.assertEqual([event["event"] for event in events], ["before", "after"])
+        self.assertEqual(len(substeps), 33)
+        self.assertAlmostEqual(target[0], .066)
+        self.assertEqual(target[-1], 0.)
+        self.assertEqual(events[0]["requested_target"], (1.0,) * 31)
+        self.assertEqual(events[0]["executed_target"], target)
 
     def test_anchor_and_fixed_weld_are_required(self):
         model, data, api = fake_control_model()

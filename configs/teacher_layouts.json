@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "scope": "predeclared 4x5 local table grid surrounding historical green-right recovery; fixed base, green cube only, no training split; not full workspace coverage",
+  "smoke": {
+    "layout_id": "green-right-source-smoke",
+    "positions_m": {
+      "green_cube": [
+        0.31239584,
+        0.01742009,
+        0.795
+      ]
+    }
+  },
+  "layouts": [
+    {
+      "layout_id": "green-right-01",
+      "positions_m": {
+        "green_cube": [
+          0.3,
+          -0.045,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-02",
+      "positions_m": {
+        "green_cube": [
+          0.3,
+          -0.02,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-03",
+      "positions_m": {
+        "green_cube": [
+          0.3,
+          0.005,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-04",
+      "positions_m": {
+        "green_cube": [
+          0.3,
+          0.03,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-05",
+      "positions_m": {
+        "green_cube": [
+          0.3,
+          0.055,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-06",
+      "positions_m": {
+        "green_cube": [
+          0.325,
+          -0.045,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-07",
+      "positions_m": {
+        "green_cube": [
+          0.325,
+          -0.02,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-08",
+      "positions_m": {
+        "green_cube": [
+          0.325,
+          0.005,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-09",
+      "positions_m": {
+        "green_cube": [
+          0.325,
+          0.03,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-10",
+      "positions_m": {
+        "green_cube": [
+          0.325,
+          0.055,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-11",
+      "positions_m": {
+        "green_cube": [
+          0.35,
+          -0.045,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-12",
+      "positions_m": {
+        "green_cube": [
+          0.35,
+          -0.02,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-13",
+      "positions_m": {
+        "green_cube": [
+          0.35,
+          0.005,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-14",
+      "positions_m": {
+        "green_cube": [
+          0.35,
+          0.03,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-15",
+      "positions_m": {
+        "green_cube": [
+          0.35,
+          0.055,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-16",
+      "positions_m": {
+        "green_cube": [
+          0.375,
+          -0.045,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-17",
+      "positions_m": {
+        "green_cube": [
+          0.375,
+          -0.02,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-18",
+      "positions_m": {
+        "green_cube": [
+          0.375,
+          0.005,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-19",
+      "positions_m": {
+        "green_cube": [
+          0.375,
+          0.03,
+          0.795
+        ]
+      }
+    },
+    {
+      "layout_id": "green-right-20",
+      "positions_m": {
+        "green_cube": [
+          0.375,
+          0.055,
+          0.795
+        ]
+      }
+    }
+  ]
+}
