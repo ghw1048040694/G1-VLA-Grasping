@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "paths": {
+    "root": "."
+  },
+  "task": {
+    "name": "green_cube_grasp_rebuild",
+    "mode": "grasp_lift",
+    "object_ids": [
+      "green_cube"
+    ],
+    "hand": "right"
+  },
+  "scene": {
+    "backend": "mujoco",
+    "asset_path": "resources/g1_warehouse_pregrasp.xml",
+    "fixed_stance": true,
+    "assisted_grasp": false,
+    "seed": 42
+  },
+  "observation": {
+    "fields": [
+      "images",
+      "joint_position",
+      "joint_velocity",
+      "finger_sites",
+      "language",
+      "tactile",
+      "timestamp_s",
+      "history"
+    ],
+    "camera_ids": [
+      "head_camera",
+      "left_wrist_camera",
+      "right_wrist_camera"
+    ],
+    "camera_keys": [
+      "observation.images.head",
+      "observation.images.left_wrist",
+      "observation.images.right_wrist"
+    ],
+    "image_width": 96,
+    "image_height": 64,
+    "tactile_definition": "sensor_equivalent"
+  },
+  "control": {
+    "control_hz": 15.151515151515152,
+    "nominal_control_hz": 15,
+    "physics_dt_s": 0.002,
+    "physics_substeps": 33,
+    "body_gain_scale": 5,
+    "hand_gain_scale": 6,
+    "max_anchor_delta_rad": 0.08,
+    "max_velocity_rad_s": null
+  },
+  "action": {
+    "protocol": "anchor_relative_target_chunk",
+    "action_dim": 31,
+    "history_steps": 4,
+    "chunk_steps": 8,
+    "execute_steps": 4,
+    "anchor": "qpos_at_plan",
+    "joint_metadata_path": "resources/g1_action31_train_root_stub/meta/info.json",
+    "joint_order_sha256": "a1ebeba31f134d7b730311b1edcb69344ec85165bfa729f40ab620dd0defc6f1"
+  },
+  "expert": {
+    "label_alignment": "next_control_command",
+    "include_restart_wait_labels": false,
+    "separate_waypoint_recovery": true
+  },
+  "data": {
+    "registry_path": ".g1-rebuild/raw_registry.jsonl",
+    "source_roots": [
+      "outputs"
+    ],
+    "build_dir": "outputs/rebuild/data",
+    "split_group_fields": [
+      "layout_fingerprint",
+      "parent_rollout_id"
+    ],
+    "validation_fraction": 0.2,
+    "test_fraction": 0.2,
+    "seed": 42,
+    "historical_test_role": "regression"
+  },
+  "policy": {
+    "name": "continuous_dagger",
+    "input_boundary": "observation_only",
+    "arm_hand_heads": true
+  },
+  "train": {
+    "enabled": false,
+    "seed": 42,
+    "batch_size": null,
+    "epochs": null,
+    "learning_rate": null,
+    "resume_checkpoint": null,
+    "warm_start_checkpoint": null
+  },
+  "eval": {
+    "checkpoint": null,
+    "layouts_path": null,
+    "num_layouts": 20,
+    "lift_height_m": 0.1,
+    "hold_duration_s": 0.5,
+    "assisted_grasp": false,
+    "gates": {
+      "expert_lift_rate": 0.9,
+      "policy_contact_rate": 0.9,
+      "policy_lift_rate": 0.8
+    }
+  },
+  "artifacts": {
+    "runs_dir": ".runtime/rebuild",
+    "inventory_path": ".g1-rebuild/inventory.json",
+    "protection_manifest_path": ".g1-rebuild/protected-artifacts.json"
+  },
+  "environment": {
+    "python_min": "3.10",
+    "mujoco_expected": "3.2.5",
+    "torch_expected": "2.6.0+cu124",
+    "cuda_expected": "12.4"
+  },
+  "wm": {
+    "enabled": false
+  }
+}

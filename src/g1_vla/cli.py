@@ -1,240 +1,176 @@
-"""Unified lifecycle CLI for the paused G1 VLA project."""
-
+"""One validated configuration and explicit stage for G1 rebuilding."""
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import importlib.metadata
 import json
-import platform
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
 
-from . import __version__
-from .runtime import RunContext, default_runtime_root, workspace_root
-from .runtime.compat import COMPATIBILITY_SCRIPTS, run_compatibility_script
+from .artifacts import BASELINE_EXPERIMENTS, inventory_artifacts, sha256_file, write_manifest
+from .config import ConfigError, load_config
+from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
+from .runtime.experiment import ExperimentRun, canonical_hash
 
-
-def _runtime_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--runtime-root", type=Path, default=default_runtime_root())
-    parser.add_argument("--run-id", help="Explicit run directory name; defaults to a timestamped ID")
-    parser.add_argument("--dry-run", action="store_true", help="Validate and print the plan without writing artifacts")
-    parser.add_argument("--json", action="store_true", help="Print compact JSON")
+STAGES = ("plan", "inventory", "registry", "audit", "report", "collect", "build", "replay", "train", "eval")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="g1-vla", description="G1 VLA lifecycle CLI; the project is currently paused.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    for name, help_text in (
-        ("doctor", "Check environment, assets, checkpoints, and workflow scripts"),
-        ("prepare", "Validate the paused G1 workspace without launching a simulator"),
-        ("smoke", "Parse the warehouse asset and verify the lightweight project contract"),
-    ):
-        command = subparsers.add_parser(name, help=help_text)
-        _runtime_args(command)
-    for name in COMPATIBILITY_SCRIPTS:
-        command = subparsers.add_parser(name, help=f"Run {name} through the recorded compatibility entry point")
-        _runtime_args(command)
-        command.add_argument("extra", nargs=argparse.REMAINDER, help="Arguments forwarded to the existing G1 script")
-    report = subparsers.add_parser("report", help="Summarize completed G1 unified runs")
-    _runtime_args(report)
-    report.add_argument("--limit", type=int, default=20)
+def readiness(config):
+    root = Path(config["paths"]["root"])
+    action = config["action"]
+    checks, blockers = {}, []
+    metadata_path = Path(action["joint_metadata_path"])
+    try:
+        names = read_joint_order(json.loads(metadata_path.read_text(encoding="utf-8")))
+        digest = canonical_sha256(list(names))
+        checks["joint_order"] = {"names": list(names), "sha256": digest, "matches_config": digest == action["joint_order_sha256"]}
+        if not checks["joint_order"]["matches_config"]:
+            blockers.append("Source joint ordering differs from the frozen configuration")
+    except (OSError, ValueError, ContractError) as exc:
+        checks["joint_order"] = {"error": str(exc)}
+        blockers.append("Source joint metadata must be repaired")
+    asset = Path(config["scene"]["asset_path"]) if config["scene"]["asset_path"] else None
+    checks["asset"] = {"path": str(asset) if asset else None, "present": bool(asset and asset.is_file())}
+    if asset and asset.is_file():
+        checks["asset"]["sha256"] = sha256_file(asset)
+    else:
+        blockers.append("Scene asset is missing")
+    try:
+        contract = ActionContract.from_config(config)
+        checks["action_contract"] = {"ready": True, "sha256": contract.contract_sha256, "metadata": contract.metadata()}
+    except (ValueError, ContractError) as exc:
+        checks["action_contract"] = {"ready": False, "reason": str(exc)}
+        blockers.append(str(exc))
+    versions = {}
+    for package in ("numpy", "torch", "mujoco", "scipy", "imageio"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    checks["installed_versions"] = versions
+    checks["cadence"] = {key: config["control"][key] for key in ("nominal_control_hz", "control_hz", "physics_dt_s", "physics_substeps")}
+    checks["registry"] = {"path": config["data"]["registry_path"], "present": Path(config["data"]["registry_path"]).is_file()}
+    return {"schema_version": 1, "project_root": str(root), "configuration_valid": True,
+            "training_enabled": False, "wm_enabled": False, "training_started": False,
+            "ready_for_inventory": True, "ready_for_execution": not blockers,
+            "checks": checks, "execution_blockers": blockers,
+            "pipeline_status": "Preparation only: physical collection/build/replay/policy evaluation and optimizer runner are not admitted."}
+
+
+def _protection(inventory):
+    return {"schema_version": 1, "read_only": True,
+            "records": [row for row in inventory["records"] if row.get("protected")],
+            "inventory_summary": inventory["summary"]}
+
+
+def execute_stage(stage, config, run):
+    report = readiness(config)
+    if stage == "inventory":
+        scan = list(config["data"]["source_roots"]) + ["resources", ".runtime", "../../notes/Lerobot.md"]
+        inventory = inventory_artifacts(config["paths"]["root"], scan_paths=scan, exclude_paths=["outputs/rebuild", ".g1-rebuild", config["artifacts"]["runs_dir"]])
+        # Research weights are slightly above the general large-file cutoff.
+        # Fingerprint these protected anchors without hashing the 24 GiB cache candidates.
+        for row in inventory["records"]:
+            relative = row.get("relative_path") or ""
+            anchor = bool(set(row.get("experiment_ids", [])) & BASELINE_EXPERIMENTS)
+            if relative.startswith("resources/checkpoints/"):
+                row.update({"protected": True, "action": "keep"})
+                row["reasons"].append("Preserve the explicit historical reference checkpoint.")
+                anchor = True
+            if anchor and row.get("kind") == "file" and row.get("sha256") is None:
+                row["sha256"] = sha256_file(row["path"])
+                row["hash_status"] = "complete"
+        inventory_path = run.path / "manifests" / "inventory.json"
+        protected_path = run.path / "manifests" / "protected_artifacts.json"
+        write_manifest(inventory, inventory_path)
+        protection = _protection(inventory)
+        write_manifest(protection, protected_path)
+        for path, value in ((Path(config["artifacts"]["inventory_path"]), inventory),
+                            (Path(config["artifacts"]["protection_manifest_path"]), protection)):
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_manifest(value, path)
+        report.update({"stage": stage, "inventory": inventory["summary"], "inventory_path": str(inventory_path),
+                       "protection_manifest_path": str(protected_path), "errors": inventory["errors"], "deleted_files": 0})
+        return report, not inventory["errors"]
+    if stage == "registry":
+        from .data_ingest import ingest_raw_registry
+        from .data_registry import validate_registry, write_registry
+        data = ingest_raw_registry(config["paths"]["root"])
+        path = run.path / "manifests" / "raw_registry.jsonl"
+        write_registry(data["records"], path)
+        configured = Path(config["data"]["registry_path"])
+        if not configured.exists():
+            configured.parent.mkdir(parents=True, exist_ok=True)
+            write_registry(data["records"], configured)
+        validation = validate_registry(data["records"])
+        report.update({"stage": stage, "registry_path": str(path), "registry": data["summary"],
+                       "validation": validation, "errors": data["errors"], "historical_data_used_for_training": False})
+        return report, not data["errors"] and validation["ok"]
+    if stage == "audit":
+        from .data_registry import read_registry, validate_registry
+        path = Path(config["data"]["registry_path"])
+        if path.is_file():
+            report["registry_validation"] = validate_registry(read_registry(path))
+        report["stage"] = stage
+        report["audit_scope"] = "Configuration, source ordering, checkpoint boundaries and historical registry; no physics steps."
+        return report, report["ready_for_execution"] and report.get("registry_validation", {}).get("ok", False)
+    if stage == "train":
+        from .training import train
+        gate = train(config, run.path)
+        report.update({"stage": stage, "training_gate": gate})
+        return report, False
+    report.update({"stage": stage, "status": "blocked",
+                   "reason": "This preparation phase has no admitted " + stage + " runner. No historical script will be invoked."})
+    return report, False
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="g1-vla", description="G1 rebuild: explicit stages, training disabled")
+    commands = parser.add_subparsers(dest="command", required=True)
+    experiment = commands.add_parser("experiment", help="Use the single validated project configuration")
+    experiment.add_argument("--config", type=Path, required=True)
+    experiment.add_argument("--stage", choices=STAGES, default="plan")
+    experiment.add_argument("--dry-run", action="store_true")
+    experiment.add_argument("--run-id")
+    for alias in ("doctor", "prepare", "smoke", "report"):
+        command = commands.add_parser(alias, help="Read-only preparation alias")
+        command.add_argument("--config", type=Path)
     return parser
 
 
-def _print(payload: Any, compact: bool = False) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=None if compact else 2, default=str))
-
-
-def _context(args: argparse.Namespace, kind: str, config: dict[str, Any]) -> RunContext | None:
-    if args.dry_run:
-        return None
-    return RunContext.create(kind, [sys.executable, *sys.argv], runtime_root=args.runtime_root, run_id=args.run_id, config=config)
-
-
-def _finish(context: RunContext | None, success: bool, summary: dict[str, Any], error: Exception | None = None, *, compact: bool = False) -> int:
-    output = dict(summary)
-    if context is not None:
-        output.update({"run_id": context.run_id, "run_dir": str(context.path)})
-        context.write_summary(output)
-        context.finish(success, error=None if error is None else f"{type(error).__name__}: {error}")
-    _print(output, compact)
-    if error is not None:
-        print(f"g1-vla: {type(error).__name__}: {error}", file=sys.stderr)
-    return 0 if success else 1
-
-
-def _dependency(name: str) -> dict[str, Any]:
-    found = importlib.util.find_spec(name) is not None
-    result: dict[str, Any] = {"installed": found}
-    if found:
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(arguments)
+    root = Path(__file__).resolve().parents[2]
+    config_path = args.config or root / "configs" / "experiment.json"
+    try:
+        config = load_config(config_path)
+        stage = args.stage if args.command == "experiment" else ("report" if args.command == "report" else "plan")
+        if stage == "report":
+            runs = Path(config["artifacts"]["runs_dir"]) / "runs"
+            items = []
+            for path in sorted(runs.glob("*/summary.json"), reverse=True)[:20]:
+                items.append(json.loads(path.read_text(encoding="utf-8")))
+            print(json.dumps({"schema_version": 1, "runs": items, "training_started": False}, ensure_ascii=False, indent=2))
+            return 0
+        if stage == "plan" or getattr(args, "dry_run", False) or args.command != "experiment":
+            report = readiness(config)
+            report.update({"stage": stage, "dry_run": True, "effective_config_sha256": canonical_hash(config)})
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+        run = ExperimentRun(Path(config["paths"]["root"]), Path(config["artifacts"]["runs_dir"]), stage, config,
+                            ["g1-vla", *arguments], getattr(args, "run_id", None))
+        run.begin()
         try:
-            module = __import__(name)
-            result["version"] = getattr(module, "__version__", "unknown")
-        except Exception as exc:  # pragma: no cover - diagnostics only
-            result["import_error"] = f"{type(exc).__name__}: {exc}"
-    return result
-
-
-def _doctor_report() -> dict[str, Any]:
-    root = workspace_root()
-    asset = root / "resources/g1_warehouse_pregrasp.xml"
-    scripts = {name: (root / path).is_file() for name, path in COMPATIBILITY_SCRIPTS.items()}
-    checks = {
-        "python": {"version": platform.python_version(), "required": ">=3.10"},
-        "package": {"version": __version__, "root": str(root)},
-        "dependencies": {"torch": _dependency("torch"), "genesis": _dependency("genesis"), "mujoco": _dependency("mujoco")},
-        "asset": {"path": str(asset), "present": asset.is_file()},
-        "reference_checkpoint": {"path": str(root / "resources/checkpoints/G1LANG-423b_action_token_vla_best.pt"), "present": (root / "resources/checkpoints/G1LANG-423b_action_token_vla_best.pt").is_file()},
-        "compatibility_scripts": scripts,
-        "paused": True,
-    }
-    ready = sys.version_info >= (3, 10) and checks["asset"]["present"] and all(scripts.values())
-    return {"schema": "g1_vla_doctor_v1", "ready_for_lightweight_smoke": bool(ready), "checks": checks}
-
-
-def command_doctor(args: argparse.Namespace) -> int:
-    try:
-        report = _doctor_report()
-        report["dry_run"] = bool(args.dry_run)
-        if args.dry_run:
-            return _finish(None, bool(report["ready_for_lightweight_smoke"]), report, compact=args.json)
-        context = _context(args, "doctor", {})
-        return _finish(context, bool(report["ready_for_lightweight_smoke"]), report, compact=args.json)
-    except Exception as exc:
-        return _finish(None, False, {"schema": "g1_vla_doctor_v1"}, exc, compact=getattr(args, "json", False))
-
-
-def command_smoke(args: argparse.Namespace) -> int:
-    context: RunContext | None = None
-    try:
-        asset = workspace_root() / "resources/g1_warehouse_pregrasp.xml"
-        root = ET.parse(asset).getroot()
-        worldbody = root.find("worldbody")
-        report = {
-            "schema": "g1_vla_lightweight_smoke_v1",
-            "asset": str(asset),
-            "asset_parse": True,
-            "has_worldbody": worldbody is not None,
-            "body_count": len(root.findall(".//body")),
-            "geom_count": len(root.findall(".//geom")),
-            "simulator_launched": False,
-            "paused": True,
-        }
-        success = bool(report["has_worldbody"] and report["body_count"] > 0 and report["geom_count"] > 0)
-        if args.dry_run:
-            report["dry_run"] = True
-            return _finish(None, success, report, compact=args.json)
-        context = _context(args, "smoke", {})
-        return _finish(context, success, report, compact=args.json)
-    except Exception as exc:
-        return _finish(context, False, {"schema": "g1_vla_lightweight_smoke_v1"}, exc, compact=getattr(args, "json", False))
-
-
-def command_prepare(args: argparse.Namespace) -> int:
-    report = _doctor_report()
-    result = {
-        "schema": "g1_vla_prepare_v1",
-        "ready_for_lightweight_smoke": report["ready_for_lightweight_smoke"],
-        "simulator_launched": False,
-        "next": "g1-vla smoke" if report["ready_for_lightweight_smoke"] else "repair the workspace contract",
-        "paused": True,
-    }
-    if args.dry_run:
-        result["dry_run"] = True
-        return _finish(None, bool(result["ready_for_lightweight_smoke"]), result, compact=args.json)
-    context = _context(args, "prepare", {})
-    return _finish(context, bool(result["ready_for_lightweight_smoke"]), result, compact=args.json)
-
-
-def command_compatibility(args: argparse.Namespace) -> int:
-    context: RunContext | None = None
-    try:
-        config = {"forwarded_args": list(args.extra), "compatibility_script": str(COMPATIBILITY_SCRIPTS[args.command]), "paused": True}
-        if args.dry_run:
-            return _finish(None, True, {"schema": "g1_vla_compat_plan_v1", "workflow": args.command, "config": config, "dry_run": True}, compact=args.json)
-        context = _context(args, args.command, config)
-        report = run_compatibility_script(args.command, args.extra, context)
-        return _finish(context, report["exit_code"] == 0, report, compact=args.json)
-    except Exception as exc:
-        return _finish(context, False, {"schema": "g1_vla_compat_run_v1", "workflow": args.command}, exc, compact=getattr(args, "json", False))
-
-
-def command_report(args: argparse.Namespace) -> int:
-    context: RunContext | None = None
-    try:
-        runs_root = args.runtime_root.expanduser().resolve() / "runs"
-        rows = []
-        for path in sorted(runs_root.glob("*/summary.json"), key=lambda value: value.stat().st_mtime, reverse=True) if runs_root.is_dir() else ():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if payload.get("schema") == "g1_vla_report_v1":
-                continue
-            rows.append(payload)
-            if len(rows) >= max(1, args.limit):
-                break
-        report = {"schema": "g1_vla_report_v1", "runs_root": str(runs_root), "count": len(rows), "runs": rows, "paused": True}
-        if args.dry_run:
-            report["dry_run"] = True
-            return _finish(None, True, report, compact=args.json)
-        context = _context(args, "report", {"limit": args.limit})
-        return _finish(context, True, report, compact=args.json)
-    except Exception as exc:
-        return _finish(context, False, {"schema": "g1_vla_report_v1"}, exc, compact=getattr(args, "json", False))
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    raw_args = list(sys.argv[1:] if argv is None else argv)
-    args, unknown = parser.parse_known_args(raw_args)
-    if unknown:
-        if args.command in COMPATIBILITY_SCRIPTS:
-            command_index = raw_args.index(args.command)
-            tail = raw_args[command_index + 1 :]
-            forwarded: list[str] = []
-            runtime_value_options = {"--runtime-root", "--run-id"}
-            index = 0
-            while index < len(tail):
-                token = tail[index]
-                if token == "--dry-run":
-                    args.dry_run = True
-                    index += 1
-                    continue
-                if token == "--json":
-                    args.json = True
-                    index += 1
-                    continue
-                if token in runtime_value_options:
-                    if index + 1 >= len(tail):
-                        parser.error(f"{token} requires a value")
-                    setattr(args, token[2:].replace("-", "_"), Path(tail[index + 1]) if token == "--runtime-root" else tail[index + 1])
-                    index += 2
-                    continue
-                if any(token.startswith(option + "=") for option in runtime_value_options):
-                    option, value = token.split("=", 1)
-                    setattr(args, option[2:].replace("-", "_"), Path(value) if option == "--runtime-root" else value)
-                    index += 1
-                    continue
-                forwarded.append(token)
-                index += 1
-            args.extra = forwarded
-        else:
-            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
-    if args.command == "doctor":
-        return command_doctor(args)
-    if args.command == "prepare":
-        return command_prepare(args)
-    if args.command == "smoke":
-        return command_smoke(args)
-    if args.command in COMPATIBILITY_SCRIPTS:
-        return command_compatibility(args)
-    if args.command == "report":
-        return command_report(args)
-    parser.error(f"Unknown command: {args.command}")
-    return 2
+            report, success = execute_stage(stage, config, run)
+        except Exception as exc:
+            report, success = {"stage": stage, "error": type(exc).__name__ + ": " + str(exc)}, False
+        print(json.dumps(run.finish(report, success), ensure_ascii=False, indent=2))
+        return 0 if success else 2
+    except (ConfigError, ValueError, OSError) as exc:
+        print("g1-vla: " + str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

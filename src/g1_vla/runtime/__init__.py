@@ -1,5 +1,4 @@
-"""Run lifecycle and compatibility adapters for G1 experiments."""
+"""Immutable experiment recording for the rebuild."""
+from .experiment import ExperimentRun, canonical_hash, git_state
 
-from .run_context import RunContext, default_runtime_root, workspace_root
-
-__all__ = ["RunContext", "default_runtime_root", "workspace_root"]
+__all__ = ["ExperimentRun", "canonical_hash", "git_state"]
