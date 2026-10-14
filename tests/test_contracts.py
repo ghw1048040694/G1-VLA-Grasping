@@ -35,9 +35,11 @@ def contract_fixture():
 
 
 class ConfigTests(unittest.TestCase):
-    def test_default_configuration_cannot_train(self):
+    def test_default_native_training_is_conditionally_authorized(self):
         config = load_config(PROJECT / "configs" / "experiment.json")
-        self.assertFalse(config["train"]["enabled"])
+        self.assertTrue(config["train"]["enabled"])
+        self.assertEqual(config["train"]["backend"], "grasp_square_act")
+        self.assertEqual(config["train"]["authorization"], "conditional")
         self.assertFalse(config["wm"]["enabled"])
         self.assertEqual(config["paths"]["root"], str(PROJECT))
         self.assertEqual(config["action"]["joint_metadata_path"], str(
@@ -53,6 +55,22 @@ class ConfigTests(unittest.TestCase):
             owner = config if path == "root" else config[path]
             owner["quiet_typo"] = 1
             with self.subTest(path=path), self.assertRaisesRegex(ConfigError, "unknown keys"):
+                validate_config(config)
+
+    def test_native_split_and_model_cadence_are_not_silent_overrides(self):
+        for change in ("split_overlap", "discovery_episode", "chunk_mismatch", "eval_overlap"):
+            config = config_fixture()
+            if change == "split_overlap":
+                config["source_native"]["split_episode_ids"]["validation"][0] = config["source_native"]["split_episode_ids"]["train"][0]
+            elif change == "discovery_episode":
+                prior = config["source_native"]["episode_ids"][0]
+                config["source_native"]["episode_ids"][0] = 0
+                config["source_native"]["split_episode_ids"]["train"][0] = 0
+            elif change == "chunk_mismatch":
+                config["grasp_act"]["chunk_size"] += 1
+            else:
+                config["grasp_act"]["eval_stride"] = 1
+            with self.subTest(change=change), self.assertRaises(ConfigError):
                 validate_config(config)
 
     def test_velocity_zero_is_hold_and_bad_limits_are_rejected(self):

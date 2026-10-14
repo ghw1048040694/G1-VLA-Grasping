@@ -151,6 +151,7 @@ class PolicyMetadataTest(unittest.TestCase):
 
     def test_training_gate_records_disabled_without_tensor_runtime(self):
         config = load_config(ROOT / "configs/experiment.json")
+        config["train"]["enabled"] = False
         with tempfile.TemporaryDirectory() as temp:
             result = train(config, Path(temp))
             self.assertEqual(result["status"], "disabled")

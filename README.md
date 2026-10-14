@@ -1,6 +1,6 @@
 # G1 VLA Grasping
 
-G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. Training is conditionally authorized and defaults off until an audited backend and dataset split are admitted; world-model optimization remains disabled.
+G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. A bounded source-native ACT trial is conditionally enabled, with verified data, independent splits and measured training memory required before optimization. World-model optimization remains disabled.
 
 ## Workspace
 
@@ -9,6 +9,8 @@ The development directory is `/home/ubuntu/VLA-Learning/projects/G1-VLA-Grasping
 All experiment history and new implementation records belong in `../../notes/Lerobot.md`. This README describes operation and boundaries, not a second experiment journal.
 
 ## Preparation commands
+
+Physical teacher acceptance requires `train.enabled=false`; it preserves the existing no-optimization acceptance boundary. The native ACT trial uses its own explicit backend and stages below. Switching stages does not invoke another stage automatically.
 
 ```bash
 conda activate g1ub_genesis
@@ -33,13 +35,22 @@ External-data and original-policy probes use the isolated audit environment so t
 /home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage weights-audit
 /home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage offline-fetch
 /home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage offline-infer
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage source-native-fetch
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage build
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage grasp-memory
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage train
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage eval
 ```
 
 The official GraspSquare sample uses pinned episodes 0/150/300. Downloads verify exact revisions and LFS hashes. Video probes fetch bounded HTTP ranges and preserve source PTS; range hashes do not claim full-video integrity. When transport fails, `external-reconcile` verifies configured immutable reports against the same full source hashes, sample plan and actual PNG pixels. It requires all 36 planned frames and agrees on duplicate successful frames; it never hides failed attempts or treats partial probes as complete. Data keeps its native 28 dimensions and missing waist values remain missing. Model-source joint geometry supports an identity mapping, while acquisition clocks, calibration and current-task conversion need separate evidence.
 
 The compact ACT probe uses its actual original pizza-box dataset, saved normalization, a complete strict checkpoint load and FP32 CUDA inference. Its 29-state/20-action protocol includes remote axes and binary hand-open commands. The measured output is a compute baseline, without language conditioning, simulated rollout or adaptation to the current 31-joint policy. Large VLA metadata estimates and gated dependencies are reported separately; estimates never count as successful inference.
 
-`plan` and `--dry-run` are read-only. Inventory and registry create exclusive evidence files; they never delete, move or deserialize training artifacts. `train.enabled` is a conditional request, and the current training stage records missing prerequisites without constructing an optimizer. No stage automatically starts training. Collection, dataset build, replay and physical policy evaluation are not yet admitted runners; selecting them returns an explicit blocked result and never invokes historical scripts. Public source-native imitation is a separate candidate pipeline: failure of the current green/right teacher does not invalidate official demonstrations.
+`plan` and `--dry-run` are read-only. Inventory and registry create exclusive evidence files; they never delete, move or deserialize training artifacts. No stage automatically starts training. `train.backend=grasp_square_act` selects the separate source-native build, bounded optimizer and offline evaluation; `current_action31` remains unadmitted for optimization. Collection, replay and physical policy evaluation remain blocked and never invoke historical scripts. Failure of the current green/right teacher does not invalidate official demonstrations.
+
+The native trial predeclares twelve new episodes: six train, three validation and three test, excluding the prior discovery episodes 0/150/300. All four original camera file sets are disjoint between splits; acquisition session and layout independence are unknown. Only the original left head eye is a model input. Complete pinned videos supply every row at 30 Hz, explicitly resized from 640×480 to 320×240, with original 28D float32 state/actions and complete 16-step future windows. Statistics come only from the six training episodes. The recorded task text `camera packaging` is preserved despite its disagreement with the data card.
+
+The small ACT starts from scratch, including its ResNet18 backbone. It does not reuse or pad the pizza-box checkpoint's incompatible 20D action head. `grasp-memory` performs one temporary real forward/backward/AdamW step and the configured evaluation batch, discards its parameters, and binds the observed memory to the exact data/configuration/model code. `train` requires that report and completes at most 200 steps and 1800 seconds with a 7 GiB PyTorch allocator cap. Validation recorded-action MAE selects the checkpoint every 50 steps. `eval` strictly reloads that complete checkpoint and consumes the test split once; state-hold and training-mean baselines use the same targets. These errors do not establish grasp success, language conditioning, real-time control or a 31-joint adapter. Trial checkpoints are new safetensors artifacts and do not provide resume state; existing run directories and checkpoints cannot be overwritten.
 
 ## Contracts and evidence
 

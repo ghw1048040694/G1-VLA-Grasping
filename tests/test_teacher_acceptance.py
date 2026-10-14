@@ -30,6 +30,8 @@ def manifest():
 
 def configuration(root):
     config = load_config(PROJECT / "configs/experiment.json", project_root=root)
+    config["train"]["enabled"] = False
+    config["train"]["backend"] = "current_action31"
     metadata = Path(config["action"]["joint_metadata_path"])
     metadata.parent.mkdir(parents=True)
     metadata.write_text(META.read_text())

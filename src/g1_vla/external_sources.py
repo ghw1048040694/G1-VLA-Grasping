@@ -2,6 +2,7 @@
 from pathlib import Path
 import hashlib
 import json
+import time
 
 from .runtime.experiment import write_new_json
 
@@ -24,14 +25,31 @@ def download_public_files(repo_id, revision, repo_type, filenames, destination, 
     if len(revision) != 40 or any(ch not in "0123456789abcdef" for ch in revision):
         raise SourceError("Public source revision must be pinned")
     api = HfApi(token=False)
-    info = api.repo_info(repo_id, repo_type=repo_type, revision=revision, files_metadata=True)
+    if not filenames or len(filenames) != len(set(filenames)):
+        raise SourceError("Source allowlist must be nonempty and contain no duplicates")
+    retries = []
+    def retry_network(operation, scope):
+        for attempt in range(1, 4):
+            try:
+                return operation()
+            except OSError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500 and status != 429:
+                    raise
+                retries.append({"scope": scope, "attempt": attempt, "error": type(exc).__name__ + ": " + str(exc)})
+                if attempt == 3:
+                    raise
+                time.sleep(attempt)
+    info = retry_network(lambda: api.repo_info(repo_id, repo_type=repo_type, revision=revision, files_metadata=True), "pinned_metadata")
     if info.sha != revision or info.private or info.gated:
         raise SourceError("Expected anonymous, ungated public revision")
     indexed = {row.rfilename: row for row in info.siblings}
     absent = set(filenames) - set(indexed)
     if absent:
         raise SourceError("Missing pinned source files: " + ", ".join(sorted(absent)))
-    planned = sum(indexed[name].size or 0 for name in filenames)
+    if any(not isinstance(indexed[name].size, int) or indexed[name].size <= 0 for name in filenames):
+        raise SourceError("Every selected source file must have a bounded positive metadata size")
+    planned = sum(indexed[name].size for name in filenames)
     if planned <= 0 or planned > max_bytes:
         raise SourceError("Explicit source file list exceeds download budget")
     destination = Path(destination).resolve()
@@ -47,8 +65,8 @@ def download_public_files(repo_id, revision, repo_type, filenames, destination, 
         path = destination / name
         if not path.resolve().is_relative_to(destination) or path.is_symlink():
             raise SourceError("Source destination must stay inside its cache")
-        path = Path(hf_hub_download(repo_id, name, repo_type=repo_type, revision=revision,
-                                   local_dir=destination, token=False))
+        path = Path(retry_network(lambda: hf_hub_download(repo_id, name, repo_type=repo_type, revision=revision,
+                                   local_dir=destination, token=False), name))
         digest = file_sha256(path)
         lfs = expected.lfs
         expected_sha = lfs.sha256 if lfs else None
@@ -59,7 +77,7 @@ def download_public_files(repo_id, revision, repo_type, filenames, destination, 
                         "full_file_verified": True})
     result = {"repo_id": repo_id, "revision": revision, "repo_type": repo_type,
             "anonymous": True, "files": records, "total_bytes": planned,
-            "training_started": False, "training_eligible": False}
+            "training_started": False, "training_eligible": False, "network_retries": retries}
     if not provenance_path.exists():
         write_new_json(provenance_path, result)
     return result
@@ -130,4 +148,55 @@ def fetch_native_policy(config, run_dir):
               "training_started": False, "project_adapter_ready": False,
               "scope": "Original policy input/data only; no GraspSquare-to-native fabrication or closed-loop deployment"}
     write_new_json(Path(run_dir) / "reports" / "offline_fetch.json", result)
+    return result
+
+
+def fetch_source_native_videos(config, run_dir):
+    """Fetch complete selected source-camera shards after a frozen split preflight."""
+    import pyarrow.parquet as pq
+    settings, original = config["source_native"], config["external_data"]
+    verified = verify_download_receipt(original["local_dir"], original["repo_id"], original["revision"], DATA_FILES)
+    source = Path(original["local_dir"])
+    info = json.loads((source / "meta/info.json").read_text())
+    if info["codebase_version"] != "v3.0" or info["fps"] != settings["source_fps"]:
+        raise SourceError("Native source layout/cadence differs from the declared protocol")
+    rows = pq.read_table(source / "meta/episodes/chunk-000/file-000.parquet").to_pylist()
+    indexed = {row["episode_index"]: row for row in rows}
+    if len(indexed) != len(rows) or any(item not in indexed for item in settings["episode_ids"]):
+        raise SourceError("Native episode identities are missing or duplicated")
+    cameras = sorted(key for key, feature in info["features"].items() if feature["dtype"] == "video")
+    if len(cameras) != 4 or settings["camera_key"] not in cameras:
+        raise SourceError("The pinned source must retain its original four camera identities")
+    paths_by_split, episodes, selected_files = {}, [], set()
+    for split, identifiers in settings["split_episode_ids"].items():
+        paths_by_split[split] = set()
+        for identifier in identifiers:
+            row = indexed[identifier]
+            paths = {camera: info["video_path"].format(video_key=camera,
+                        chunk_index=row[f"videos/{camera}/chunk_index"],
+                        file_index=row[f"videos/{camera}/file_index"]) for camera in cameras}
+            paths_by_split[split].update(paths.values())
+            selected_files.add(paths[settings["camera_key"]])
+            if not settings["chunk_steps"] <= row["length"] <= settings["max_episode_rows"]:
+                raise SourceError("Native episode length is outside the declared admission bounds")
+            episodes.append({"episode_id": identifier, "split": split, "rows": row["length"],
+                             "recorded_tasks": row["tasks"], "original_video_paths": paths})
+    for left, right in (("train", "validation"), ("train", "test"), ("validation", "test")):
+        if paths_by_split[left] & paths_by_split[right]:
+            raise SourceError("Native split shares an original camera video file")
+    if sum(row["rows"] for row in episodes) > settings["max_total_rows"]:
+        raise SourceError("Native selected rows exceed the declared bound")
+    plan = {"repo_id": original["repo_id"], "revision": original["revision"],
+            "episode_plan": episodes, "camera_key_used": settings["camera_key"],
+            "complete_video_allowlist": sorted(selected_files), "source_files": verified,
+            "four_camera_file_sets_disjoint": True, "session_independence_proven": False,
+            "max_video_download_bytes": settings["max_video_download_bytes"],
+            "source_metadata_read_only": True, "test_images_decoded": False, "training_started": False}
+    write_new_json(Path(run_dir) / "reports/source_native_plan.json", plan)
+    fetched = download_public_files(original["repo_id"], original["revision"], "dataset", sorted(selected_files),
+                                    settings["video_dir"], settings["max_video_download_bytes"])
+    result = {"status": "complete_verified_source_videos", "plan": plan, "download": fetched,
+              "training_started": False, "current_adapter_ready": False,
+              "scope": "Complete pinned source-camera files, with only declared native episodes admitted to subsequent build."}
+    write_new_json(Path(run_dir) / "reports/source_native_fetch.json", result)
     return result

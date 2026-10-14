@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -53,6 +53,7 @@ def readiness(config):
     checks["registry"] = {"path": config["data"]["registry_path"], "present": Path(config["data"]["registry_path"]).is_file()}
     return {"schema_version": 1, "project_root": str(root), "configuration_valid": True,
             "training_enabled": config["train"]["enabled"], "training_authorization": config["train"]["authorization"],
+            "active_training_backend": config["train"]["backend"],
             "wm_enabled": False, "training_started": False,
             "ready_for_inventory": True, "ready_for_execution": not blockers,
             "checks": checks, "execution_blockers": blockers,
@@ -67,6 +68,28 @@ def _protection(inventory):
 
 def execute_stage(stage, config, run):
     report = readiness(config)
+    if stage == "source-native-fetch":
+        from .external_sources import fetch_source_native_videos
+        fetched = fetch_source_native_videos(config, run.path)
+        report.update(stage=stage, source_native_fetch=fetched)
+        return report, fetched["status"] == "complete_verified_source_videos"
+    if config["train"]["backend"] == "grasp_square_act" and stage == "build":
+        from .grasp_data import build_grasp_square_data
+        built = build_grasp_square_data(config, run.path)
+        report.update(stage=stage, source_native_build=built)
+        return report, built.get("passed") is True
+    if stage == "grasp-memory":
+        from .grasp_act import run_grasp_act_memory
+        measured = run_grasp_act_memory(config, run.path)
+        report.update(stage=stage, grasp_act_memory=measured)
+        return report, measured.get("memory_passed") is True
+    if config["train"]["backend"] == "grasp_square_act" and stage in ("train", "eval"):
+        from .grasp_act import train_grasp_act, eval_grasp_act
+        result = (train_grasp_act if stage == "train" else eval_grasp_act)(config, run.path)
+        report.update(stage=stage, source_native_act=result,
+                      training_started=result.get("training_started", False),
+                      optimizer_steps=result.get("optimizer_steps", 0))
+        return report, result.get("training_passed" if stage == "train" else "evaluation_passed") is True
     if stage in ("external-fetch", "offline-fetch"):
         from .external_sources import fetch_official_sample, fetch_native_policy
         fetched = (fetch_official_sample if stage == "external-fetch" else fetch_native_policy)(config, run.path)

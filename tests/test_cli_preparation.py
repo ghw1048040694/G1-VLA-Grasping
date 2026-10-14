@@ -18,6 +18,8 @@ class PreparationCLITests(unittest.TestCase):
         (root / "configs").mkdir()
         (root / "resources").mkdir()
         config = json.loads((PROJECT / "configs/experiment.json").read_text())
+        config["train"]["enabled"] = False
+        config["train"]["backend"] = "current_action31"
         metadata = PROJECT / "resources/g1_action31_train_root_stub/meta/info.json"
         destination = root / "resources/info.json"
         destination.write_bytes(metadata.read_bytes())
@@ -133,6 +135,34 @@ class PreparationCLITests(unittest.TestCase):
                 self.assertFalse(report["training_started"])
                 finished = json.loads((Path(report["run_dir"]) / "finished.json").read_text())
                 self.assertEqual(finished["status"], "success" if expected == 0 else "failed")
+
+    def test_native_training_preserves_real_optimization_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.make_project(directory)
+            config = json.loads(path.read_text())
+            config["train"]["backend"] = "grasp_square_act"
+            config["train"]["enabled"] = True
+            path.write_text(json.dumps(config))
+            with patch("g1_vla.grasp_act.train_grasp_act", return_value={
+                    "training_passed": True, "training_started": True, "optimizer_steps": 200}):
+                status, report = self.run_cli(["experiment", "--config", str(path), "--stage", "train"])
+            self.assertEqual(status, 0)
+            self.assertTrue(report["training_started"])
+            self.assertEqual(report["optimizer_steps"], 200)
+            self.assertTrue(json.loads((Path(report["run_dir"]) / "finished.json").read_text())["training_started"])
+
+    def test_native_failed_partial_training_is_not_reported_as_no_training(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.make_project(directory)
+            config = json.loads(path.read_text())
+            config["train"]["backend"] = "grasp_square_act"
+            path.write_text(json.dumps(config))
+            with patch("g1_vla.grasp_act.train_grasp_act", return_value={
+                    "training_passed": False, "training_started": True, "optimizer_steps": 12}):
+                status, report = self.run_cli(["experiment", "--config", str(path), "--stage", "train"])
+            self.assertEqual(status, 2)
+            self.assertTrue(report["training_started"])
+            self.assertEqual(report["optimizer_steps"], 12)
 
 
 if __name__ == "__main__":

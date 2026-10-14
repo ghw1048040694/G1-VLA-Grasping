@@ -23,6 +23,17 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ExperimentRun(Path(directory), Path(directory), "plan", {}, [], "../escape")
 
+    def test_real_training_flag_is_preserved_in_summary_and_finish(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = ExperimentRun(root, root / "runtime", "train", {}, [], "trained")
+            run.begin()
+            report = run.finish({"training_started": True, "optimizer_steps": 3}, True)
+            self.assertTrue(report["training_started"])
+            self.assertEqual(report["optimizer_steps"], 3)
+            self.assertTrue(json.loads((run.path / "finished.json").read_text())["training_started"])
+
     def test_config_hash_is_canonical(self):
         self.assertEqual(canonical_hash({"x": 1, "y": 2}), canonical_hash({"y": 2, "x": 1}))
 

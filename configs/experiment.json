@@ -154,11 +154,12 @@
     "arm_hand_heads": true
   },
   "train": {
-    "enabled": false,
-    "seed": 42,
-    "batch_size": null,
+    "enabled": true,
+    "backend": "grasp_square_act",
+    "seed": 20261014,
+    "batch_size": 2,
     "epochs": null,
-    "learning_rate": null,
+    "learning_rate": 0.0001,
     "resume_checkpoint": null,
     "warm_start_checkpoint": null,
     "authorization": "conditional"
@@ -251,5 +252,52 @@
     "warmup_runs": 1,
     "measured_runs": 3,
     "max_download_bytes": 419430400
+  },
+  "source_native": {
+    "backend": "grasp_square_native_v1",
+    "episode_ids": [20, 21, 75, 76, 125, 126, 180, 181, 182, 280, 281, 282],
+    "split_episode_ids": {
+      "train": [20, 21, 75, 76, 125, 126],
+      "validation": [180, 181, 182],
+      "test": [280, 281, 282]
+    },
+    "split_unit": "source_video_file_group",
+    "camera_key": "observation.images.cam_left_high",
+    "source_fps": 30,
+    "chunk_steps": 16,
+    "image_width": 320,
+    "image_height": 240,
+    "image_transform": "bilinear_resize_rgb_v1",
+    "build_dir": ".runtime/rebuild/data/grasp-square-native-stage4-v1",
+    "video_dir": ".runtime/rebuild/external/grasp-square-videos-stage4/c2b44ca4c5f6329d75143613f9f1eada0cf94c62",
+    "timestamp_tolerance_s": 0.0001,
+    "max_episode_rows": 3000,
+    "max_total_rows": 36000,
+    "max_derived_bytes": 3221225472,
+    "max_video_download_bytes": 3221225472
+  },
+  "grasp_act": {
+    "backend": "lerobot_act_grasp_square",
+    "dataset_manifest_path": ".runtime/rebuild/data/grasp-square-native-stage4-v1/manifest.json",
+    "memory_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261014-grasp-memory-01/reports/grasp_act_memory.json",
+    "checkpoint_path": ".runtime/rebuild/runs/G1-REBUILD-20261014-grasp-train-01/checkpoint_best",
+    "device": "cuda",
+    "chunk_size": 16,
+    "dim_model": 256,
+    "n_heads": 8,
+    "dim_feedforward": 1024,
+    "n_encoder_layers": 2,
+    "n_decoder_layers": 2,
+    "n_vae_encoder_layers": 2,
+    "latent_dim": 32,
+    "dropout": 0.1,
+    "weight_decay": 0.0001,
+    "kl_weight": 10,
+    "max_steps": 200,
+    "eval_every_steps": 50,
+    "max_train_wall_s": 1800,
+    "max_gpu_reserved_bytes": 7516192768,
+    "eval_stride": 30,
+    "eval_batch_size": 8
   }
 }

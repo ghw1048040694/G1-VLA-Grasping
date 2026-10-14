@@ -47,6 +47,32 @@ class ExternalSourceTests(unittest.TestCase):
                 download_public_files("owner/repo", "a" * 40, "dataset", ["file"], directory, 100)
             self.assertFalse((Path(directory) / "provenance.json").exists())
 
+    def test_transient_metadata_errors_have_bounded_recorded_retries(self):
+        module, calls, info = self.fixture()
+        attempts = []
+        def metadata(*args, **kwargs):
+            attempts.append(kwargs)
+            if len(attempts) <= 2:
+                raise OSError("transient TLS EOF")
+            return info
+        module.HfApi = lambda **kwargs: SimpleNamespace(repo_info=metadata)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {"huggingface_hub": module}), patch("g1_vla.external_sources.time.sleep"):
+            report = download_public_files("owner/repo", "a" * 40, "dataset", ["file"], directory, 100)
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(len(report["network_retries"]), 2)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(all(row["revision"] == "a" * 40 for row in attempts))
+
+    def test_unbounded_size_or_duplicate_allowlist_precedes_payload(self):
+        module, calls, info = self.fixture()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {"huggingface_hub": module}):
+            with self.assertRaisesRegex(SourceError, "duplicates"):
+                download_public_files("owner/repo", "a" * 40, "dataset", ["file", "file"], directory, 100)
+            info.siblings[0].size = None
+            with self.assertRaisesRegex(SourceError, "bounded"):
+                download_public_files("owner/repo", "a" * 40, "dataset", ["file"], directory, 100)
+            self.assertEqual(calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

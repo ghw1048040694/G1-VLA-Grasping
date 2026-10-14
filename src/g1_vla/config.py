@@ -233,6 +233,7 @@ SCHEMA = {
     },
     "train": {
         "enabled": _boolean, "authorization": _literal("conditional"), "seed": _integer,
+        "backend": _choice("current_action31", "grasp_square_act"),
         "batch_size": _optional(_positive_integer),
         "epochs": _optional(_positive_integer),
         "learning_rate": _optional(_positive),
@@ -276,6 +277,29 @@ SCHEMA = {
         "dataset_dir": _text, "episode_id": _integer, "frame_indices": _indices,
         "device": _literal("cuda"), "warmup_runs": _positive_integer,
         "measured_runs": _positive_integer, "max_download_bytes": _positive_integer,
+    },
+    "source_native": {
+        "backend": _literal("grasp_square_native_v1"), "episode_ids": _indices,
+        "split_episode_ids": {"train": _indices, "validation": _indices, "test": _indices},
+        "split_unit": _literal("source_video_file_group"),
+        "camera_key": _literal("observation.images.cam_left_high"),
+        "source_fps": _literal(30), "chunk_steps": _positive_integer,
+        "image_width": _positive_integer, "image_height": _positive_integer,
+        "image_transform": _literal("bilinear_resize_rgb_v1"),
+        "build_dir": _text, "video_dir": _text, "timestamp_tolerance_s": _positive,
+        "max_episode_rows": _positive_integer, "max_total_rows": _positive_integer,
+        "max_derived_bytes": _positive_integer, "max_video_download_bytes": _positive_integer,
+    },
+    "grasp_act": {
+        "backend": _literal("lerobot_act_grasp_square"), "dataset_manifest_path": _text,
+        "memory_report_path": _text, "checkpoint_path": _text, "device": _literal("cuda"),
+        "chunk_size": _positive_integer, "dim_model": _positive_integer, "n_heads": _positive_integer,
+        "dim_feedforward": _positive_integer, "n_encoder_layers": _positive_integer,
+        "n_decoder_layers": _positive_integer, "n_vae_encoder_layers": _positive_integer,
+        "latent_dim": _positive_integer, "dropout": _probability, "weight_decay": _positive,
+        "kl_weight": _positive, "max_steps": _positive_integer, "eval_every_steps": _positive_integer,
+        "max_train_wall_s": _positive, "max_gpu_reserved_bytes": _positive_integer,
+        "eval_stride": _positive_integer, "eval_batch_size": _positive_integer,
     },
 }
 
@@ -328,6 +352,20 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.expert.teacher.phase_timeout_scale", "must be at least one")
     if teacher["final_hold_s"] < config["eval"]["hold_duration_s"]:
         _error("config.expert.teacher.final_hold_s", "must cover the acceptance hold")
+    native, act = config["source_native"], config["grasp_act"]
+    split_ids = [item for name in ("train", "validation", "test") for item in native["split_episode_ids"][name]]
+    if len(split_ids) != len(set(split_ids)) or set(split_ids) != set(native["episode_ids"]):
+        _error("config.source_native.split_episode_ids", "must partition every selected episode exactly once")
+    if set(native["episode_ids"]) & {0, 150, 300}:
+        _error("config.source_native.episode_ids", "exclude the prior discovery-audit episodes 0/150/300")
+    if native["chunk_steps"] != act["chunk_size"] or native["chunk_steps"] < 2:
+        _error("config.grasp_act.chunk_size", "must agree with the native future horizon and be at least two")
+    if act["dim_model"] % act["n_heads"] or act["dropout"] >= 1:
+        _error("config.grasp_act", "attention dimension must divide into heads and dropout must be below one")
+    if act["eval_every_steps"] > act["max_steps"] or act["eval_stride"] < act["chunk_size"]:
+        _error("config.grasp_act", "validation interval must fit the step budget; evaluation anchors must not overlap future windows")
+    if config["train"]["backend"] == "grasp_square_act" and (config["train"]["resume_checkpoint"] or config["train"]["warm_start_checkpoint"]):
+        _error("config.train", "the admitted native ACT baseline starts from scratch")
     return copy.deepcopy(config)
 
 
@@ -340,6 +378,8 @@ _PATH_FIELDS = {
     "external_data": ("local_dir", "semantic_evidence_path"),
     "public_weights": ("cache_dir",),
     "offline_policy": ("model_dir", "dataset_dir"),
+    "source_native": ("build_dir", "video_dir"),
+    "grasp_act": ("dataset_manifest_path", "memory_report_path", "checkpoint_path"),
 }
 
 
