@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "weights-audit", "offline-fetch", "offline-infer", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -79,6 +79,11 @@ def execute_stage(stage, config, run):
         cameras_complete = (not config["external_data"]["probe_videos"] or
             audited["bounded_video_probes_passed"] == len(config["external_data"]["episode_ids"]) * 4)
         return report, audited["status"] == "passed" and cameras_complete
+    if stage == "external-reconcile":
+        from .external_data import reconcile_official_audits
+        reconciled = reconcile_official_audits(config, run.path)
+        report.update(stage=stage, external_reconciliation=reconciled)
+        return report, reconciled.get("status") == "passed"
     if stage == "weights-audit":
         from .weight_audit import audit_public_weights
         import torch
@@ -177,7 +182,7 @@ def execute_stage(stage, config, run):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="g1-vla", description="G1 rebuild: explicit stages, training disabled")
+    parser = argparse.ArgumentParser(prog="g1-vla", description="G1 rebuild: explicit stages with dataset and execution admission")
     commands = parser.add_subparsers(dest="command", required=True)
     experiment = commands.add_parser("experiment", help="Use the single validated project configuration")
     experiment.add_argument("--config", type=Path, required=True)

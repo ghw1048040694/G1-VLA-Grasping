@@ -210,7 +210,11 @@
       "backend": "pyav_http_range",
       "samples_per_episode": 3,
       "max_read_bytes": 268435456
-    }
+    },
+    "audit_report_paths": [
+      ".runtime/rebuild/runs/G1-REBUILD-20261014-external-audit-final-02/reports/external_data_audit.json",
+      ".runtime/rebuild/runs/G1-REBUILD-20261014-external-audit-02/reports/external_data_audit.json"
+    ]
   },
   "public_weights": {
     "cache_dir": ".runtime/rebuild/external/model-metadata",

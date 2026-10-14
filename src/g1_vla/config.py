@@ -264,6 +264,7 @@ SCHEMA = {
         "episode_ids": _indices, "source_fps": _positive,
         "max_episode_rows": _positive_integer, "max_download_bytes": _positive_integer,
         "timestamp_tolerance_s": _positive, "semantic_evidence_path": _optional(_text),
+        "audit_report_paths": _strings,
         "probe_videos": _boolean,
         "video": {"backend": _literal("pyav_http_range"), "samples_per_episode": _positive_integer,
                   "max_read_bytes": _positive_integer},
@@ -384,4 +385,5 @@ def load_config(path: Union[str, Path], project_root: Optional[Union[str, Path]]
         for key in keys:
             result[section][key] = resolve(result[section][key])
     result["data"]["source_roots"] = [resolve(item) for item in result["data"]["source_roots"]]
+    result["external_data"]["audit_report_paths"] = [resolve(item) for item in result["external_data"]["audit_report_paths"]]
     return result

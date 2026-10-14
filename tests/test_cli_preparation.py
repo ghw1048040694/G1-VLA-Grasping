@@ -122,6 +122,18 @@ class PreparationCLITests(unittest.TestCase):
             self.assertEqual(status, 2)
             self.assertFalse(report["training_started"])
 
+    def test_reconciliation_records_actual_helper_success_and_failure(self):
+        for result, expected in (("passed", 0), ("failed", 2)):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
+                root, path = self.make_project(directory)
+                with patch("g1_vla.external_data.reconcile_official_audits", return_value={
+                        "status": result, "single_run_full_camera_success_claimed": False}):
+                    status, report = self.run_cli(["experiment", "--config", str(path), "--stage", "external-reconcile"])
+                self.assertEqual(status, expected)
+                self.assertFalse(report["training_started"])
+                finished = json.loads((Path(report["run_dir"]) / "finished.json").read_text())
+                self.assertEqual(finished["status"], "success" if expected == 0 else "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

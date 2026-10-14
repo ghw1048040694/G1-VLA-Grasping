@@ -14,7 +14,7 @@ import numpy as np
 from g1_vla.external_data import (
     ExternalDataError, OFFICIAL_REPO, SOURCE_CAMERA_KEYS, SOURCE_JOINT_NAMES,
     SOURCE_TARGET_NAMES, audit_official_sample, camera_mapping, inspect_episode,
-    joint_mapping, read_xml_joint_ranges,
+    joint_mapping, read_xml_joint_ranges, reconcile_official_audits,
 )
 
 
@@ -297,6 +297,224 @@ class ActualParquetTests(unittest.TestCase):
             self.assertEqual(result["action"].dtype, np.float32)
             self.assertEqual(result["timestamp"].dtype, np.float32)
             np.testing.assert_array_equal(result["action"], source["action"])
+
+
+class ExternalReconciliationTests(unittest.TestCase):
+    def _fixture(self, root):
+        config = ExternalDataTests()._fixture(root)
+        config["external_data"]["audit_report_paths"] = [
+            str(root / "newer/reports/external_data_audit.json"),
+            str(root / "earlier/reports/external_data_audit.json")]
+        return config
+
+    def _parquet_mocks(self):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("g1_vla.external_data._parquet_rows",
+            side_effect=lambda path, **kw: [episode_metadata(kw["filters"][0][2])]))
+        stack.enter_context(patch("g1_vla.external_data._parquet_columns",
+            side_effect=lambda path, episode_id: columns(episode_id)))
+        return stack
+
+    def _sample(self, root, episode_id, camera, frame, requested):
+        from PIL import Image
+        color = (episode_id * 30, SOURCE_CAMERA_KEYS.index(camera) * 40, frame * 10)
+        pixels = np.zeros((480, 640, 3), dtype=np.uint8)
+        pixels[:] = color
+        path = root / ("ep{}_{}_{}.png".format(episode_id, camera.rsplit(".", 1)[-1], frame))
+        Image.fromarray(pixels).save(path)
+        ticks = int(round(requested * 30000))
+        decoded = ticks / 30000
+        return {"sample_id": path.stem, "requested_source_pts_s": requested,
+                "decoded_source_pts_s": decoded, "decoded_pts_ticks": ticks,
+                "pts_error_s": abs(requested - decoded), "allowed_pts_error_s": 0.5 / 30 + 1e-6,
+                "width": 640, "height": 480, "pixel_format": "rgb24",
+                "rgb_sha256": hashlib.sha256(pixels.tobytes()).hexdigest(),
+                "png_path": str(path), "png_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    def _original(self, config, root, name, failed=None):
+        with self._parquet_mocks():
+            report = audit_official_sample(config, root / name)
+        passed = 0
+        used_bytes = 0
+        for episode in report["episodes"]:
+            for video in episode["videos"]:
+                successful = (episode["episode_id"], video["camera_key"]) != failed
+                samples = [self._sample(root / name / "official_samples", episode["episode_id"], video["camera_key"], frame, pts)
+                    for frame, pts in zip(video["source_frame_indices_sampled"], video["expected_source_pts_s"])]
+                video["probe"] = {"repo_id": config["external_data"]["repo_id"], "revision": config["external_data"]["revision"],
+                    "video_path": video["source_video_path"], "passed": successful,
+                    "status": "sampled_format_and_pts_passed" if successful else "blocked",
+                    "samples": samples if successful else samples[:2], "errors": [] if successful else ["transport failure"],
+                    "full_video_sha256": None, "sensor_clock_synchronization_proven": False,
+                    "stream": {"width": 640, "height": 480, "average_fps": 30.0,
+                        "codec_id": 225, "expected_codec_id": 225, "encoded_codec": "av1",
+                        "encoded_codec_verified_by_id": True, "time_base_s": 1 / 30000},
+                    "http_range_receipts": [{"start_byte": 0, "requested_end_byte": 31,
+                        "response_content_range": "bytes 0-31/1048576", "source_size_bytes": 1048576,
+                        "http_status": 206, "etag": '"immutable-fixture"', "attempt": 1,
+                        "full_file_checksum": False, "end_byte": 31, "downloaded_bytes": 32,
+                        "sha256": hashlib.sha256(b"R" * 32).hexdigest(), "complete": True}],
+                    "read_bytes": 32, "budget_used_bytes": used_bytes + 32,
+                    "budget_max_read_bytes": config["external_data"]["video"]["max_read_bytes"],
+                    "source_size_bytes": 1048576}
+                used_bytes += 32
+                passed += successful
+        report["bounded_video_probes_passed"] = passed
+        path = root / name / "reports/external_data_audit.json"
+        path.write_text(json.dumps(report))
+        return path, report
+
+    def _complete_join(self, root):
+        config = self._fixture(root)
+        first, first_report = self._original(config, root, "newer", failed=(0, SOURCE_CAMERA_KEYS[0]))
+        second, second_report = self._original(config, root, "earlier", failed=(2, SOURCE_CAMERA_KEYS[2]))
+        return config, first, first_report, second, second_report
+
+    def _run(self, root, config):
+        with self._parquet_mocks():
+            return reconcile_official_audits(config, root / "joined")
+
+    def test_complete_join_rechecks_36_pixels_and_preserves_two_11_of_12_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, first, first_report, second, second_report = self._complete_join(root)
+            first_sha, second_sha = hashlib.sha256(first.read_bytes()).hexdigest(), hashlib.sha256(second.read_bytes()).hexdigest()
+            # An older report can predate cache-receipt verification, but its
+            # actual source hashes and saved raw rows must independently match.
+            second_report.pop("source_receipt_verified")
+            second.write_text(json.dumps(second_report))
+            second_sha = hashlib.sha256(second.read_bytes()).hexdigest()
+            result = self._run(root, config)
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(result["consolidated_camera_triplets_passed"], 12)
+            self.assertEqual(result["consolidated_frame_samples_passed"], 36)
+            self.assertEqual([report["original_camera_passed"] for report in result["original_reports"]], [11, 11])
+            self.assertFalse(result["single_run_full_camera_success_claimed"])
+            self.assertFalse(result["sensor_clock_synchronization_proven"])
+            self.assertFalse(result["training_eligible"])
+            self.assertEqual(hashlib.sha256(first.read_bytes()).hexdigest(), first_sha)
+            self.assertEqual(hashlib.sha256(second.read_bytes()).hexdigest(), second_sha)
+            self.assertTrue((root / "joined/reports/external_reconciliation.json").is_file())
+
+    def test_wrong_pin_and_source_hash_reports_cannot_supply_missing_camera(self):
+        for key, mutation in (("pin", lambda value: value.__setitem__("revision", "b" * 40)),
+                              ("hash", lambda value: value["source_file_sha256"].__setitem__("meta/info.json", "0" * 64))):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config, first, first_report, second, second_report = self._complete_join(root)
+                mutation(second_report)
+                second.write_text(json.dumps(second_report))
+                result = self._run(root, config)
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(result["original_reports"][1]["usable"])
+
+    def test_failed_probe_even_with_three_frames_cannot_supply_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, first, first_report, second, second_report = self._complete_join(root)
+            missing = second_report["episodes"][0]["videos"][0]["probe"]
+            missing["passed"] = False
+            second_report["bounded_video_probes_passed"] -= 1
+            second.write_text(json.dumps(second_report))
+            result = self._run(root, config)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["consolidated_camera_triplets_passed"], 11)
+
+    def test_missing_camera_and_changed_frame_plan_are_rejected(self):
+        for mutation in (lambda value: value["episodes"][0]["videos"].pop(),
+                         lambda value: value["episodes"][0]["videos"][0]["source_frame_indices_sampled"].__setitem__(1, 3)):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config, first, first_report, second, second_report = self._complete_join(root)
+                mutation(second_report)
+                second.write_text(json.dumps(second_report))
+                result = self._run(root, config)
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(result["original_reports"][1]["usable"])
+
+    def test_duplicate_valid_camera_with_conflicting_rgb_is_not_joined(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, first, first_report, second, second_report = self._complete_join(root)
+            from PIL import Image
+            sample = second_report["episodes"][0]["videos"][1]["probe"]["samples"][0]
+            pixels = np.full((480, 640, 3), 251, dtype=np.uint8)
+            path = Path(sample["png_path"])
+            Image.fromarray(pixels).save(path)
+            sample["png_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            sample["rgb_sha256"] = hashlib.sha256(pixels.tobytes()).hexdigest()
+            second.write_text(json.dumps(second_report))
+            result = self._run(root, config)
+            self.assertEqual(result["status"], "failed")
+            self.assertTrue(any("Conflicting" in error for error in result["errors"]))
+
+    def test_corrupt_saved_png_and_saved_npz_cannot_be_reconciled(self):
+        for kind in ("png", "npz"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config, first, first_report, second, second_report = self._complete_join(root)
+                path = (Path(second_report["episodes"][0]["videos"][0]["probe"]["samples"][0]["png_path"])
+                        if kind == "png" else root / "earlier" / second_report["episodes"][0]["saved_sample"])
+                path.write_bytes(b"corrupted original evidence")
+                result = self._run(root, config)
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(result["original_reports"][1]["usable"])
+
+    def test_passed_true_with_blocked_status_cannot_supply_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, first, first_report, second, second_report = self._complete_join(root)
+            second_report["episodes"][0]["videos"][0]["probe"]["status"] = "blocked"
+            second.write_text(json.dumps(second_report))
+            result = self._run(root, config)
+            self.assertEqual(result["status"], "failed")
+            self.assertFalse(result["original_reports"][1]["usable"])
+            self.assertTrue(any("status" in error for error in result["errors"]))
+
+    def test_missing_malformed_and_unbounded_range_receipts_are_rejected(self):
+        mutations = {
+            "missing": lambda probe: probe.__setitem__("http_range_receipts", []),
+            "non206": lambda probe: probe["http_range_receipts"][0].__setitem__("http_status", 200),
+            "bad_range": lambda probe: probe["http_range_receipts"][0].__setitem__("response_content_range", "bytes 1-31/1048576"),
+            "bad_count": lambda probe: probe["http_range_receipts"][0].__setitem__("downloaded_bytes", 31),
+            "bad_digest": lambda probe: probe["http_range_receipts"][0].__setitem__("sha256", "unverified"),
+            "budget_read_mismatch": lambda probe: probe.__setitem__("read_bytes", 31),
+            "budget_exceeded": lambda probe: probe.__setitem__("budget_used_bytes", 1048577),
+            "no_complete_206": lambda probe: probe["http_range_receipts"][0].__setitem__("complete", False),
+            "full_checksum_claim": lambda probe: probe["http_range_receipts"][0].__setitem__("full_file_checksum", True),
+        }
+        for kind, mutation in mutations.items():
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config, first, first_report, second, second_report = self._complete_join(root)
+                mutation(second_report["episodes"][0]["videos"][0]["probe"])
+                second.write_text(json.dumps(second_report))
+                result = self._run(root, config)
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(result["original_reports"][1]["usable"])
+
+    def test_partial_retry_receipt_is_preserved_and_charged_with_complete_206(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, first, first_report, second, second_report = self._complete_join(root)
+            probe = second_report["episodes"][0]["videos"][0]["probe"]
+            partial = copy.deepcopy(probe["http_range_receipts"][0])
+            partial.update(downloaded_bytes=8, end_byte=7, complete=False, attempt=1,
+                           sha256=hashlib.sha256(b"R" * 8).hexdigest())
+            probe["http_range_receipts"].insert(0, partial)
+            probe["read_bytes"] += 8
+            probe["budget_used_bytes"] += 8
+            second.write_text(json.dumps(second_report))
+            result = self._run(root, config)
+            self.assertEqual(result["status"], "passed")
+            selected = next(camera for camera in result["consolidated_camera_triplets"]
+                            if camera["episode_id"] == 0 and camera["camera_key"] == SOURCE_CAMERA_KEYS[0])
+            transport = selected["original_transport_record_validation"]
+            self.assertEqual(transport["total_http_receipts"], 2)
+            self.assertEqual(transport["recorded_downloaded_bytes"], 40)
+            self.assertFalse(transport["original_range_bodies_rehashed"])
+            self.assertFalse(transport["full_video_integrity_verified"])
 
 
 if __name__ == "__main__":
