@@ -66,6 +66,22 @@ class PreparationCLITests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual((root / ".g1-rebuild/inventory.json").read_bytes(), original)
 
+    def test_reference_checkpoint_promotion_updates_inventory_totals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.make_project(directory)
+            reference = root / "resources/checkpoints/reference.pt"
+            reference.parent.mkdir()
+            reference.write_bytes(b"historical reference")
+            inventory = {"records": [{"path": str(reference), "relative_path": "resources/checkpoints/reference.pt",
+                         "experiment_ids": [], "kind": "file", "sha256": None, "action": "review",
+                         "protected": False, "reasons": []}], "errors": [], "summary": {"artifact_count": 1, "actions": {"review": 1}}}
+            with patch("g1_vla.cli.inventory_artifacts", return_value=inventory):
+                status, report = self.run_cli(["experiment", "--config", str(path), "--stage", "inventory", "--run-id", "reference"])
+            self.assertEqual(status, 0)
+            self.assertEqual(report["inventory"]["actions"], {"keep": 1})
+            protection = json.loads((root / ".g1-rebuild/protected-artifacts.json").read_text())
+            self.assertIsNotNone(protection["records"][0]["sha256"])
+
     def test_old_training_alias_and_forwarded_args_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as error:

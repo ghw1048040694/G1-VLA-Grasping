@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import importlib.metadata
 import json
 import sys
@@ -80,6 +81,7 @@ def execute_stage(stage, config, run):
             if anchor and row.get("kind") == "file" and row.get("sha256") is None:
                 row["sha256"] = sha256_file(row["path"])
                 row["hash_status"] = "complete"
+        inventory["summary"]["actions"] = dict(sorted(Counter(row["action"] for row in inventory["records"]).items()))
         inventory_path = run.path / "manifests" / "inventory.json"
         protected_path = run.path / "manifests" / "protected_artifacts.json"
         write_manifest(inventory, inventory_path)
