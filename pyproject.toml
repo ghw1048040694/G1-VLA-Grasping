@@ -11,6 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 simulation = ["numpy==1.26.4", "mujoco==3.2.5", "torch>=2.6,<2.7", "scipy>=1.10,<2", "imageio>=2.37,<3"]
+audit = ["huggingface_hub==0.35.3", "pyarrow==23.0.1", "av==15.1.0", "safetensors>=0.4.5,<0.8"]
 
 [project.scripts]
 g1-vla = "g1_vla.cli:main"

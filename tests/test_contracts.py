@@ -65,11 +65,14 @@ class ConfigTests(unittest.TestCase):
                 validate_config(config)
 
     def test_train_and_wm_enabled_rejected(self):
-        for section in ("train", "wm"):
+        for section in ("wm",):
             config = config_fixture()
             config[section]["enabled"] = True
             with self.subTest(section=section), self.assertRaises(ConfigError):
                 validate_config(config)
+        config = config_fixture()
+        config["train"]["enabled"] = True
+        self.assertEqual(validate_config(config)["train"]["authorization"], "conditional")
 
     def test_boolean_numeric_and_invalid_timing_rejected(self):
         for value in (True, 0, -15, float("nan"), float("inf")):

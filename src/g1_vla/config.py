@@ -127,6 +127,26 @@ def _triple(value: Any, path: str) -> None:
         _finite(item, "{}[{}]".format(path, index))
 
 
+def _indices(value: Any, path: str) -> None:
+    if not isinstance(value, list) or not value or len(value) != len(set(value)):
+        _error(path, "must contain unique integer indices")
+    for item in value:
+        _integer(item, path)
+
+
+def _revision(value: Any, path: str) -> None:
+    _text(value, path)
+    if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+        _error(path, "must be a pinned 40-character Hub commit SHA")
+
+
+def _candidates(value: Any, path: str) -> None:
+    if not isinstance(value, list) or not value or len(value) > 5:
+        _error(path, "must contain one to five pinned model candidates")
+    for index, item in enumerate(value):
+        _object(item, {"repo_id": _text, "revision": _revision}, "{}[{}]".format(path, index))
+
+
 def _object(value: Any, schema: Dict[str, Any], path: str) -> None:
     if not isinstance(value, dict):
         _error(path, "must be an object")
@@ -212,7 +232,7 @@ SCHEMA = {
         "arm_hand_heads": _literal(True),
     },
     "train": {
-        "enabled": _literal(False), "seed": _integer,
+        "enabled": _boolean, "authorization": _literal("conditional"), "seed": _integer,
         "batch_size": _optional(_positive_integer),
         "epochs": _optional(_positive_integer),
         "learning_rate": _optional(_positive),
@@ -238,6 +258,24 @@ SCHEMA = {
         "torch_expected": _optional(_text), "cuda_expected": _optional(_text),
     },
     "wm": {"enabled": _literal(False)},
+    "external_data": {
+        "repo_id": _literal("unitreerobotics/G1_Dex3_GraspSquare_Dataset"),
+        "revision": _revision, "local_dir": _text,
+        "episode_ids": _indices, "source_fps": _positive,
+        "max_episode_rows": _positive_integer, "max_download_bytes": _positive_integer,
+        "timestamp_tolerance_s": _positive, "semantic_evidence_path": _optional(_text),
+        "probe_videos": _boolean,
+        "video": {"backend": _literal("pyav_http_range"), "samples_per_episode": _positive_integer,
+                  "max_read_bytes": _positive_integer},
+    },
+    "public_weights": {"cache_dir": _text, "candidates": _candidates},
+    "offline_policy": {
+        "backend": _literal("lerobot_act_native"), "repo_id": _text, "revision": _revision,
+        "model_dir": _text, "dataset_repo_id": _text, "dataset_revision": _revision,
+        "dataset_dir": _text, "episode_id": _integer, "frame_indices": _indices,
+        "device": _literal("cuda"), "warmup_runs": _positive_integer,
+        "measured_runs": _positive_integer, "max_download_bytes": _positive_integer,
+    },
 }
 
 OBSERVATION_FIELDS = frozenset({
@@ -298,6 +336,9 @@ _PATH_FIELDS = {
     "train": ("resume_checkpoint", "warm_start_checkpoint"),
     "eval": ("checkpoint", "layouts_path"),
     "artifacts": ("runs_dir", "inventory_path", "protection_manifest_path"),
+    "external_data": ("local_dir", "semantic_evidence_path"),
+    "public_weights": ("cache_dir",),
+    "offline_policy": ("model_dir", "dataset_dir"),
 }
 
 

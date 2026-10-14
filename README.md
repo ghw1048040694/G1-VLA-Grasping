@@ -1,6 +1,6 @@
 # G1 VLA Grasping
 
-G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. The preparation revision has one active configuration and one package entry point. Training and world-model optimization are disabled.
+G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. Training is conditionally authorized and defaults off until an audited backend and dataset split are admitted; world-model optimization remains disabled.
 
 ## Workspace
 
@@ -24,7 +24,21 @@ MUJOCO_GL=egl g1-vla experiment --config configs/experiment.json --stage teacher
 g1-vla experiment --config configs/experiment.json --stage report
 ```
 
-`plan` and `--dry-run` are read-only. Inventory and registry create exclusive evidence files; they never delete, move or deserialize training artifacts. The current `train` stage records a refusal without creating an optimizer. Editing the configuration cannot enable optimization in this preparation revision. Collection, dataset build, replay and physical policy evaluation are not yet admitted runners; selecting them returns an explicit blocked result and never invokes historical scripts.
+External-data and original-policy probes use the isolated audit environment so the physical environment remains stable:
+
+```bash
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage external-fetch
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage external-audit
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage weights-audit
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage offline-fetch
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage offline-infer
+```
+
+The official GraspSquare sample uses pinned episodes 0/150/300. Downloads verify exact revisions and LFS hashes. Video probes fetch bounded HTTP ranges and preserve source PTS; range hashes do not claim full-video integrity. Data keeps its native 28 dimensions and missing waist values remain missing. Model-source joint geometry supports an identity mapping, while acquisition clocks, calibration and current-task conversion need separate evidence.
+
+The compact ACT probe uses its actual original pizza-box dataset, saved normalization, a complete strict checkpoint load and FP32 CUDA inference. Its 29-state/20-action protocol includes remote axes and binary hand-open commands. The measured output is a compute baseline, without language conditioning, simulated rollout or adaptation to the current 31-joint policy. Large VLA metadata estimates and gated dependencies are reported separately; estimates never count as successful inference.
+
+`plan` and `--dry-run` are read-only. Inventory and registry create exclusive evidence files; they never delete, move or deserialize training artifacts. `train.enabled` is a conditional request, and the current training stage records missing prerequisites without constructing an optimizer. No stage automatically starts training. Collection, dataset build, replay and physical policy evaluation are not yet admitted runners; selecting them returns an explicit blocked result and never invokes historical scripts. Public source-native imitation is a separate candidate pipeline: failure of the current green/right teacher does not invalidate official demonstrations.
 
 ## Contracts and evidence
 

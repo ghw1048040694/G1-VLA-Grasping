@@ -20,6 +20,8 @@
 | `evaluation.py` | Contact/lift/placement events and strict success metrics |
 | `artifacts.py` | Read-only inventory and protection classification |
 | `data_registry.py`, `data_ingest.py` | Raw provenance, historical quarantine and connected source/layout splits |
+| `external_sources.py`, `external_data.py`, `video_audit.py` | Bounded revision-pinned sources, native row/joint/camera/time audits and partial-video PTS evidence |
+| `weight_audit.py`, `offline_inference.py` | Public checkpoint metadata and measured original-protocol offline compute; no controller handoff |
 | `runtime/experiment.py` | Immutable config, provenance and result records |
 
 ## Data boundary
@@ -34,6 +36,8 @@ Each explicit preparation stage writes `effective_config.json`, `provenance.json
 
 ## Current boundary
 
-No optimizer runner is installed in this revision. Limits/pairing and physical teacher stages are available through the single entry. The teacher uses the shared executor, captures RGB and exact command intervals, and evaluates a frozen local layout suite. Command bounds, measured joint tracking, torque saturation, substep contact, sustained lift and chunk consistency are recorded separately. A passing format audit does not establish physical grasp success; a passing teacher does not establish a learned policy result. Collection, training-cache build, replay and physical policy evaluation remain blocked, without historical fallback. All new raw evidence remains diagnostic pending future dataset admission.
+Training authorization is conditional; the current action31 builder/optimizer runner remains unadmitted. Limits/pairing, physical teacher, external source audits and original-policy offline inference are available through the single entry. The teacher uses the shared executor, captures RGB and exact command intervals, and evaluates a frozen local layout suite. Command bounds, measured joint tracking, torque saturation, substep contact, sustained lift and chunk consistency are recorded separately. A passing format audit does not establish physical grasp success; a passing teacher or original-policy compute probe does not establish current learned-policy success. Collection, training-cache build, replay and physical policy evaluation remain blocked, without historical fallback.
+
+External source rows and current physical interval pairs have different contracts. GraspSquare keeps its native action28, four real views and 30Hz row cadence; three waist values and physical acquisition times are unavailable. Native external imitation can be validated independently rather than being rejected by the local teacher gate. Admission to the current green/right task still requires an explicit sensor/action/time bridge, source grouping and closed-loop evaluation. No missing observations or successful labels are fabricated during an audit.
 
 World model, MPC, left-hand expansion and Sim2Sim remain deferred. Every implementation step and its validation belongs in the existing `notes/Lerobot.md` journal.

@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "weights-audit", "offline-fetch", "offline-infer", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -52,10 +52,11 @@ def readiness(config):
     checks["cadence"] = {key: config["control"][key] for key in ("nominal_control_hz", "control_hz", "physics_dt_s", "physics_substeps")}
     checks["registry"] = {"path": config["data"]["registry_path"], "present": Path(config["data"]["registry_path"]).is_file()}
     return {"schema_version": 1, "project_root": str(root), "configuration_valid": True,
-            "training_enabled": False, "wm_enabled": False, "training_started": False,
+            "training_enabled": config["train"]["enabled"], "training_authorization": config["train"]["authorization"],
+            "wm_enabled": False, "training_started": False,
             "ready_for_inventory": True, "ready_for_execution": not blockers,
             "checks": checks, "execution_blockers": blockers,
-            "pipeline_status": "Source limits/pairing audits and green-right physical teacher acceptance are admitted; training and policy evaluation remain disabled."}
+            "pipeline_status": "Audits, physical teacher and original-protocol offline inference are admitted. Conditional training requires dataset and execution admission; there is no automatic stage chaining."}
 
 
 def _protection(inventory):
@@ -66,6 +67,35 @@ def _protection(inventory):
 
 def execute_stage(stage, config, run):
     report = readiness(config)
+    if stage in ("external-fetch", "offline-fetch"):
+        from .external_sources import fetch_official_sample, fetch_native_policy
+        fetched = (fetch_official_sample if stage == "external-fetch" else fetch_native_policy)(config, run.path)
+        report.update(stage=stage, source_fetch=fetched)
+        return report, True
+    if stage == "external-audit":
+        from .external_data import audit_official_sample
+        audited = audit_official_sample(config, run.path)
+        report.update(stage=stage, external_data_audit=audited)
+        cameras_complete = (not config["external_data"]["probe_videos"] or
+            audited["bounded_video_probes_passed"] == len(config["external_data"]["episode_ids"]) * 4)
+        return report, audited["status"] == "passed" and cameras_complete
+    if stage == "weights-audit":
+        from .weight_audit import audit_public_weights
+        import torch
+        import platform
+        free, total = torch.cuda.mem_get_info() if torch.cuda.is_available() else (0, 0)
+        hardware = {"gpu_total_mib": total / 2**20, "gpu_free_mib": free / 2**20,
+                    "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+                    "python": platform.python_version(), "torch": torch.__version__, "cuda": torch.version.cuda}
+        weights = audit_public_weights(config["paths"]["root"], config, hardware=hardware)
+        write_new_json(run.path / "reports" / "weight_audit.json", weights)
+        report.update(stage=stage, weight_audit=weights)
+        return report, weights["status"] == "metadata_audited"
+    if stage == "offline-infer":
+        from .offline_inference import run_native_act_inference
+        inferred = run_native_act_inference(config, run.path)
+        report.update(stage=stage, offline_inference=inferred)
+        return report, inferred.get("inference_passed") is True
     if stage == "limits":
         from .control_limits import audit_control_limits
         limits = audit_control_limits(config["paths"]["root"], config)

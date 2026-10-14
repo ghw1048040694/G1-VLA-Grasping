@@ -160,7 +160,8 @@
     "epochs": null,
     "learning_rate": null,
     "resume_checkpoint": null,
-    "warm_start_checkpoint": null
+    "warm_start_checkpoint": null,
+    "authorization": "conditional"
   },
   "eval": {
     "checkpoint": null,
@@ -189,5 +190,62 @@
   },
   "wm": {
     "enabled": false
+  },
+  "external_data": {
+    "repo_id": "unitreerobotics/G1_Dex3_GraspSquare_Dataset",
+    "revision": "c2b44ca4c5f6329d75143613f9f1eada0cf94c62",
+    "local_dir": ".runtime/rebuild/external/grasp-square/c2b44ca4c5f6329d75143613f9f1eada0cf94c62",
+    "episode_ids": [
+      0,
+      150,
+      300
+    ],
+    "source_fps": 30.0,
+    "max_episode_rows": 3000,
+    "max_download_bytes": 104857600,
+    "timestamp_tolerance_s": 0.0001,
+    "semantic_evidence_path": "resources/protocols/grasp_square_mapping.json",
+    "probe_videos": true,
+    "video": {
+      "backend": "pyav_http_range",
+      "samples_per_episode": 3,
+      "max_read_bytes": 268435456
+    }
+  },
+  "public_weights": {
+    "cache_dir": ".runtime/rebuild/external/model-metadata",
+    "candidates": [
+      {
+        "repo_id": "nvidia/GR00T-N1.7-3B",
+        "revision": "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
+      },
+      {
+        "repo_id": "unitreerobotics/UnifoLM-VLA-Base",
+        "revision": "06fee5014922ba6791cfe48d1e4aefac995dd8a2"
+      },
+      {
+        "repo_id": "ambitiousmangosteen/g1-dex3-pick-act",
+        "revision": "a9a8c4e2bd523ebe5f3dc360188741aee438bbe3"
+      }
+    ]
+  },
+  "offline_policy": {
+    "backend": "lerobot_act_native",
+    "repo_id": "ambitiousmangosteen/g1-dex3-pick-act",
+    "revision": "a9a8c4e2bd523ebe5f3dc360188741aee438bbe3",
+    "model_dir": ".runtime/rebuild/external/act-native/model",
+    "dataset_repo_id": "ambitiousmangosteen/g1-dex3-pick",
+    "dataset_revision": "b4e1bb305a7355fbb41ea82ff75dbf272a3893ad",
+    "dataset_dir": ".runtime/rebuild/external/act-native/data",
+    "episode_id": 0,
+    "frame_indices": [
+      0,
+      30,
+      60
+    ],
+    "device": "cuda",
+    "warmup_runs": 1,
+    "measured_runs": 3,
+    "max_download_bytes": 419430400
   }
 }

@@ -91,15 +91,36 @@ class PreparationCLITests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 main(["experiment", "--config", "fake.json", "--epochs", "20"])
 
-    def test_enabling_training_in_configuration_rejected_before_run(self):
+    def test_conditional_training_still_requires_dataset_admission(self):
         with tempfile.TemporaryDirectory() as directory:
             root, path = self.make_project(directory)
             config = json.loads(path.read_text())
             config["train"]["enabled"] = True
             path.write_text(json.dumps(config))
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(main(["experiment", "--config", str(path), "--stage", "train"]), 2)
-            self.assertFalse((root / "outputs").exists())
+            status, report = self.run_cli(["experiment", "--config", str(path), "--stage", "train"])
+            self.assertEqual(status, 2)
+            self.assertEqual(report["training_gate"]["status"], "blocked")
+            self.assertFalse(report["training_gate"]["optimizer_created"])
+            self.assertFalse(any(root.rglob("*.pt")))
+
+    def test_native_compute_success_uses_inference_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.make_project(directory)
+            with patch("g1_vla.offline_inference.run_native_act_inference", return_value={
+                    "status": "passed_native_compute_probe", "inference_passed": True}):
+                status, report = self.run_cli(["experiment", "--config", str(path), "--stage", "offline-infer"])
+            self.assertEqual(status, 0)
+            self.assertFalse(report["training_started"])
+            self.assertEqual(json.loads((Path(report["run_dir"]) / "finished.json").read_text())["status"], "success")
+
+    def test_structural_only_external_audit_requires_camera_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.make_project(directory)
+            with patch("g1_vla.external_data.audit_official_sample", return_value={
+                    "status": "passed", "bounded_video_probes_passed": 0}):
+                status, report = self.run_cli(["experiment", "--config", str(path), "--stage", "external-audit"])
+            self.assertEqual(status, 2)
+            self.assertFalse(report["training_started"])
 
 
 if __name__ == "__main__":

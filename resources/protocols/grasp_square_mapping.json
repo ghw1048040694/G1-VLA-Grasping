@@ -1,0 +1,1352 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-10-14",
+  "authority": "independent_primary_source_audit",
+  "audit_scope": "small immutable evidence; no hardware replay, calibration certification, training, or full video checksum",
+  "dataset": {
+    "repo_id": "unitreerobotics/G1_Dex3_GraspSquare_Dataset",
+    "revision": "c2b44ca4c5f6329d75143613f9f1eada0cf94c62",
+    "info_url": "https://huggingface.co/datasets/unitreerobotics/G1_Dex3_GraspSquare_Dataset/resolve/c2b44ca4c5f6329d75143613f9f1eada0cf94c62/meta/info.json",
+    "info_raw_sha256": "3466132be194fb9487db582dd37afbb2585f924d1b722a8fc6ac30920a471927",
+    "readme_url": "https://huggingface.co/datasets/unitreerobotics/G1_Dex3_GraspSquare_Dataset/resolve/c2b44ca4c5f6329d75143613f9f1eada0cf94c62/README.md",
+    "readme_raw_sha256": "9ac8f30c9a2a53ab144808f40246b5415d43c6127529ff2901bb2765e56987f9",
+    "actual_codebase_version": "v3.0",
+    "readme_embedded_version": "v2.0 (stale)",
+    "published_task": "Stack three 5 cm cubic blocks, red then yellow then blue, on black tape; dual-arm operation",
+    "published_frequency_hz": 30.0,
+    "published_image_width": 640,
+    "published_image_height": 480,
+    "published_camera_keys": [
+      "observation.images.cam_left_high",
+      "observation.images.cam_right_high",
+      "observation.images.cam_left_wrist",
+      "observation.images.cam_right_wrist"
+    ],
+    "original_collection_source_commit_provided": false
+  },
+  "primary_sources": [
+    {
+      "repository": "unitreerobotics/xr_teleoperate",
+      "revision": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+      "path": "assets/g1/g1_body29_hand14.xml",
+      "url": "https://github.com/unitreerobotics/xr_teleoperate/blob/817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b/assets/g1/g1_body29_hand14.xml",
+      "raw_sha256": "c7bec8183aebdc23be735bdc6705a0adc4b0fba230ecbd46a42f0fe4a7269951",
+      "bytes": 38225
+    },
+    {
+      "repository": "unitreerobotics/xr_teleoperate",
+      "revision": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+      "path": "assets/g1/g1_body29_hand14.urdf",
+      "url": "https://github.com/unitreerobotics/xr_teleoperate/blob/817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b/assets/g1/g1_body29_hand14.urdf",
+      "raw_sha256": "8bbf006633fc50b616f665c7a970780cc296577a0adfd7d28b049e751c238735",
+      "bytes": 51870
+    },
+    {
+      "repository": "unitreerobotics/xr_teleoperate",
+      "revision": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+      "path": "teleop/robot_control/robot_hand_unitree.py",
+      "url": "https://github.com/unitreerobotics/xr_teleoperate/blob/817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b/teleop/robot_control/robot_hand_unitree.py",
+      "raw_sha256": "4ee8bd44e9512fb29f20113728e1cf3eebd077652b8540e62f8fd11943cfc034",
+      "bytes": 24186
+    },
+    {
+      "repository": "unitreerobotics/xr_teleoperate",
+      "revision": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+      "path": "teleop/robot_control/hand_retargeting.py",
+      "url": "https://github.com/unitreerobotics/xr_teleoperate/blob/817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b/teleop/robot_control/hand_retargeting.py",
+      "raw_sha256": "fe25e74059239ed34e610642db660e173803eae275ab3624a0219246915be056",
+      "bytes": 6161
+    },
+    {
+      "repository": "unitreerobotics/xr_teleoperate",
+      "revision": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+      "path": "teleop/robot_control/robot_arm.py",
+      "url": "https://github.com/unitreerobotics/xr_teleoperate/blob/817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b/teleop/robot_control/robot_arm.py",
+      "raw_sha256": "5b132065de6483dd1ff1df8083d4317d1391ecd50f7ee87eced874e8739e4374",
+      "bytes": 92982
+    },
+    {
+      "repository": "unitreerobotics/xr_teleoperate",
+      "revision": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+      "path": "teleop/teleop_hand_and_arm.py",
+      "url": "https://github.com/unitreerobotics/xr_teleoperate/blob/817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b/teleop/teleop_hand_and_arm.py",
+      "raw_sha256": "41e50227bb6973a7e12d3b5a1f118c2bf5391c06f3bb62b33d710c7cee9c1261",
+      "bytes": 34358
+    },
+    {
+      "repository": "unitreerobotics/xr_teleoperate",
+      "revision": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+      "path": "teleop/utils/episode_writer.py",
+      "url": "https://github.com/unitreerobotics/xr_teleoperate/blob/817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b/teleop/utils/episode_writer.py",
+      "raw_sha256": "664937c5192fcb19cfdd1656af8c88310fc1f8860aee8db806760d8d7a815888",
+      "bytes": 10081
+    },
+    {
+      "repository": "unitreerobotics/unitree_lerobot",
+      "revision": "41c2805742de879ddab2d8d6beaeaf215f876395",
+      "path": "unitree_lerobot/utils/convert_unitree_json_to_lerobot.py",
+      "url": "https://github.com/unitreerobotics/unitree_lerobot/blob/41c2805742de879ddab2d8d6beaeaf215f876395/unitree_lerobot/utils/convert_unitree_json_to_lerobot.py",
+      "raw_sha256": "4a5f5dcf9165a2301fe4d4f7c0850e56a94714833735f1b2ca3e8f280dce6eb7",
+      "bytes": 11491
+    },
+    {
+      "repository": "unitreerobotics/unitree_lerobot",
+      "revision": "41c2805742de879ddab2d8d6beaeaf215f876395",
+      "path": "unitree_lerobot/utils/constants.py",
+      "url": "https://github.com/unitreerobotics/unitree_lerobot/blob/41c2805742de879ddab2d8d6beaeaf215f876395/unitree_lerobot/utils/constants.py",
+      "raw_sha256": "6fcaa836e15dfe96f0706e214f655a0c77a2e6933581e3ca58dc599515aab68a",
+      "bytes": 13140
+    },
+    {
+      "repository": "huggingface/lerobot",
+      "revision": "a5b29d430105f5235eb05bbf2db5a0d747a869d6",
+      "path": "src/lerobot/datasets/lerobot_dataset.py",
+      "url": "https://github.com/huggingface/lerobot/blob/a5b29d430105f5235eb05bbf2db5a0d747a869d6/src/lerobot/datasets/lerobot_dataset.py",
+      "raw_sha256": "1bd9e5f133f0931d73a20aab73ba8490ac2d4fa1308bf1a0b045981490afd504",
+      "bytes": 73352
+    },
+    {
+      "repository": "huggingface/lerobot",
+      "revision": "a5b29d430105f5235eb05bbf2db5a0d747a869d6",
+      "path": "src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py",
+      "url": "https://github.com/huggingface/lerobot/blob/a5b29d430105f5235eb05bbf2db5a0d747a869d6/src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py",
+      "raw_sha256": "e95736e3039f962ea96629c8c8c664f3ccc6caee5bb3f2a7c872adf01b1bd636",
+      "bytes": 19570
+    }
+  ],
+  "current_scene_mapping": {
+    "current_xml_path": "resources/g1_warehouse_pregrasp.xml",
+    "current_xml_raw_sha256": "a500ae8ba9e8bc0f6a3c922948a18988ea1a386933b67ebd2b079b583c86c453",
+    "official_xml_path": "assets/g1/g1_body29_hand14.xml",
+    "official_xml_raw_sha256": "c7bec8183aebdc23be735bdc6705a0adc4b0fba230ecbd46a42f0fe4a7269951",
+    "official_xml_revision": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b",
+    "compared_arm_hand_joints": 28,
+    "all_joint_axis_range_pos_identical": true,
+    "all_joint_body_local_pos_quat_identical": true,
+    "target31_source_index": [
+      null,
+      null,
+      null,
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+    ],
+    "target31_names": [
+      "waist_yaw_joint",
+      "waist_roll_joint",
+      "waist_pitch_joint",
+      "left_shoulder_pitch_joint",
+      "left_shoulder_roll_joint",
+      "left_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "left_wrist_roll_joint",
+      "left_wrist_pitch_joint",
+      "left_wrist_yaw_joint",
+      "left_hand_thumb_0_joint",
+      "left_hand_thumb_1_joint",
+      "left_hand_thumb_2_joint",
+      "left_hand_middle_0_joint",
+      "left_hand_middle_1_joint",
+      "left_hand_index_0_joint",
+      "left_hand_index_1_joint",
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint",
+      "right_wrist_pitch_joint",
+      "right_wrist_yaw_joint",
+      "right_hand_thumb_0_joint",
+      "right_hand_thumb_1_joint",
+      "right_hand_thumb_2_joint",
+      "right_hand_index_0_joint",
+      "right_hand_index_1_joint",
+      "right_hand_middle_0_joint",
+      "right_hand_middle_1_joint"
+    ],
+    "source28_names": [
+      "kLeftShoulderPitch",
+      "kLeftShoulderRoll",
+      "kLeftShoulderYaw",
+      "kLeftElbow",
+      "kLeftWristRoll",
+      "kLeftWristPitch",
+      "kLeftWristYaw",
+      "kRightShoulderPitch",
+      "kRightShoulderRoll",
+      "kRightShoulderYaw",
+      "kRightElbow",
+      "kRightWristRoll",
+      "kRightWristPitch",
+      "kRightWristYaw",
+      "kLeftHandThumb0",
+      "kLeftHandThumb1",
+      "kLeftHandThumb2",
+      "kLeftHandMiddle0",
+      "kLeftHandMiddle1",
+      "kLeftHandIndex0",
+      "kLeftHandIndex1",
+      "kRightHandThumb0",
+      "kRightHandThumb1",
+      "kRightHandThumb2",
+      "kRightHandIndex0",
+      "kRightHandIndex1",
+      "kRightHandMiddle0",
+      "kRightHandMiddle1"
+    ],
+    "missing_source_dimensions": [
+      "waist_yaw_joint",
+      "waist_roll_joint",
+      "waist_pitch_joint"
+    ],
+    "missing_dimension_policy": "unobserved mask or declared fixed prior; never call synthetic zero a measured state",
+    "candidate_mapping": "same joint name, +1 sign, radians; no extra left/right mirroring or finger-column swap inferred",
+    "candidate_mapping_supported_by_named_kinematic_model": true,
+    "measured_encoder_calibration_proven": false,
+    "physical_dynamics_equivalence_proven": false,
+    "joint_comparisons": [
+      {
+        "source_index": 0,
+        "source_name": "kLeftShoulderPitch",
+        "current_index": 3,
+        "current_joint_name": "left_shoulder_pitch_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 1 0",
+            "current": "0 1 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-3.0892 2.6704",
+            "current": "-3.0892 2.6704",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.0039563 0.10022 0.24778",
+            "current": "0.0039563 0.10022 0.24778",
+            "identical": true
+          },
+          "quat": {
+            "official": "0.990264 0.139201 1.38722e-05 -9.86868e-05",
+            "current": "0.990264 0.139201 1.38722e-05 -9.86868e-05",
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 1,
+        "source_name": "kLeftShoulderRoll",
+        "current_index": 4,
+        "current_joint_name": "left_shoulder_roll_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "1 0 0",
+            "current": "1 0 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.5882 2.2515",
+            "current": "-1.5882 2.2515",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0 0.038 -0.013831",
+            "current": "0 0.038 -0.013831",
+            "identical": true
+          },
+          "quat": {
+            "official": "0.990268 -0.139172 0 0",
+            "current": "0.990268 -0.139172 0 0",
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 2,
+        "source_name": "kLeftShoulderYaw",
+        "current_index": 5,
+        "current_joint_name": "left_shoulder_yaw_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-2.618 2.618",
+            "current": "-2.618 2.618",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0 0.00624 -0.1032",
+            "current": "0 0.00624 -0.1032",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 3,
+        "source_name": "kLeftElbow",
+        "current_index": 6,
+        "current_joint_name": "left_elbow_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 1 0",
+            "current": "0 1 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.0472 2.0944",
+            "current": "-1.0472 2.0944",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.015783 0 -0.080518",
+            "current": "0.015783 0 -0.080518",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 4,
+        "source_name": "kLeftWristRoll",
+        "current_index": 7,
+        "current_joint_name": "left_wrist_roll_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "1 0 0",
+            "current": "1 0 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.97222 1.97222",
+            "current": "-1.97222 1.97222",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.1 0.00188791 -0.01",
+            "current": "0.1 0.00188791 -0.01",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 5,
+        "source_name": "kLeftWristPitch",
+        "current_index": 8,
+        "current_joint_name": "left_wrist_pitch_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 1 0",
+            "current": "0 1 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.61443 1.61443",
+            "current": "-1.61443 1.61443",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.038 0 0",
+            "current": "0.038 0 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 6,
+        "source_name": "kLeftWristYaw",
+        "current_index": 9,
+        "current_joint_name": "left_wrist_yaw_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.61443 1.61443",
+            "current": "-1.61443 1.61443",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.046 0 0",
+            "current": "0.046 0 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 14,
+        "source_name": "kLeftHandThumb0",
+        "current_index": 10,
+        "current_joint_name": "left_hand_thumb_0_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 1 0",
+            "current": "0 1 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.0472 1.0472",
+            "current": "-1.0472 1.0472",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.067 0.003 0",
+            "current": "0.067 0.003 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 15,
+        "source_name": "kLeftHandThumb1",
+        "current_index": 11,
+        "current_joint_name": "left_hand_thumb_1_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-0.724312 1.0472",
+            "current": "-0.724312 1.0472",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "-0.0025 -0.0193 0",
+            "current": "-0.0025 -0.0193 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 16,
+        "source_name": "kLeftHandThumb2",
+        "current_index": 12,
+        "current_joint_name": "left_hand_thumb_2_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "0 1.74533",
+            "current": "0 1.74533",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0 -0.0458 0",
+            "current": "0 -0.0458 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 17,
+        "source_name": "kLeftHandMiddle0",
+        "current_index": 13,
+        "current_joint_name": "left_hand_middle_0_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.5708 0",
+            "current": "-1.5708 0",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.1192 0.0046 -0.0285",
+            "current": "0.1192 0.0046 -0.0285",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 18,
+        "source_name": "kLeftHandMiddle1",
+        "current_index": 14,
+        "current_joint_name": "left_hand_middle_1_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.74533 0",
+            "current": "-1.74533 0",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.0458 0 0",
+            "current": "0.0458 0 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 19,
+        "source_name": "kLeftHandIndex0",
+        "current_index": 15,
+        "current_joint_name": "left_hand_index_0_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.5708 0",
+            "current": "-1.5708 0",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.1192 0.0046 0.0285",
+            "current": "0.1192 0.0046 0.0285",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 20,
+        "source_name": "kLeftHandIndex1",
+        "current_index": 16,
+        "current_joint_name": "left_hand_index_1_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.74533 0",
+            "current": "-1.74533 0",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.0458 0 0",
+            "current": "0.0458 0 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 7,
+        "source_name": "kRightShoulderPitch",
+        "current_index": 17,
+        "current_joint_name": "right_shoulder_pitch_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 1 0",
+            "current": "0 1 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-3.0892 2.6704",
+            "current": "-3.0892 2.6704",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.0039563 -0.10021 0.24778",
+            "current": "0.0039563 -0.10021 0.24778",
+            "identical": true
+          },
+          "quat": {
+            "official": "0.990264 -0.139201 1.38722e-05 9.86868e-05",
+            "current": "0.990264 -0.139201 1.38722e-05 9.86868e-05",
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 8,
+        "source_name": "kRightShoulderRoll",
+        "current_index": 18,
+        "current_joint_name": "right_shoulder_roll_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "1 0 0",
+            "current": "1 0 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-2.2515 1.5882",
+            "current": "-2.2515 1.5882",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0 -0.038 -0.013831",
+            "current": "0 -0.038 -0.013831",
+            "identical": true
+          },
+          "quat": {
+            "official": "0.990268 0.139172 0 0",
+            "current": "0.990268 0.139172 0 0",
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 9,
+        "source_name": "kRightShoulderYaw",
+        "current_index": 19,
+        "current_joint_name": "right_shoulder_yaw_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-2.618 2.618",
+            "current": "-2.618 2.618",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0 -0.00624 -0.1032",
+            "current": "0 -0.00624 -0.1032",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 10,
+        "source_name": "kRightElbow",
+        "current_index": 20,
+        "current_joint_name": "right_elbow_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 1 0",
+            "current": "0 1 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.0472 2.0944",
+            "current": "-1.0472 2.0944",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.015783 0 -0.080518",
+            "current": "0.015783 0 -0.080518",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 11,
+        "source_name": "kRightWristRoll",
+        "current_index": 21,
+        "current_joint_name": "right_wrist_roll_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "1 0 0",
+            "current": "1 0 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.97222 1.97222",
+            "current": "-1.97222 1.97222",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.1 -0.00188791 -0.01",
+            "current": "0.1 -0.00188791 -0.01",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 12,
+        "source_name": "kRightWristPitch",
+        "current_index": 22,
+        "current_joint_name": "right_wrist_pitch_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 1 0",
+            "current": "0 1 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.61443 1.61443",
+            "current": "-1.61443 1.61443",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.038 0 0",
+            "current": "0.038 0 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 13,
+        "source_name": "kRightWristYaw",
+        "current_index": 23,
+        "current_joint_name": "right_wrist_yaw_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.61443 1.61443",
+            "current": "-1.61443 1.61443",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.046 0 0",
+            "current": "0.046 0 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 21,
+        "source_name": "kRightHandThumb0",
+        "current_index": 24,
+        "current_joint_name": "right_hand_thumb_0_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 1 0",
+            "current": "0 1 0",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.0472 1.0472",
+            "current": "-1.0472 1.0472",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.067 -0.003 0",
+            "current": "0.067 -0.003 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 22,
+        "source_name": "kRightHandThumb1",
+        "current_index": 25,
+        "current_joint_name": "right_hand_thumb_1_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.0472 0.724312",
+            "current": "-1.0472 0.724312",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "-0.0025 0.0193 0",
+            "current": "-0.0025 0.0193 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 23,
+        "source_name": "kRightHandThumb2",
+        "current_index": 26,
+        "current_joint_name": "right_hand_thumb_2_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "-1.74533 0",
+            "current": "-1.74533 0",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0 0.0458 0",
+            "current": "0 0.0458 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 24,
+        "source_name": "kRightHandIndex0",
+        "current_index": 27,
+        "current_joint_name": "right_hand_index_0_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "0 1.5708",
+            "current": "0 1.5708",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.1192 -0.0046 0.0285",
+            "current": "0.1192 -0.0046 0.0285",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 25,
+        "source_name": "kRightHandIndex1",
+        "current_index": 28,
+        "current_joint_name": "right_hand_index_1_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "0 1.74533",
+            "current": "0 1.74533",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.0458 0 0",
+            "current": "0.0458 0 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 26,
+        "source_name": "kRightHandMiddle0",
+        "current_index": 29,
+        "current_joint_name": "right_hand_middle_0_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "0 1.5708",
+            "current": "0 1.5708",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.1192 -0.0046 -0.0285",
+            "current": "0.1192 -0.0046 -0.0285",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      },
+      {
+        "source_index": 27,
+        "source_name": "kRightHandMiddle1",
+        "current_index": 30,
+        "current_joint_name": "right_hand_middle_1_joint",
+        "candidate_sign": 1,
+        "candidate_units": "rad",
+        "joint_fields": {
+          "axis": {
+            "official": "0 0 1",
+            "current": "0 0 1",
+            "identical": true
+          },
+          "range": {
+            "official": "0 1.74533",
+            "current": "0 1.74533",
+            "identical": true
+          },
+          "pos": {
+            "official": "0 0 0",
+            "current": "0 0 0",
+            "identical": true
+          }
+        },
+        "body_local_fields": {
+          "pos": {
+            "official": "0.0458 0 0",
+            "current": "0.0458 0 0",
+            "identical": true
+          },
+          "quat": {
+            "official": null,
+            "current": null,
+            "identical": true
+          }
+        }
+      }
+    ]
+  },
+  "source_native_recorded_row": {
+    "converter_revision": "41c2805742de879ddab2d8d6beaeaf215f876395",
+    "converter_evidence": "populate_dataset constructs observation.state=state[i], action=action[i], every camera=image[i], then dataset.add_frame(frame); no next-row shift",
+    "converter_source_lines": "populate_dataset lines 298-312; create_empty_dataset fps=30 at line 272",
+    "original_timestamp_preservation": "converter does not pass acquisition timestamps",
+    "actual_linked_lerobot_revision": "a5b29d430105f5235eb05bbf2db5a0d747a869d6",
+    "lerobot_default_timestamp_evidence": "lerobot_dataset.py lines 1090-1094 defaults timestamp to frame_index/fps when absent",
+    "v3_video_query_evidence": "lerobot_dataset.py lines 973-980 shifts row timestamp by videos/{video_key}/from_timestamp",
+    "xr_arm_evidence": "teleop_hand_and_arm.py lines 361-370 reads current arm q before IK, sets target sol_q, then lines 428-431 records that arm state and sol_q in one row",
+    "xr_hand_evidence": "robot_hand_unitree.py lines 188-205 reads shared motor state and writes state/command under lock, then sends the same command vector; hand loop defaults 100 Hz; collection loop defaults 30 Hz and controller/background subscriber clocks differ",
+    "xr_writer_evidence": "episode_writer.py lines 129-142 stores idx/colors/states/actions without acquisition or applied-command timestamps",
+    "recorded_row_order_supported": true,
+    "label_next_row_shift_supported": false,
+    "next_actual_hardware_control_interval_proven": false,
+    "exposure_to_encoder_clock_synchronization_proven": false,
+    "requested_command_equals_applied_hardware_command_proven": false,
+    "exact_original_collector_version_known": false
+  },
+  "right_hand_order_clarification": {
+    "dds_enum_order": [
+      "thumb0",
+      "thumb1",
+      "thumb2",
+      "index0",
+      "index1",
+      "middle0",
+      "middle1"
+    ],
+    "retargeting_declared_order": [
+      "thumb0",
+      "thumb1",
+      "thumb2",
+      "middle0",
+      "middle1",
+      "index0",
+      "index1"
+    ],
+    "source_disagreement_observed": true,
+    "effect": "Retargeted gesture intention may route middle/index values unexpectedly. The saved command vector is nevertheless the same vector sent by enumerated DDS motor index, and state is read by that same index. This disagreement alone does not prove dataset columns mislabeled.",
+    "automatic_finger_column_swap_authorized_by_evidence": false,
+    "scope": "Current pinned XR source and v0.5 728ffa0f9ff309e52f5cfbc16fea5e5c0e146785 both show the disagreement; neither is asserted to be the unpublished dataset collection commit."
+  },
+  "camera_and_cadence": {
+    "source_camera_count": 4,
+    "target_camera_count": 3,
+    "target_width": 96,
+    "target_height": 64,
+    "source_positions": "head-mounted binocular cameras plus one camera on each wrist",
+    "candidate_head_correspondence": "one source head eye may be selected explicitly for a declared adaptation; cannot certify extrinsic equivalence with a single simulated head camera",
+    "source_to_current_camera_calibration_proven": false,
+    "source_hz": 30.0,
+    "current_control_hz": 15.151515151515152,
+    "source_frames_per_current_interval": 1.98,
+    "every_two_source_frames_hz": 15.0,
+    "every_two_frames_equals_current_control_clock": false,
+    "current_cadence_bridge_proven": false,
+    "source_resampling_performed_by_this_audit": false
+  },
+  "training_qualification": {
+    "source_native_external_demonstrations_invalidated_by_current_teacher_4_of_20": false,
+    "source_native_28d_4camera_30hz_recorded_row_imitation_candidate": true,
+    "source_native_candidate_conditions": [
+      "Actual selected parquet/vector finite and identity audit",
+      "Native video row/PTS checks",
+      "Preserve source task and source-native observation/action protocol",
+      "Declare uncertainty of original sensor timing and requested-vs-applied target",
+      "Establish episode-grouped train/validation/test partitions with source-only training statistics",
+      "Verify chosen pretrained policy native input/output and compute fit"
+    ],
+    "current_31d_closed_loop_training_ready": false,
+    "current_bridge_unproven_prerequisites": [
+      "Missing waist observations and other current sensors (qvel/tactile) cannot be forged",
+      "Real four-camera to simulated three-camera geometry and preprocessing adaptation",
+      "30 Hz recorded rows to current 500/33 Hz execution and anchor-relative chunk semantics",
+      "Public dual-arm commands conflict with current left-hand/left-arm freeze; do not silently modify labels",
+      "Source stacking-task demonstrations are not current green-single-right physical positives",
+      "Current mechanical bounds, velocity/anchor limits, and task replay acceptance",
+      "Adequate independent evaluation split and leakage controls"
+    ],
+    "teacher_gate_meaning": "4/20 concerns the local teacher/scene acceptance; it is not evidence that independent official demonstrations are invalid"
+  }
+}

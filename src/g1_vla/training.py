@@ -1,4 +1,4 @@
-"""Auditable continuous training primitives and a disabled preparation gate.
+"""Auditable continuous training primitives and a conditional readiness gate.
 
 There is deliberately no optimizer loop in this preparation revision. Dataset,
 normalization and loss code are shared package functions, ready for the audited
@@ -300,6 +300,8 @@ def training_readiness(config: Mapping[str, Any]) -> dict:
     for name in ("batch_size", "epochs", "learning_rate"):
         if checked["train"][name] is None:
             errors.append("train." + name + " is unresolved")
+    if checked["train"]["authorization"] != "conditional":
+        errors.append("conditional training authorization is required")
     build_dir = Path(checked["data"]["build_dir"])
     requirements = ["manifest.json", "audit.json", "train.pt", "validation.pt"]
     for name in requirements:
@@ -307,7 +309,7 @@ def training_readiness(config: Mapping[str, Any]) -> dict:
             errors.append("audited dataset artifact missing: " + str(build_dir / name))
     # This preparation revision cannot begin optimization merely by editing a
     # boolean. The source-aligned builder and explicit execution stage remain.
-    errors.append("optimizer runner is intentionally unavailable in the no-training preparation revision")
+    errors.append("the current action31 builder/optimizer runner has not been admitted; source-native public training requires its own audited backend and split")
     return {"ready": False, "blockers": errors, "action_contract_sha256": contract_hash,
             "required_dataset_artifacts": requirements, "optimizer_created": False,
             "warm_start_rule": "exact token mapping and fixed normalization; strict weights only",
@@ -315,7 +317,7 @@ def training_readiness(config: Mapping[str, Any]) -> dict:
 
 
 def train(config: Mapping[str, Any], run_dir: Path) -> dict:
-    """Record the disabled gate. Never creates an optimizer or updates weights."""
+    """Record prerequisites. This unadmitted runner never creates an optimizer."""
     readiness = training_readiness(config)
     enabled = config.get("train", {}).get("enabled")
     result = {"schema": "g1_vla_training_gate_v1", "status": "disabled" if enabled is False else "blocked",
