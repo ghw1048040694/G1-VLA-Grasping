@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -68,6 +68,18 @@ def _protection(inventory):
 
 def execute_stage(stage, config, run):
     report = readiness(config)
+    if stage == "diagnose":
+        from .native_diagnostics import run_native_diagnostics
+        diagnosed = run_native_diagnostics(config, run.path)
+        report.update(stage=stage, native_diagnostics=diagnosed)
+        return report, diagnosed.get("passed") is True
+    if stage in ("act-diagnose", "act-ablate"):
+        from .act_diagnostics import run_act_diagnostics, train_act_ablation
+        diagnosed = (run_act_diagnostics if stage == "act-diagnose" else train_act_ablation)(config, run.path)
+        report.update(stage=stage, act_diagnostics=diagnosed,
+                      training_started=diagnosed.get("training_started", False),
+                      optimizer_steps=diagnosed.get("optimizer_steps", 0))
+        return report, diagnosed.get("passed") is True
     if stage == "source-native-fetch":
         from .external_sources import fetch_source_native_videos
         fetched = fetch_source_native_videos(config, run.path)

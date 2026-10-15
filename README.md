@@ -52,6 +52,18 @@ The native trial predeclares twelve new episodes: six train, three validation an
 
 The small ACT starts from scratch, including its ResNet18 backbone. It does not reuse or pad the pizza-box checkpoint's incompatible 20D action head. `grasp-memory` performs one temporary real forward/backward/AdamW step and the configured evaluation batch, discards its parameters, and binds the observed memory to the exact data/configuration/model code. `train` requires that report and completes at most 200 steps and 1800 seconds with a 7 GiB PyTorch allocator cap. Validation recorded-action MAE selects the checkpoint every 50 steps. `eval` strictly reloads that complete checkpoint and consumes the test split once; state-hold and training-mean baselines use the same targets. These errors do not establish grasp success, language conditioning, real-time control or a 31-joint adapter. Trial checkpoints are new safetensors artifacts and do not provide resume state; existing run directories and checkpoints cannot be overwritten.
 
+ACT failure diagnosis and controlled ablations use the same configuration and entry point:
+
+```bash
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage diagnose
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage act-diagnose
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage act-ablate
+```
+
+`diagnose` independently compares only the nine train/validation episodes with their pinned original rows, metadata, decoded PTS and actual dataset indexing. It measures state/action lag and future-horizon baselines without shifting labels, separates observed joint motion groups, and replays the original sample coverage and L1/KL losses. Hardware acquisition and applied-command clocks remain unknown; a preferred statistical lag never certifies a label correction.
+
+`act-diagnose` verifies the original checkpoint against its saved configuration and runtime, then evaluates validation observations with real images, constant training-channel means, a nonidentity within-episode image shift and an image donor from another validation episode. State and targets stay fixed. `act-ablate` compares RGB, constant-image, genuinely state-only and no-CVAE models using identical compatible initial parameters and the same sampled anchors. The state-only adapter creates no visual or environment-state feature, token or projection; an alias of the same observed joints only supplies the original ACT library's batch-size lookup. Removing CVAE tests the whole variational mechanism, and does not isolate KL weight alone. Each variant has a discarded real memory probe and immutable validation-selected checkpoints. The RGB trajectory must reproduce the original first 200 steps before any longer budget is interpreted. Loss, gradient groups, coverage and label-free prior inference are reported separately. No diagnostic stage reads test arrays/images or performs test inference; extending the budget or trying pretrained initialization requires a new declared run and output directory.
+
 ## Contracts and evidence
 
 - `configs/experiment.json` is the only active configuration; unknown or duplicate JSON keys are rejected.

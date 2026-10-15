@@ -73,6 +73,22 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ConfigError):
                 validate_config(config)
 
+    def test_diagnostic_controls_reject_silent_scope_or_seed_changes(self):
+        for change in ("missing_visual_control", "unknown_variant", "changed_seed", "lag_without_zero", "unordered_motion_thresholds"):
+            config = config_fixture()
+            if change == "missing_visual_control":
+                config["act_diagnostics"]["visual_modes"].pop()
+            elif change == "unknown_variant":
+                config["act_diagnostics"]["variants"] = ["use_test_to_select"]
+            elif change == "changed_seed":
+                config["act_diagnostics"]["seed"] += 1
+            elif change == "lag_without_zero":
+                config["native_diagnostics"]["lag_frames"] = [-1, 1]
+            else:
+                config["native_diagnostics"]["stationary_speed_rad_s"] = 1
+            with self.subTest(change=change), self.assertRaises(ConfigError):
+                validate_config(config)
+
     def test_velocity_zero_is_hold_and_bad_limits_are_rejected(self):
         config = config_fixture()
         config["control"]["max_velocity_rad_s"] = [0.] * 31

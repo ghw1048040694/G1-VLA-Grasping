@@ -140,6 +140,13 @@ def _revision(value: Any, path: str) -> None:
         _error(path, "must be a pinned 40-character Hub commit SHA")
 
 
+def _lags(value: Any, path: str) -> None:
+    if (not isinstance(value, list) or not value or
+            any(isinstance(item, bool) or not isinstance(item, int) or abs(item) > 30 for item in value) or
+            len(value) != len(set(value)) or 0 not in value):
+        _error(path, "must contain unique integer frame lags within [-30, 30], including zero")
+
+
 def _candidates(value: Any, path: str) -> None:
     if not isinstance(value, list) or not value or len(value) > 5:
         _error(path, "must contain one to five pinned model candidates")
@@ -301,6 +308,20 @@ SCHEMA = {
         "max_train_wall_s": _positive, "max_gpu_reserved_bytes": _positive_integer,
         "eval_stride": _positive_integer, "eval_batch_size": _positive_integer,
     },
+    "native_diagnostics": {
+        "training_report_path": _text, "lag_frames": _lags,
+        "stationary_speed_rad_s": _positive, "moving_speed_rad_s": _positive,
+        "loss_window_steps": _positive_integer, "verify_raw_source": _literal(True),
+    },
+    "act_diagnostics": {
+        "backend": _literal("grasp_square_act_diagnostics_v1"),
+        "reference_checkpoint_path": _text, "reference_config_path": _text,
+        "eval_stride": _positive_integer, "eval_batch_size": _positive_integer,
+        "visual_modes": _strings, "image_shift_fraction": _fraction, "seed": _integer,
+        "max_steps": _positive_integer, "eval_every_steps": _positive_integer,
+        "max_train_wall_s": _positive, "max_gpu_reserved_bytes": _positive_integer,
+        "output_dir": _text, "variants": _strings,
+    },
 }
 
 OBSERVATION_FIELDS = frozenset({
@@ -366,6 +387,17 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.grasp_act", "validation interval must fit the step budget; evaluation anchors must not overlap future windows")
     if config["train"]["backend"] == "grasp_square_act" and (config["train"]["resume_checkpoint"] or config["train"]["warm_start_checkpoint"]):
         _error("config.train", "the admitted native ACT baseline starts from scratch")
+    diagnostics, timing = config["act_diagnostics"], config["native_diagnostics"]
+    if set(diagnostics["visual_modes"]) != {"real", "mean_image", "within_episode_shift", "cross_episode_swap"}:
+        _error("config.act_diagnostics.visual_modes", "must retain all four predeclared visual conditions")
+    if not set(diagnostics["variants"]) <= {"rgb", "rgb_mean", "state_only", "rgb_no_vae"}:
+        _error("config.act_diagnostics.variants", "unsupported native ACT ablation variant")
+    if diagnostics["eval_stride"] < act["chunk_size"] or diagnostics["eval_every_steps"] > diagnostics["max_steps"]:
+        _error("config.act_diagnostics", "evaluation must use complete nonoverlapping windows within the step budget")
+    if diagnostics["seed"] != config["train"]["seed"] or diagnostics["max_gpu_reserved_bytes"] > 7 * 1024**3:
+        _error("config.act_diagnostics", "paired trials must retain the training seed and 7 GiB allocator bound")
+    if timing["stationary_speed_rad_s"] >= timing["moving_speed_rad_s"]:
+        _error("config.native_diagnostics", "stationary speed threshold must be lower than moving threshold")
     return copy.deepcopy(config)
 
 
@@ -380,6 +412,8 @@ _PATH_FIELDS = {
     "offline_policy": ("model_dir", "dataset_dir"),
     "source_native": ("build_dir", "video_dir"),
     "grasp_act": ("dataset_manifest_path", "memory_report_path", "checkpoint_path"),
+    "native_diagnostics": ("training_report_path",),
+    "act_diagnostics": ("reference_checkpoint_path", "reference_config_path", "output_dir"),
 }
 
 

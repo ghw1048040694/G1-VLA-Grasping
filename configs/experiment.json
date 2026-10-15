@@ -299,5 +299,29 @@
     "max_gpu_reserved_bytes": 7516192768,
     "eval_stride": 30,
     "eval_batch_size": 8
+  },
+  "native_diagnostics": {
+    "training_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261014-grasp-train-01/reports/grasp_act_training.json",
+    "lag_frames": [-3, -2, -1, 0, 1, 2, 3],
+    "stationary_speed_rad_s": 0.02,
+    "moving_speed_rad_s": 0.1,
+    "loss_window_steps": 20,
+    "verify_raw_source": true
+  },
+  "act_diagnostics": {
+    "backend": "grasp_square_act_diagnostics_v1",
+    "reference_checkpoint_path": ".runtime/rebuild/runs/G1-REBUILD-20261014-grasp-train-01/checkpoint_best",
+    "reference_config_path": ".runtime/rebuild/runs/G1-REBUILD-20261014-grasp-train-01/checkpoint_best/experiment_config.json",
+    "eval_stride": 30,
+    "eval_batch_size": 8,
+    "visual_modes": ["real", "mean_image", "within_episode_shift", "cross_episode_swap"],
+    "image_shift_fraction": 0.5,
+    "seed": 20261014,
+    "max_steps": 200,
+    "eval_every_steps": 50,
+    "max_train_wall_s": 1800,
+    "max_gpu_reserved_bytes": 7516192768,
+    "output_dir": ".runtime/rebuild/diagnostics/phase5-initial-v1",
+    "variants": ["rgb", "rgb_mean", "state_only", "rgb_no_vae"]
   }
 }
