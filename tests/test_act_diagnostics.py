@@ -111,6 +111,24 @@ class DiagnosticAdmissionTests(unittest.TestCase):
             with self.assertRaises(diagnostic.ACTDiagnosticsError):
                 diagnostic.verify_rgb_replay(changed, history)
 
+    def test_extension_cadence_cannot_skip_original_rgb_replay_points(self):
+        reference = {"optimizer_steps": 200, "validation": [{"step": step} for step in (50, 100, 150, 200)]}
+        settings = {**fixture()["act_diagnostics"], "max_steps": 2000}
+        admission = diagnostic.validate_reference_replay_budget(settings, reference)
+        self.assertEqual(admission["required_replay_validation_steps"], [50, 100, 150, 200])
+        for changed in ({**settings, "eval_every_steps": 250}, {**settings, "eval_every_steps": 100},
+                        {**settings, "max_steps": 100}):
+            with self.subTest(settings=changed), self.assertRaises(diagnostic.ACTDiagnosticsError):
+                diagnostic.validate_reference_replay_budget(changed, reference)
+        with self.assertRaises(diagnostic.ACTDiagnosticsError):
+            diagnostic.validate_reference_replay_budget(settings, {**reference, "validation": reference["validation"][:-1]})
+
+    def test_rgb_completion_requires_an_explicit_successful_replay_receipt(self):
+        for entry in ({}, {"original_rgb_replay": {}}, {"original_rgb_replay": {"passed": False}}):
+            with self.subTest(entry=entry), self.assertRaises(diagnostic.ACTDiagnosticsError):
+                diagnostic._require_completed_rgb_replay(entry)
+        diagnostic._require_completed_rgb_replay({"original_rgb_replay": {"passed": True}})
+
 
 @unittest.skipUnless(HAS_NUMPY, "optional NumPy runtime is unavailable")
 class DiagnosticArrayTests(unittest.TestCase):

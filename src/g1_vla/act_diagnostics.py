@@ -536,6 +536,28 @@ def verify_rgb_replay(entry, reference):
             "relative_tolerance": 1e-6, "loss_absolute_tolerance": 1e-6, "validation_mae_absolute_tolerance": 1e-7}
 
 
+def validate_reference_replay_budget(settings, reference):
+    """Every original validation point must be reached before any extension."""
+    count = reference.get("optimizer_steps")
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        raise ACTDiagnosticsError("the reference optimization budget is invalid")
+    points = [item.get("step") for item in reference.get("validation", [])]
+    if (not points or any(isinstance(step, bool) or not isinstance(step, int) or not 0 < step <= count for step in points)
+            or points != sorted(set(points)) or count not in points):
+        raise ACTDiagnosticsError("the reference validation plan must include its final optimization step")
+    if settings["max_steps"] < count:
+        raise ACTDiagnosticsError("matched diagnostics must retain the complete original RGB step budget")
+    if any(step % settings["eval_every_steps"] for step in points):
+        raise ACTDiagnosticsError("the configured validation cadence omits an original RGB replay point")
+    return {"reference_optimizer_steps": count, "required_replay_validation_steps": points,
+            "configured_validation_cadence_reaches_all_reference_points": True}
+
+
+def _require_completed_rgb_replay(entry):
+    if entry.get("original_rgb_replay", {}).get("passed") is not True:
+        raise ACTDiagnosticsError("RGB training cannot complete without its original trajectory replay guard")
+
+
 def train_act_ablation(config, run_dir):
     """Four predeclared native models; no test loading or automatic budget extension."""
     diagnostics, path, report = _stage(config, run_dir, "act_ablation")
@@ -557,8 +579,7 @@ def train_act_ablation(config, run_dir):
                 or reference_training.get("checkpoint", {}).get("provenance_sha256") != binding["reference_provenance_sha256"]
                 or reference_training.get("training_passed") is not True):
             raise ACTDiagnosticsError("the reference training trajectory is not bound to the original selected checkpoint")
-        if settings["max_steps"] < reference_training["optimizer_steps"]:
-            raise ACTDiagnosticsError("matched diagnostics must retain the complete original RGB step budget")
+        report["reference_replay_budget_admission"] = validate_reference_replay_budget(settings, reference_training)
         report["reference_training_report"] = {"path": str(reference_training_path), "sha256": sha256_file(reference_training_path)}
         np, torch, device, blueprint_policy = native._runtime(config, settings, report)
         _verify_reference_runtime(config, diagnostics, report)
@@ -625,6 +646,8 @@ def train_act_ablation(config, run_dir):
                         best_state = {name: tensor.detach().cpu().contiguous().clone() for name, tensor in policy.state_dict().items()}
                     if variant == "rgb" and step == reference_training["optimizer_steps"]:
                         entry["original_rgb_replay"] = verify_rgb_replay(entry, reference_training)
+            if variant == "rgb":
+                _require_completed_rgb_replay(entry)
             if best_state is None:
                 raise ACTDiagnosticsError("a variant did not complete a selectable validation")
             entry["checkpoint"] = _save_variant_checkpoint(output / variant / "checkpoint_best", config, manifest, statistics, binding,

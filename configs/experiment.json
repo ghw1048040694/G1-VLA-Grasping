@@ -317,11 +317,11 @@
     "visual_modes": ["real", "mean_image", "within_episode_shift", "cross_episode_swap"],
     "image_shift_fraction": 0.5,
     "seed": 20261014,
-    "max_steps": 200,
+    "max_steps": 2000,
     "eval_every_steps": 50,
     "max_train_wall_s": 1800,
     "max_gpu_reserved_bytes": 7516192768,
-    "output_dir": ".runtime/rebuild/diagnostics/phase5-initial-v1",
+    "output_dir": ".runtime/rebuild/diagnostics/phase5-extension-v1",
     "variants": ["rgb", "rgb_mean", "state_only", "rgb_no_vae"]
   }
 }
