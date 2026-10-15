@@ -35,9 +35,9 @@ def contract_fixture():
 
 
 class ConfigTests(unittest.TestCase):
-    def test_default_native_training_is_conditionally_authorized(self):
+    def test_current_teacher_configuration_disables_training(self):
         config = load_config(PROJECT / "configs" / "experiment.json")
-        self.assertTrue(config["train"]["enabled"])
+        self.assertFalse(config["train"]["enabled"])
         self.assertEqual(config["train"]["backend"], "grasp_square_act")
         self.assertEqual(config["train"]["authorization"], "conditional")
         self.assertFalse(config["wm"]["enabled"])

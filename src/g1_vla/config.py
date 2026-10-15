@@ -213,9 +213,10 @@ SCHEMA = {
         "include_restart_wait_labels": _literal(False),
         "separate_waypoint_recovery": _literal(True),
         "teacher": {
-            "profile": _choice("green_right_recovery_v1", "green_right_geometry_feedback_v2"),
+            "profile": _choice("green_right_recovery_v1", "green_right_geometry_feedback_v2", "green_right_cavity_feedback_v3"),
             "grasp_yaw_deg": _finite, "closure_multiplier": _positive,
             "finger_scale": _triple, "contact_compensation_m": _triple,
+            "grasp_center_in_palm_m": _triple,
             "pregrasp_height_m": _positive, "pregrasp_lateral_m": _positive,
             "high_pregrasp_height_m": _positive, "home_settle_s": _positive,
             "high_approach_s": _positive, "pregrasp_s": _positive,
@@ -223,6 +224,7 @@ SCHEMA = {
             "grasp_hold_s": _positive, "lift_height_m": _positive,
             "lift_duration_s": _positive, "final_hold_s": _positive,
             "adaptive_regrasp": _boolean, "ik_max_error_m": _positive,
+            "ik_orientation_weight": _positive,
             "ik_collision_margin_m": _positive, "ik_collision_weight": _positive,
             "record_rgb": _literal(True), "palm_position_tolerance_m": _positive,
             "joint_target_tolerance_rad": _positive, "phase_timeout_scale": _positive,
@@ -466,6 +468,9 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if config["train"]["resume_checkpoint"] and config["train"]["warm_start_checkpoint"]:
         _error("config.train", "resume_checkpoint and warm_start_checkpoint are mutually exclusive")
     teacher = config["expert"]["teacher"]
+    if (teacher["profile"] == "green_right_cavity_feedback_v3"
+            and any(value != 0 for value in teacher["contact_compensation_m"])):
+        _error("config.expert.teacher.contact_compensation_m", "cavity profile forbids legacy world compensation")
     if any(value <= 0 for value in teacher["finger_scale"]):
         _error("config.expert.teacher.finger_scale", "must be positive")
     if teacher["phase_timeout_scale"] < 1:

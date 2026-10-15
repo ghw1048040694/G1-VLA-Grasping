@@ -11,7 +11,8 @@ from g1_vla.expert import (ExpertError, effective_compensation, hand_target,
                            pose_tracking_reached, contact_closure_ready, closure_complete,
                            _robot_self_contacts, collision_distance_residual,
                            arm_torso_collision_pairs, run_teacher_episode,
-                           green_contact_penetration_evidence)
+                           green_contact_penetration_evidence, bounded_planning_seed,
+                           interpolate)
 
 
 PROFILE = {
@@ -27,6 +28,7 @@ PROFILE = {
     "adaptive_regrasp": True, "ik_max_error_m": .08, "record_rgb": False,
     "palm_position_tolerance_m": .03, "joint_target_tolerance_rad": .06, "phase_timeout_scale": 3.,
     "ik_collision_margin_m": .002, "ik_collision_weight": 5.,
+    "grasp_center_in_palm_m": [0., .05, 0.], "ik_orientation_weight": .04,
 }
 
 
@@ -170,12 +172,27 @@ class TeacherTests(unittest.TestCase):
         pairs = arm_torso_collision_pairs(model, mujoco_api=api)
         self.assertEqual(pairs, ((0, 3), (0, 4), (1, 3), (1, 4), (2, 3), (2, 4)))
         model.geom_contype[0] = model.geom_conaffinity[0] = 0
-        with self.assertRaisesRegex(ExpertError, "six active"):
+        with self.assertRaisesRegex(ExpertError, "6 active"):
             arm_torso_collision_pairs(model, mujoco_api=api)
         model.geom_contype[0] = model.geom_conaffinity[0] = 1
         model.exclude_signature = [(1 << 16) + 4]
-        with self.assertRaisesRegex(ExpertError, "six active"):
+        with self.assertRaisesRegex(ExpertError, "6 active"):
             arm_torso_collision_pairs(model, mujoco_api=api)
+
+    def test_cavity_pair_contract_adds_only_the_observed_source_elbow_pairs(self):
+        body_ids = {"torso_link": 1, "right_shoulder_roll_link": 3,
+                    "right_shoulder_yaw_link": 4, "right_elbow_link": 5}
+        api = SimpleNamespace(mjtObj=SimpleNamespace(mjOBJ_BODY=1),
+                              mj_name2id=lambda _model, _kind, name: body_ids[name])
+        model = SimpleNamespace(ngeom=6, geom_bodyid=[1, 1, 1, 3, 4, 5],
+                                geom_contype=[1] * 6, geom_conaffinity=[1] * 6,
+                                body_weldid=list(range(6)), body_parentid=[0, 0, 1, 2, 3, 4],
+                                exclude_signature=[])
+        original = arm_torso_collision_pairs(model, mujoco_api=api)
+        extended = arm_torso_collision_pairs(model, include_elbow=True, mujoco_api=api)
+        self.assertEqual(len(original), 6)
+        self.assertEqual(len(extended), 9)
+        self.assertEqual(set(extended) - set(original), {(0, 5), (1, 5), (2, 5)})
 
     def test_mechanical_overrun_remains_visible_inside_declared_tolerance(self):
         model = SimpleNamespace(jnt_limited=[True, True], jnt_range=[[-1., 1.], [-1., 1.]])
@@ -185,6 +202,26 @@ class TeacherTests(unittest.TestCase):
         excess = joint_limit_excesses(model, data, bindings)
         self.assertAlmostEqual(excess["right_hand"], .002)
         self.assertAlmostEqual(excess["left_frozen_hand"], .004)
+        self.assertFalse(all(value <= .003 for value in excess.values()))
+
+    def test_planning_seed_bounds_requests_without_clamping_actual_or_safety(self):
+        import numpy as np
+        actual = np.asarray([2.0948735, -.004, .3])
+        original = actual.copy()
+        low, high = np.asarray([-1.0472, 0., -1.]), np.asarray([2.0944, 1.5708, 1.])
+        seed = bounded_planning_seed(actual, low, high)
+        self.assertTrue(np.array_equal(actual, original))
+        self.assertFalse(np.shares_memory(seed, actual))
+        self.assertEqual(seed.tolist(), [2.0944, 0., .3])
+        for alpha in (0., .25, .5, 1.):
+            requested = np.asarray(interpolate(seed, [1., .6, 0.], alpha))
+            self.assertTrue(np.all(requested >= low) and np.all(requested <= high))
+        model = SimpleNamespace(jnt_limited=[True] * 3, jnt_range=list(zip(low, high)))
+        data = SimpleNamespace(qpos=actual)
+        bindings = {str(i): {"joint_id": i, "qpos_id": i} for i in range(3)}
+        excess = joint_limit_excesses(model, data, bindings)
+        self.assertAlmostEqual(excess["0"], .0004735)
+        self.assertGreater(excess["1"], .003)
         self.assertFalse(all(value <= .003 for value in excess.values()))
 
     def test_final_numeric_gate_checks_force_and_time(self):
@@ -224,6 +261,37 @@ class TeacherTests(unittest.TestCase):
         self.assertAlmostEqual(target[1], .03)
         self.assertEqual(target[2], current_object[2])
         self.assertEqual(PROFILE["contact_compensation_m"][2], -.055)
+
+    def test_cavity_target_uses_one_hand_local_offset_for_all_phase_heights(self):
+        profile = copy.deepcopy(PROFILE)
+        profile.update(profile="green_right_cavity_feedback_v3", grasp_yaw_deg=0.,
+                       contact_compensation_m=[0., 0., 0.])
+        position = [.35, .03, .7744281478732685]
+        for height, lateral in ((.28, 0.), (.12, -.015), (0., 0.), (.22, 0.)):
+            target = green_target_from_position(position, profile, height=height, lateral=lateral)
+            self.assertAlmostEqual(target[0], position[0])
+            self.assertAlmostEqual(target[1], position[1] - .05 + lateral)
+            self.assertAlmostEqual(target[2], position[2] + height)
+            self.assertEqual(target, green_target_from_position(position, profile, height=height,
+                                                               lateral=lateral, compensate=True))
+        profile["grasp_yaw_deg"] = 90.
+        turned = green_target_from_position(position, profile)
+        self.assertAlmostEqual(turned[0], position[0] + .05)
+        self.assertAlmostEqual(turned[1], position[1])
+        self.assertAlmostEqual(turned[2], position[2])
+
+    def test_cavity_profile_cannot_silently_stack_legacy_compensation(self):
+        profile = copy.deepcopy(PROFILE)
+        profile.update(profile="green_right_cavity_feedback_v3", grasp_yaw_deg=0.,
+                       contact_compensation_m=[0., 0., 0.])
+        config = {"train": {"enabled": False}, "wm": {"enabled": False},
+                  "task": {"mode": "grasp_lift", "hand": "right", "object_ids": ["green_cube"]},
+                  "scene": {"assisted_grasp": False}, "eval": {"assisted_grasp": False, "hold_duration_s": .5},
+                  "expert": {"teacher": profile}}
+        self.assertEqual(validate_teacher(config)["grasp_center_in_palm_m"], [0., .05, 0.])
+        profile["contact_compensation_m"][1] = .001
+        with self.assertRaisesRegex(ExpertError, "zero legacy"):
+            validate_teacher(config)
 
     def test_canonical_hand_profile_is_named_and_signed(self):
         self.assertAlmostEqual(hand_target("right_hand_thumb_2_joint", PROFILE), -.72)

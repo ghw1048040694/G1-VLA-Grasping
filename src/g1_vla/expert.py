@@ -40,6 +40,7 @@ PROFILE_KEYS = frozenset({
     "ik_max_error_m", "record_rgb", "palm_position_tolerance_m",
     "joint_target_tolerance_rad", "phase_timeout_scale",
     "ik_collision_margin_m", "ik_collision_weight",
+    "grasp_center_in_palm_m", "ik_orientation_weight",
 })
 
 
@@ -51,6 +52,22 @@ def smoothstep(alpha):
 def interpolate(start, end, alpha):
     alpha = smoothstep(alpha)
     return tuple((1. - alpha) * a + alpha * b for a, b in zip(start, end))
+
+
+def bounded_planning_seed(actual, lower, upper):
+    """Make a legal interpolation reference without changing measured state.
+
+    Soft mechanical limits can admit a small, still acceptance-safe overrun.
+    That measured value remains the controller anchor and safety evidence; it
+    must not become an out-of-range requested target at interpolation alpha=0.
+    """
+    import numpy as np
+    values, low, high = (np.asarray(item, dtype=float) for item in (actual, lower, upper))
+    if (values.ndim != 1 or values.shape != low.shape or values.shape != high.shape
+            or not np.isfinite(values).all() or not np.isfinite(low).all()
+            or not np.isfinite(high).all() or np.any(low > high)):
+        raise ExpertError("planning seed and bounds require matching finite vectors")
+    return np.clip(values, low, high).copy()
 
 
 def effective_compensation(profile, hand="right"):
@@ -67,6 +84,16 @@ def green_target_from_position(object_position, profile, *, height=0., lateral=0
     """Build a privileged teacher goal from the measured, current object center."""
     if len(object_position) != 3 or any(not math.isfinite(float(value)) for value in object_position):
         raise ExpertError("current green object position must contain three finite coordinates")
+    if profile["profile"] == "green_right_cavity_feedback_v3":
+        # The site is at local x=.14, close to the finger roots.  The grasp
+        # cavity is on their shared +local-y side toward the opposing thumb.
+        # Every stage uses this same frame relation, including its approach.
+        x, y, z = profile["grasp_center_in_palm_m"]
+        angle = math.radians(profile["grasp_yaw_deg"])
+        center_world = (math.cos(angle) * x - math.sin(angle) * y,
+                        math.sin(angle) * x + math.cos(angle) * y, z)
+        return tuple(float(object_position[index]) - center_world[index]
+                     + (0., lateral, height)[index] for index in range(3))
     offset = OBJECT_ASSIST_OFFSET_M["green_cube"]
     compensation = effective_compensation(profile) if compensate else (0., 0., 0.)
     return tuple(float(object_position[index]) + offset[index] + compensation[index]
@@ -93,21 +120,25 @@ def validate_teacher(config):
     profile = config["expert"].get("teacher")
     if not isinstance(profile, dict) or set(profile) != PROFILE_KEYS:
         raise ExpertError("expert.teacher must contain the complete explicit physical profile")
-    if profile["profile"] not in ("green_right_recovery_v1", "green_right_geometry_feedback_v2"):
+    if profile["profile"] not in ("green_right_recovery_v1", "green_right_geometry_feedback_v2",
+                                  "green_right_cavity_feedback_v3"):
         raise ExpertError("teacher requires a declared green/right physical profile")
-    for key in PROFILE_KEYS - {"profile", "finger_scale", "contact_compensation_m", "adaptive_regrasp", "record_rgb", "grasp_yaw_deg"}:
+    for key in PROFILE_KEYS - {"profile", "finger_scale", "contact_compensation_m", "grasp_center_in_palm_m", "adaptive_regrasp", "record_rgb", "grasp_yaw_deg"}:
         value = profile[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise ExpertError("expert.teacher.{} must be finite and positive".format(key))
     if isinstance(profile["grasp_yaw_deg"], bool) or not math.isfinite(float(profile["grasp_yaw_deg"])):
         raise ExpertError("grasp_yaw_deg must be finite")
-    for key in ("finger_scale", "contact_compensation_m"):
+    for key in ("finger_scale", "contact_compensation_m", "grasp_center_in_palm_m"):
         values = profile[key]
         if not isinstance(values, list) or len(values) != 3 or any(
                 isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
             raise ExpertError("{} requires three finite values".format(key))
     if any(v <= 0 for v in profile["finger_scale"]):
         raise ExpertError("finger_scale must be positive")
+    if (profile["profile"] == "green_right_cavity_feedback_v3"
+            and any(value != 0 for value in profile["contact_compensation_m"])):
+        raise ExpertError("cavity v3 requires zero legacy contact compensation")
     if not all(isinstance(profile[key], bool) for key in ("adaptive_regrasp", "record_rgb")):
         raise ExpertError("adaptive_regrasp and record_rgb must be booleans")
     if profile["phase_timeout_scale"] < 1:
@@ -199,8 +230,8 @@ def arm_ik_contract(model, *, hand=None, mujoco_api=None):
     return names, qpos, lower, upper
 
 
-def arm_torso_collision_pairs(model, *, mujoco_api=None):
-    """Declare the source model's active torso/shoulder geometry pairs once.
+def arm_torso_collision_pairs(model, *, include_elbow=False, mujoco_api=None):
+    """Declare active torso/shoulder pairs, adding observed elbow pairs for v3.
 
     These are the self contacts measured in the failed teacher, not replacement
     collision shapes. Mask, welded-body, parent-body and explicit-exclusion
@@ -208,10 +239,12 @@ def arm_torso_collision_pairs(model, *, mujoco_api=None):
     """
     api = _api(mujoco_api)
     torso = api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, "torso_link")
-    shoulders = {api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, name)
-                 for name in ("right_shoulder_roll_link", "right_shoulder_yaw_link")}
-    if torso < 0 or min(shoulders) < 0:
-        raise ExpertError("declared torso/right-shoulder collision bodies are missing")
+    body_names = ["right_shoulder_roll_link", "right_shoulder_yaw_link"]
+    if include_elbow:
+        body_names.append("right_elbow_link")
+    arm_bodies = {api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, name) for name in body_names}
+    if torso < 0 or min(arm_bodies) < 0:
+        raise ExpertError("declared torso/right-arm collision bodies are missing")
     excluded = set(int(value) for value in model.exclude_signature)
     pairs = []
     for first in range(model.ngeom):
@@ -220,7 +253,7 @@ def arm_torso_collision_pairs(model, *, mujoco_api=None):
             continue
         for second in range(model.ngeom):
             body_b = int(model.geom_bodyid[second])
-            if body_b not in shoulders:
+            if body_b not in arm_bodies:
                 continue
             compatible = (int(model.geom_contype[first]) & int(model.geom_conaffinity[second])
                           or int(model.geom_contype[second]) & int(model.geom_conaffinity[first]))
@@ -230,8 +263,9 @@ def arm_torso_collision_pairs(model, *, mujoco_api=None):
             signature = (min(body_a, body_b) << 16) + max(body_a, body_b)
             if compatible and weld_a != weld_b and not adjacent and signature not in excluded:
                 pairs.append((first, second))
-    if len(pairs) != 6:
-        raise ExpertError("source-audited torso/shoulder constraint requires exactly six active geom pairs")
+    expected = 9 if include_elbow else 6
+    if len(pairs) != expected:
+        raise ExpertError("source-audited torso/arm constraint requires exactly {} active geom pairs".format(expected))
     return tuple(pairs)
 
 
@@ -439,7 +473,10 @@ def run_teacher_episode(config, spec, run_dir):
     if set(spec.get("positions_m", {})) != {"green_cube"}:
         raise ExpertError("teacher layout must contain only green_cube")
     layout_fingerprint = spec.get("layout_fingerprint") or canonical_sha256(spec["positions_m"])
-    report = {"schema_version": 2, "teacher_protocol": "green_right_strict_shared_pd_feedback_v2",
+    report = {"schema_version": 2,
+              "teacher_protocol": ("green_right_strict_shared_pd_cavity_v3"
+                                   if profile["profile"] == "green_right_cavity_feedback_v3"
+                                   else "green_right_strict_shared_pd_feedback_v2"),
               "task": "green_cube_right_grasp_lift", "layout": spec,
               "layout_fingerprint": layout_fingerprint, "train_started": False,
               "assisted_grasp": False, "profile": dict(profile),
@@ -459,6 +496,7 @@ def run_teacher_episode(config, spec, run_dir):
     diagnostic_video = None
     phase_records, saturation_counts, maximum_actuator_force, physics_warning_counts = [], {}, {}, []
     replan_ledger = []
+    phase_reference_ledger = []
     self_collision_counts, self_collision_penetrations, phase_self_collision_counts = {}, {}, {}
     maximum_green_penetration = {kind: {"penetration_m": 0., "pair": None,
                                       "timestamp_s": None, "phase": None} for kind in ("hand", "table")}
@@ -511,8 +549,20 @@ def run_teacher_episode(config, spec, run_dir):
         report["control"] = controller.metadata()
         report["action_contract"] = contract.metadata()
         orientations = np.asarray([Rotation.from_euler("z", profile["grasp_yaw_deg"], degrees=True).as_matrix()])
-        collision_pairs = arm_torso_collision_pairs(model, mujoco_api=api)
-        report["ik_collision_constraint_scope"] = "six source-active torso/right-shoulder geometry pairs; reject any generated robot self contact at the solution"
+        cavity_profile = profile["profile"] == "green_right_cavity_feedback_v3"
+        collision_pairs = arm_torso_collision_pairs(model, include_elbow=cavity_profile, mujoco_api=api)
+        report["ik_collision_constraint_scope"] = (
+            "nine source-active torso/right-shoulder-and-elbow geometry pairs; reject any generated robot self contact at the solution"
+            if cavity_profile else "six source-active torso/right-shoulder geometry pairs; reject any generated robot self contact at the solution")
+        report["ik_collision_pair_count"] = len(collision_pairs)
+        report["grasp_target_geometry"] = {
+            "mapping": ("object_world - Rz(configured_yaw) @ grasp_center_in_palm_m + world_phase_lateral_and_height"
+                        if cavity_profile else "legacy object assist offset, world lateral - .03m, optional mirrored legacy compensation"),
+            "grasp_center_in_palm_m": list(profile["grasp_center_in_palm_m"]) if cavity_profile else None,
+            "grasp_yaw_deg": float(profile["grasp_yaw_deg"]),
+            "contact_palm_offset_world_m": list(green_target_from_position((0., 0., 0.), profile, compensate=True)),
+            "legacy_assist_offset_applied": not cavity_profile,
+            "ik_orientation_weight": float(profile["ik_orientation_weight"])}
         poses = {"home": baseline[arm_indices].copy()}
         cartesian_targets = {"home": data.site_xpos[palms[1]].copy()}
         reports = {"home": home_report}
@@ -523,7 +573,8 @@ def run_teacher_episode(config, spec, run_dir):
             workspace.qpos[:] = data.qpos
             workspace.qvel[:] = data.qvel
             values, detail = solve_pose(model, workspace, [palms[1]], ids, low, high, np.asarray([target]), seed,
-                                        orientations, max_error_m=min(profile["ik_max_error_m"],
+                                        orientations, orientation_weight=profile["ik_orientation_weight"],
+                                        max_error_m=min(profile["ik_max_error_m"],
                                             profile["palm_position_tolerance_m"]),
                                         collision_pairs=collision_pairs,
                                         collision_margin_m=profile["ik_collision_margin_m"],
@@ -588,7 +639,17 @@ def run_teacher_episode(config, spec, run_dir):
             renderer = api.Renderer(model, height=config["observation"]["image_height"], width=config["observation"]["image_width"])
             builder = ObservationBuilder(model, renderer, names, ObservationSpec.from_config(config), mujoco_api=api)
         language = "grasp the green cube with the right hand and lift it"
-        current_phase, phase_start, phase_seed = "home", 0., poses["home"].copy()
+        current_phase, phase_start = "home", 0.
+        actual_phase_seed = data.qpos[ids].copy()
+        phase_seed = bounded_planning_seed(actual_phase_seed, low, high)
+        phase_reference_ledger.append({
+            "phase": current_phase, "timestamp_s": float(data.time),
+            "joint_names": list(right_names),
+            "raw_actual_arm_qpos_rad": actual_phase_seed.tolist(),
+            "bounded_plan_seed_rad": phase_seed.tolist(),
+            "clip_delta_rad": (phase_seed - actual_phase_seed).tolist(),
+            "maximum_abs_clip_rad": float(np.max(np.abs(phase_seed - actual_phase_seed))),
+            "live_state_modified": False, "controller_anchor_modified": False})
         active_cartesian_target = cartesian_targets["home"].copy()
         interval_contacts, interval_lift, interval_safe, interval_finite = [], [], [], []
         pending = {}
@@ -780,7 +841,16 @@ def run_teacher_episode(config, spec, run_dir):
                     # to the now-lifted object again would cause a second lift.
                     refresh_phase_pose(next_phase, "lift", cartesian_targets["lift"].copy(),
                                        target_relation="preserve_completed_lift_reference")
-                phase_seed = data.qpos[ids].copy()
+                actual_phase_seed = data.qpos[ids].copy()
+                phase_seed = bounded_planning_seed(actual_phase_seed, low, high)
+                phase_reference_ledger.append({
+                    "phase": next_phase, "timestamp_s": float(data.time),
+                    "joint_names": list(right_names),
+                    "raw_actual_arm_qpos_rad": actual_phase_seed.tolist(),
+                    "bounded_plan_seed_rad": phase_seed.tolist(),
+                    "clip_delta_rad": (phase_seed - actual_phase_seed).tolist(),
+                    "maximum_abs_clip_rad": float(np.max(np.abs(phase_seed - actual_phase_seed))),
+                    "live_state_modified": False, "controller_anchor_modified": False})
                 current_phase, phase_start = next_phase, float(data.time)
                 planned_next_phase = None
             elif elapsed >= duration[current_phase] * profile["phase_timeout_scale"]:
@@ -846,6 +916,8 @@ def run_teacher_episode(config, spec, run_dir):
         np.savez_compressed(interrupted_path, **diagnostic)
         report["interrupted_control_artifact"] = str(interrupted_path)
     report["phase_replan_ledger"] = replan_ledger
+    report["phase_reference_ledger"] = phase_reference_ledger
+    report["planning_seed_reference"] = "mechanically bounded copy of raw measured right-arm state for interpolation only; live qpos, observation, controller anchor and original joint-safety tolerance remain unchanged"
     report["active_execution_phase"] = current_phase
     report["planned_next_phase"] = planned_next_phase
     report.setdefault("failed_ik_label", None)

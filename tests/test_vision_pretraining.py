@@ -120,6 +120,8 @@ class VisualPretrainingAdmissionTests(unittest.TestCase):
     def test_selected_data_integrity_failure_is_immutable_and_never_starts_training(self):
         with tempfile.TemporaryDirectory() as directory:
             config = fixture(directory)
+            # Admit this mocked path only to exercise its next integrity guard.
+            config["train"]["enabled"] = True
             with patch.object(diagnostic, "load_diagnostic_data", side_effect=diagnostic.ACTDiagnosticsError("selected train artifact changed")), \
                     patch.object(native, "_runtime") as runtime:
                 report = vision.train_visual_pretraining(config, directory)

@@ -75,6 +75,9 @@ class ResidualAdmissionTests(unittest.TestCase):
                                (residual.train_state_residual, "state_residual_training")):
             with self.subTest(stage=name), tempfile.TemporaryDirectory() as directory:
                 config = fixture(directory)
+                # This test targets the data-integrity guard after admission;
+                # the current teacher configuration deliberately disables it.
+                config["train"]["enabled"] = True
                 with patch.object(diagnostic, "load_diagnostic_data", side_effect=diagnostic.ACTDiagnosticsError("selected train data changed")), \
                         patch.object(native, "_runtime") as runtime:
                     report = function(config, directory)
