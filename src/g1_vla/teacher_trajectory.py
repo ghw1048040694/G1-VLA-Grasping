@@ -347,23 +347,51 @@ class CartesianTeacherPlanner:
 
     def validate_chord(self, first, second, context=None, *, closed=False, lock_rotation=None):
         samples = []
+        first, second = np.asarray(first, dtype=float), np.asarray(second, dtype=float)
+        raw_context = isinstance(context, dict) and context.get("kind") == "actual_state_to_candidate"
+        initial_excess = np.maximum(np.maximum(self.lower - first, first - self.upper), 0.)
+        candidate_legal = bool(np.all(second >= self.lower) and np.all(second <= self.upper))
+        actual_verified, actual_tolerance = None, None
+        if raw_context:
+            supplied_actual = np.asarray(context.get("actual", []), dtype=float)
+            synced_actual = np.asarray(self.workspace.qpos[self.ids], dtype=float)
+            actual_verified = bool(supplied_actual.shape == first.shape == synced_actual.shape
+                                   and np.array_equal(first, supplied_actual) and np.array_equal(first, synced_actual))
+            actual_tolerance = self.config["eval"]["joint_limit_tolerance_rad"]
+        recovery_eligible = bool(raw_context and actual_verified and candidate_legal
+            and np.all(initial_excess <= actual_tolerance))
+        previous_excess = initial_excess.copy()
         spacing = self.settings["maximum_joint_sample_spacing_rad"]
         count = max(self.settings["interpolation_samples"],
-                    int(math.ceil(float(np.max(np.abs(np.asarray(second) - first))) / spacing)) + 1)
+                    int(math.ceil(float(np.max(np.abs(second - first))) / spacing)) + 1)
         for alpha in np.linspace(0., 1., count):
-            q = np.asarray(first) + alpha * (np.asarray(second) - first)
+            q = first + alpha * (second - first)
             pose, contacts = self.reference_pose(q), self._contacts()
             angle = rotation_error(lock_rotation, pose["R"]) if closed and lock_rotation is not None else None
-            passed = (np.all(q >= self.lower) and np.all(q <= self.upper)
+            excess = np.maximum(np.maximum(self.lower - q, q - self.upper), 0.)
+            strict_bounds = bool(np.all(q >= self.lower) and np.all(q <= self.upper))
+            monotonic = bool(np.all(excess <= previous_excess) and np.all(excess <= initial_excess))
+            recovery_used = bool(not strict_bounds and recovery_eligible and monotonic)
+            bounds_passed = strict_bounds or recovery_used
+            previous_excess = excess.copy()
+            passed = (bounds_passed and (not raw_context or actual_verified)
                       and contacts["minimum_self_pair_distance_m"] >= 0.
                       and not contacts["generated_robot_self_contacts"]
                       and (closed or not contacts["generated_hand_object_contacts"])
                       and (angle is None or angle <= self.settings["closed_orientation_tolerance_rad"]))
             samples.append(dict(contacts, alpha=float(alpha), q=q.tolist(), C=pose["C"].tolist(),
-                                R=pose["R"].tolist(), closed_rotation_error_rad=angle, passed=bool(passed)))
+                                R=pose["R"].tolist(), closed_rotation_error_rad=angle, passed=bool(passed),
+                                nominal_mechanical_bounds_passed=strict_bounds, joint_limit_excess_rad=excess.tolist(),
+                                raw_recovery_exception_used=recovery_used, raw_recovery_monotonic=monotonic))
         return {"passed": all(sample["passed"] for sample in samples), "samples": samples,
                 "closed": closed, "maximum_joint_sample_spacing_rad": spacing,
                 "sample_count": count, "context": context,
+                "raw_recovery": {"context_kind": context.get("kind") if isinstance(context, dict) else None,
+                    "actual_start_verified": actual_verified, "initial_joint_limit_excess_rad": initial_excess.tolist(),
+                    "maximum_initial_joint_limit_excess_rad": float(np.max(initial_excess)),
+                    "original_actual_safety_tolerance_rad": actual_tolerance, "candidate_nominally_legal": candidate_legal,
+                    "eligible": recovery_eligible,
+                    "exception_used": any(sample["raw_recovery_exception_used"] for sample in samples)},
                 "scope": "workspace FK/contact sampling; actual PD path remains separately measured"}
 
     def latch_grip(self, data):

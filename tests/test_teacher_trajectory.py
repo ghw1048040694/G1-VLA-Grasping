@@ -282,6 +282,65 @@ class TrajectoryTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(result["samples"][-1]["generated_robot_self_contacts"], {"unlisted_arm:leg": .001})
 
+    def raw_recovery_planner(self, actual):
+        planner = self.planner()
+        planner.ids = [0]
+        planner.workspace = SimpleNamespace(qpos=np.asarray(actual, dtype=float).copy())
+        planner.config = {"eval": {"joint_limit_tolerance_rad": .003}}
+        return planner
+
+    def test_raw_recovery_accepts_observed_32microradian_soft_overrun_without_clipping(self):
+        first, second = np.array([1.000032216]), np.array([1.])
+        context = {"kind": "actual_state_to_candidate", "actual": first.tolist()}
+        original = (first.copy(), second.copy(), copy.deepcopy(context))
+        planner = self.raw_recovery_planner(first)
+        result = planner.validate_chord(first, second, context)
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["raw_recovery"]["actual_start_verified"])
+        self.assertTrue(result["raw_recovery"]["exception_used"])
+        self.assertFalse(result["samples"][0]["nominal_mechanical_bounds_passed"])
+        self.assertTrue(result["samples"][-1]["nominal_mechanical_bounds_passed"])
+        self.assertAlmostEqual(result["raw_recovery"]["maximum_initial_joint_limit_excess_rad"], .000032216)
+        excess = [row["joint_limit_excess_rad"][0] for row in result["samples"]]
+        self.assertTrue(all(second <= first for first, second in zip(excess, excess[1:])))
+        np.testing.assert_array_equal(first, original[0])
+        np.testing.assert_array_equal(second, original[1])
+        self.assertEqual(context, original[2])
+        np.testing.assert_array_equal(planner.workspace.qpos, first)
+
+    def test_raw_recovery_rejects_unsafe_start_or_illegal_candidate(self):
+        for first, second in (([1.0031], [1.]), ([1.000032216], [1.000001]),
+                              ([1.000032216], [1.00004])):
+            planner = self.raw_recovery_planner(first)
+            result = planner.validate_chord(first, second, {"kind": "actual_state_to_candidate", "actual": list(first)})
+            self.assertFalse(result["passed"])
+            self.assertFalse(result["raw_recovery"]["eligible"])
+
+    def test_raw_recovery_requires_exact_real_start_and_only_actual_context(self):
+        first, second = [1.000032216], [1.]
+        for context in (None, {"kind": "polyline_piece"}, {"kind": "applied_command_shortcut"},
+                        {"kind": "actual_state_to_candidate", "actual": [1.00003]}):
+            result = self.raw_recovery_planner(first).validate_chord(first, second, context)
+            self.assertFalse(result["passed"])
+        # Merely echoing a fabricated first vector in context is insufficient:
+        # it must also match the untouched workspace copied from the live state.
+        planner = self.raw_recovery_planner([1.00003])
+        result = planner.validate_chord(first, second, {"kind": "actual_state_to_candidate", "actual": first})
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["raw_recovery"]["actual_start_verified"])
+
+    def test_raw_recovery_preserves_all_native_and_closed_orientation_rejections(self):
+        first, second = [1.000032216], [1.]
+        context = {"kind": "actual_state_to_candidate", "actual": first}
+        planner = self.raw_recovery_planner(first)
+        contacts = planner._contacts()
+        contacts["generated_robot_self_contacts"] = {"torso:arm": .0001}
+        planner._contacts = lambda: contacts
+        self.assertFalse(planner.validate_chord(first, second, context)["passed"])
+        planner = self.raw_recovery_planner(first)
+        self.assertFalse(planner.validate_chord(first, second, context, closed=True,
+            lock_rotation=Rotation.from_euler("z", .051).as_matrix())["passed"])
+
     def test_closed_endpoint_requires_actual_orientation_and_taskpoint(self):
         planner = self.planner()
         pose = {"arm": np.array([.1]), "C": np.zeros(3), "R": np.eye(3)}

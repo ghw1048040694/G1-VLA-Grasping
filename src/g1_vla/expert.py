@@ -520,6 +520,7 @@ def run_teacher_episode(config, spec, run_dir):
                   "plans": [], "execution_ledger": [], "grip_lock": None, "progress_blocked_count": 0,
                   "workspace_snapshots": [],
                   "limiter_mismatch_count": 0, "planning_failure": None,
+                  "raw_recovery_chord_count": 0, "maximum_raw_recovery_initial_joint_excess_rad": 0.,
                   "settings": dict(config["expert"].get("trajectory", {})) if cartesian_profile else None,
                   "maximum_closed_rotation_error_rad": 0., "maximum_taskpoint_tracking_error_m": 0.,
                   "rotation_measurement_scope": "actual lift/hold post-control states relative to the post-grasp grip lock at the original control cadence; not every physics substep"}
@@ -663,6 +664,11 @@ def run_teacher_episode(config, spec, run_dir):
                         result = planner.validate_chord(first, second, context, closed=closed_geometry,
                             lock_rotation=active_plan["target_R"] if active_plan["closed"] else None)
                         result["workspace_snapshot_index"] = len(snapshots) - 1
+                        if result["raw_recovery"]["exception_used"]:
+                            trajectory["raw_recovery_chord_count"] += 1
+                            trajectory["maximum_raw_recovery_initial_joint_excess_rad"] = max(
+                                trajectory["maximum_raw_recovery_initial_joint_excess_rad"],
+                                result["raw_recovery"]["maximum_initial_joint_limit_excess_rad"])
                         return result
 
                     path_progress = JointPathProgress(next_plan["q_waypoints"], planner.velocity,
