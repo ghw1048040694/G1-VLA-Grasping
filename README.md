@@ -124,3 +124,15 @@ The original source is preserved by Git tag `codex/g1-before-rebuild-20261014` a
 The latest archived matched evaluations 688/690/691 each had zero real contact and zero complete success in six episodes. Historical hybrid successes used classical control and assisted grasp; they are not end-to-end VLA results.
 
 See `docs/ARCHITECTURE.md` for package responsibilities and the current preparation boundary.
+
+Normalization attribution and a train-only constant residual use the same entry point:
+
+```sh
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage constant-residual --run-id G1-REBUILD-20261015-constant-residual-01
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage normalization-check --run-id G1-REBUILD-20261015-normalization-check-01
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage normalization-train --run-id G1-REBUILD-20261015-normalization-train-01
+```
+
+`normalization_attribution` trains two fresh zero-head, no-VAE residual models on the admitted fourteen train episodes while explicitly using the original six train episodes' statistics. Dataset statistics retain their real fourteen-episode origin; checkpoints separately bind the six-episode model normalizer. Both models replay the expanded reference's exact initialization, RNG and sampled anchors, with 2000 steps per arm and unchanged validation. The existing six-train/old-statistics and fourteen-train/new-statistics results are immutable references, without new training or inference. This follows one path through data membership and a joint normalizer change; it does not identify their interaction or separate state, image and residual-scale effects. Only raw radian metrics are compared across normalizers.
+
+`constant_residual` fits a fixed [16,28] raw residual on every complete train anchor, once for the original six episodes and once for all fourteen. Source FP32 labels and anchors are subtracted in FP64, the pooled coordinate median uses the midpoint for even populations, and parameters are saved in FP32. Inference adds the saved constant to raw current joints, preserving raw anchor bits for exact zero parameters. It uses no RGB, validation fitting, scaling or checkpoint selection. This is a closed-form train fit with zero optimizer steps; using every train anchor does not match the neural training compute budget. Original six, added eight, all fourteen and the frozen validation episodes share the same evaluation stride, with fit membership recorded explicitly. Test payloads remain excluded.

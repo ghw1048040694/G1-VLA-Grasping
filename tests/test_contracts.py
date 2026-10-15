@@ -170,6 +170,36 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ConfigError):
                 validate_config(config)
 
+    def test_normalization_and_constant_controls_keep_the_declared_treatment(self):
+        for change in ("budget", "statistics_population", "statistics_path", "missing_rgb", "manifest",
+                       "fit_validation", "fit_order", "mean_fit", "decode", "stride", "reference"):
+            config = config_fixture()
+            model, constant = config["normalization_attribution"], config["constant_residual"]
+            if change == "budget":
+                model["max_steps"] += 50
+            elif change == "statistics_population":
+                model["model_statistics_source"] = "expanded_fourteen_train_only_v1"
+            elif change == "statistics_path":
+                model["reference_statistics_manifest_path"] = model["data_manifest_path"]
+            elif change == "missing_rgb":
+                model["variants"].pop()
+            elif change == "manifest":
+                model["data_manifest_sha256"] = "0" * 64
+            elif change == "fit_validation":
+                constant["fit_cohorts"].append("validation")
+            elif change == "fit_order":
+                constant["fit_cohorts"].reverse()
+            elif change == "mean_fit":
+                constant["method"] = "mean"
+            elif change == "decode":
+                constant["decode"] = "inverse_normalized_anchor_plus_bias"
+            elif change == "stride":
+                constant["eval_stride"] = 1
+            else:
+                constant["reference_expanded_report_sha256"] = "0" * 64
+            with self.subTest(change=change), self.assertRaises(ConfigError):
+                validate_config(config)
+
     def test_velocity_zero_is_hold_and_bad_limits_are_rejected(self):
         config = config_fixture()
         config["control"]["max_velocity_rad_s"] = [0.] * 31

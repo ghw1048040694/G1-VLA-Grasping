@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "constant-residual", "normalization-check", "normalization-train", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -68,6 +68,20 @@ def _protection(inventory):
 
 def execute_stage(stage, config, run):
     report = readiness(config)
+    if stage == "constant-residual":
+        from .constant_residual import run_constant_residual_audit
+        result = run_constant_residual_audit(config, run.path)
+        report.update(stage=stage, constant_residual=result,
+                      closed_form_train_fit_performed=result.get("closed_form_train_fit_performed", False),
+                      optimizer_steps=result.get("optimizer_steps", 0))
+        return report, result.get("passed") is True
+    if stage in ("normalization-check", "normalization-train"):
+        from .normalization_attribution import run_normalization_admission, train_normalization_attribution
+        result = (run_normalization_admission if stage == "normalization-check" else train_normalization_attribution)(config, run.path)
+        report.update(stage=stage, normalization_attribution=result,
+                      training_started=result.get("training_started", False),
+                      optimizer_steps=result.get("optimizer_steps", 0))
+        return report, result.get("passed") is True
     if stage in ("expansion-audit", "expansion-build"):
         from .train_expansion import audit_train_expansion, build_train_expansion
         result = (audit_train_expansion if stage == "expansion-audit" else build_train_expansion)(config, run.path)

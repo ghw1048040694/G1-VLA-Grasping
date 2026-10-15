@@ -435,5 +435,49 @@
     "data_manifest_sha256": "afdd619261987aaf9f45df5b8ea669281897f212a300574e0204d273df9e52e1",
     "reference_residual_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-residual-train-01/reports/state_residual_training.json",
     "reference_residual_report_sha256": "63ff2c3d9ca209f0bd57293aa0d618120a085500d31cd89bce97e2cae0b1e7b2"
+  },
+  "normalization_attribution": {
+    "backend": "grasp_square_normalization_attribution_v1",
+    "variants": [
+      "state_only_residual",
+      "rgb_residual_scratch"
+    ],
+    "use_vae": false,
+    "target": "raw_action_minus_anchor_q_over_train_action_std_v1",
+    "decode": "raw_anchor_q_plus_train_action_std_times_residual_zero_exact_v1",
+    "zero_head_init": true,
+    "include_step_zero_in_selection": true,
+    "seed": 20261014,
+    "max_steps": 2000,
+    "eval_every_steps": 50,
+    "eval_stride": 30,
+    "eval_batch_size": 8,
+    "max_train_wall_s": 1800,
+    "max_gpu_reserved_bytes": 7516192768,
+    "output_dir": ".runtime/rebuild/diagnostics/phase9-old-statistics-v1",
+    "admission_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-normalization-check-01/reports/normalization_admission.json",
+    "data_manifest_path": ".runtime/rebuild/data/grasp-square-native-stage8-v1/manifest.json",
+    "data_manifest_sha256": "afdd619261987aaf9f45df5b8ea669281897f212a300574e0204d273df9e52e1",
+    "reference_residual_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-residual-train-01/reports/state_residual_training.json",
+    "reference_residual_report_sha256": "63ff2c3d9ca209f0bd57293aa0d618120a085500d31cd89bce97e2cae0b1e7b2",
+    "reference_expanded_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-expanded-train-01/reports/expanded_residual_training.json",
+    "reference_expanded_report_sha256": "211be9d5ae95e4efc2e81ab601dcc7b616efad613a3cea1ecc6fdb8b202bba15",
+    "reference_statistics_manifest_path": ".runtime/rebuild/data/grasp-square-native-stage4-v1/manifest.json",
+    "reference_statistics_manifest_sha256": "ea8f80e28c7626cc0221419557a4368e91cc90cb82e770e044ac512fdc7b074b",
+    "reference_statistics_sha256": "b586cd81ac98f848ca431fa9d3bc188e6d074239d864d94d2f87b72ef6e91b99",
+    "model_statistics_source": "original_six_train_only_v1"
+  },
+  "constant_residual": {
+    "backend": "grasp_square_train_median_residual_v1",
+    "method": "per_horizon_joint_raw_residual_median_all_complete_train_anchors_v1",
+    "decode": "raw_anchor_q_plus_raw_constant_zero_exact_v1",
+    "fit_cohorts": [
+      "original_six",
+      "expanded_fourteen"
+    ],
+    "eval_stride": 30,
+    "output_dir": ".runtime/rebuild/diagnostics/phase9-constant-residual-v1",
+    "reference_expanded_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-expanded-train-01/reports/expanded_residual_training.json",
+    "reference_expanded_report_sha256": "211be9d5ae95e4efc2e81ab601dcc7b616efad613a3cea1ecc6fdb8b202bba15"
   }
 }

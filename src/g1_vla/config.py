@@ -381,6 +381,31 @@ SCHEMA = {
         "reference_residual_report_path": _text, "reference_residual_report_sha256": _hash,
         "admission_report_path": _text,
     },
+    "normalization_attribution": {
+        "backend": _literal("grasp_square_normalization_attribution_v1"),
+        "variants": _strings, "use_vae": _literal(False),
+        "target": _literal("raw_action_minus_anchor_q_over_train_action_std_v1"),
+        "decode": _literal("raw_anchor_q_plus_train_action_std_times_residual_zero_exact_v1"),
+        "zero_head_init": _literal(True), "include_step_zero_in_selection": _literal(True),
+        "seed": _integer, "max_steps": _positive_integer,
+        "eval_every_steps": _positive_integer, "eval_stride": _positive_integer,
+        "eval_batch_size": _positive_integer, "max_train_wall_s": _positive,
+        "max_gpu_reserved_bytes": _positive_integer, "output_dir": _text,
+        "data_manifest_path": _text, "data_manifest_sha256": _hash,
+        "reference_residual_report_path": _text, "reference_residual_report_sha256": _hash,
+        "reference_expanded_report_path": _text, "reference_expanded_report_sha256": _hash,
+        "reference_statistics_manifest_path": _text, "reference_statistics_manifest_sha256": _hash,
+        "reference_statistics_sha256": _hash,
+        "model_statistics_source": _literal("original_six_train_only_v1"),
+        "admission_report_path": _text,
+    },
+    "constant_residual": {
+        "backend": _literal("grasp_square_train_median_residual_v1"),
+        "method": _literal("per_horizon_joint_raw_residual_median_all_complete_train_anchors_v1"),
+        "decode": _literal("raw_anchor_q_plus_raw_constant_zero_exact_v1"),
+        "fit_cohorts": _strings, "eval_stride": _positive_integer, "output_dir": _text,
+        "reference_expanded_report_path": _text, "reference_expanded_report_sha256": _hash,
+    },
 }
 
 OBSERVATION_FIELDS = frozenset({
@@ -500,6 +525,21 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
             _error("config.expanded_residual." + key, "must bind the same frozen residual comparison as the data audit")
     if Path(expanded["data_manifest_path"]) != Path(expansion["build_dir"]) / "manifest.json":
         _error("config.expanded_residual.data_manifest_path", "must name the new expanded-data manifest")
+    attribution, constant = config["normalization_attribution"], config["constant_residual"]
+    for key in ("variants", "seed", "max_steps", "eval_every_steps", "eval_stride", "eval_batch_size",
+                "max_train_wall_s", "max_gpu_reserved_bytes", "data_manifest_path", "data_manifest_sha256",
+                "reference_residual_report_path", "reference_residual_report_sha256"):
+        if attribution[key] != expanded[key]:
+            _error("config.normalization_attribution." + key, "must retain the frozen expanded data and optimizer protocol")
+    if Path(attribution["reference_statistics_manifest_path"]) != Path(config["grasp_act"]["dataset_manifest_path"]):
+        _error("config.normalization_attribution.reference_statistics_manifest_path", "must identify the original six-train statistics source")
+    if constant["fit_cohorts"] != ["original_six", "expanded_fourteen"]:
+        _error("config.constant_residual.fit_cohorts", "must retain both predeclared train-only fits")
+    if constant["eval_stride"] != expanded["eval_stride"]:
+        _error("config.constant_residual.eval_stride", "must retain the original validation anchor cohort")
+    for key in ("reference_expanded_report_path", "reference_expanded_report_sha256"):
+        if constant[key] != attribution[key]:
+            _error("config.constant_residual." + key, "must bind the same frozen fourteen-train comparison")
     return copy.deepcopy(config)
 
 
@@ -521,6 +561,8 @@ _PATH_FIELDS = {
     "trajectory_coverage": ("reference_training_report_path",),
     "train_expansion": ("reference_coverage_report_path", "reference_residual_report_path", "session_evidence_path", "candidate_build_dir", "build_dir", "audit_report_path"),
     "expanded_residual": ("data_manifest_path", "reference_residual_report_path", "admission_report_path", "output_dir"),
+    "normalization_attribution": ("data_manifest_path", "reference_residual_report_path", "reference_expanded_report_path", "reference_statistics_manifest_path", "admission_report_path", "output_dir"),
+    "constant_residual": ("reference_expanded_report_path", "output_dir"),
 }
 
 
