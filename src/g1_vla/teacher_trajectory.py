@@ -503,8 +503,13 @@ class CartesianTeacherPlanner:
 
     def end_reached(self, plan, data):
         pose = self.actual_pose(data)
+        # Reference tracking and world-goal accuracy are distinct. Re-evaluate
+        # the *fixed planned arm q*, with the true base/waist/other free joints.
+        # The actual right-arm q is replaced in workspace, never in live data.
+        self.sync_actual(data)
+        endpoint_reference = self.reference_pose(np.asarray(plan["q_waypoints"][-1]))
         return bool(np.max(np.abs(pose["arm"] - np.asarray(plan["q_waypoints"][-1]))) <= self.settings["reference_tracking_rad"]
                     and np.linalg.norm(pose["C"] - np.asarray(plan["target_C"])) <= self.settings["taskpoint_tolerance_m"]
-                    and np.linalg.norm(pose["C"] - np.asarray(plan["endpoint_C"])) <= self.settings["reference_tracking_m"]
+                    and np.linalg.norm(pose["C"] - endpoint_reference["C"]) <= self.settings["reference_tracking_m"]
                     and (not plan["closed"] or rotation_error(plan["target_R"], pose["R"])
                          <= self.settings["closed_orientation_tolerance_rad"]))

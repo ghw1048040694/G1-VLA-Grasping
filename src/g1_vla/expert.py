@@ -845,6 +845,7 @@ def run_teacher_episode(config, spec, run_dir):
                     actual_pose = planner.actual_pose(data)
                     planner.sync_actual(data)
                     reference = planner.reference_pose(np.asarray(pending["requested"])[arm_indices])
+                    endpoint_reference = planner.reference_pose(np.asarray(active_plan["q_waypoints"][-1]))
                     tracking_error = float(np.linalg.norm(actual_pose["C"] - reference["C"]))
                     closed_error = (rotation_error(grip_lock["R"], actual_pose["R"])
                                     if grip_lock is not None and active_plan["closed"] else None)
@@ -858,6 +859,9 @@ def run_teacher_episode(config, spec, run_dir):
                         "endpoint_grasp_center_error_m": float(np.linalg.norm(actual_pose["C"] - active_plan["target_C"])),
                         "declared_taskpoint_goal_error_m": float(np.linalg.norm(actual_pose["C"] - active_plan["target_C"])),
                         "fixed_endpoint_reference_C_error_m": float(np.linalg.norm(actual_pose["C"] - active_plan["endpoint_C"])),
+                        "fixed_world_endpoint_C_error_m": float(np.linalg.norm(actual_pose["C"] - active_plan["endpoint_C"])),
+                        "current_endpoint_reference_C_error_m": float(np.linalg.norm(actual_pose["C"] - endpoint_reference["C"])),
+                        "current_endpoint_reference_C_m": endpoint_reference["C"].tolist(),
                         "taskpoint_reference_tracking_error_m": tracking_error,
                         "closed_grip_rotation_error_rad": closed_error, "arm_limiter_delta_rad": mismatch})
                     trajectory["maximum_taskpoint_tracking_error_m"] = max(trajectory["maximum_taskpoint_tracking_error_m"], tracking_error)
@@ -868,6 +872,7 @@ def run_teacher_episode(config, spec, run_dir):
                         "reference_sha256": active_plan["reference_sha256"], "progress": dict(path_status),
                         "raw_actual_arm_qpos_rad": actual_pose["arm"].tolist(),
                         "actual_C": actual_pose["C"].tolist(), "actual_R": actual_pose["R"].tolist(),
+                        "full_state": planner.state_snapshot(data),
                         "requested_arm_rad": np.asarray(pending["requested"])[arm_indices].tolist(),
                         "applied_arm_rad": np.asarray(pending["command"])[arm_indices].tolist(),
                         "fixed_endpoint_palm_m": active_plan["endpoint_palm"], "tracking": dict(latest_tracking)})

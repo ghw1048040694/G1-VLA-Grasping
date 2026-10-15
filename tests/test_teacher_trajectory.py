@@ -286,6 +286,9 @@ class TrajectoryTests(unittest.TestCase):
         planner = self.planner()
         pose = {"arm": np.array([.1]), "C": np.zeros(3), "R": np.eye(3)}
         planner.actual_pose = lambda data: pose
+        current_reference_C = np.zeros(3)
+        planner.sync_actual = lambda data: None
+        planner.reference_pose = lambda q: {"C": current_reference_C.copy()}
         plan = {"q_waypoints": [[0.], [.1]], "target_C": [0., 0., 0.],
                 "endpoint_C": [0., 0., 0.],
                 "target_R": np.eye(3).tolist(), "closed": True}
@@ -298,10 +301,40 @@ class TrajectoryTests(unittest.TestCase):
         pose["R"], pose["C"] = np.eye(3), np.array([.0031, 0., 0.])
         self.assertFalse(planner.end_reached(plan, None))
         plan["endpoint_C"] = [.014, 0., 0.]
+        current_reference_C[:] = [.014, 0., 0.]
         pose["C"] = np.array([.010, 0., 0.])
         self.assertFalse(planner.end_reached(plan, None))
         pose["C"] = np.array([.014, 0., 0.])
         self.assertTrue(planner.end_reached(plan, None))
+
+    def test_endpoint_tracking_accounts_for_base_frame_without_moving_world_goal_or_arm_reference(self):
+        planner = self.planner()
+        planner.settings["taskpoint_tolerance_m"] = .015
+        base = np.array([.006, 0., 0.])
+        actual_arm = np.array([.1])
+        plan = {"q_waypoints": [[0.], [.1]], "target_C": [0., 0., 0.],
+                "endpoint_C": [0., 0., 0.], "target_R": np.eye(3).tolist(), "closed": False}
+        unchanged = copy.deepcopy(plan)
+        planner.actual_pose = lambda data: {"arm": actual_arm.copy(), "C": base.copy(), "R": np.eye(3)}
+        planner.sync_actual = lambda data: None
+        queried = []
+        def reference(q):
+            queried.append(np.asarray(q).copy())
+            return {"C": base + np.array([q[0] - .1, 0., 0.])}
+        planner.reference_pose = reference
+        self.assertTrue(planner.end_reached(plan, None))
+        np.testing.assert_array_equal(queried[-1], [.1])
+        self.assertEqual(plan, unchanged)
+        # Accurate joint tracking cannot excuse violating the fixed world goal.
+        base[:] = [.016, 0., 0.]
+        self.assertFalse(planner.end_reached(plan, None))
+        # Reference FK is independent of the measured right-arm q: a .01rad
+        # discrepancy passes the .02 joint gate, but fails 3mm task tracking.
+        base[:] = [.006, 0., 0.]
+        planner.actual_pose = lambda data: {"arm": np.array([.11]), "C": base + [.01, 0., 0.], "R": np.eye(3)}
+        plan["target_C"] = [.006, 0., 0.]
+        self.assertFalse(planner.end_reached(plan, None))
+        np.testing.assert_array_equal(queried[-1], [.1])
 
     def test_workspace_refresh_copies_entire_free_object_state_without_mutating_live(self):
         planner = self.planner()
