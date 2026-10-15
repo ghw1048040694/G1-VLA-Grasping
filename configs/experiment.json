@@ -346,7 +346,7 @@
     "reference_ablation_report_sha256": "d57edbcbb6909efe815f8eaddfbecb0400201847501b7d3e40dd2968d1c9c92b",
     "weights_url": "https://download.pytorch.org/models/resnet18-f37072fd.pth",
     "weights_sha256_prefix": "f37072fd",
-    "weights_sha256": null,
+    "weights_sha256": "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec",
     "weights_max_bytes": 67108864,
     "weights_cache_path": ".runtime/rebuild/weights/torchvision-resnet18-imagenet1k-v1/resnet18-f37072fd.pth",
     "weights_receipt_path": ".runtime/rebuild/weights/torchvision-resnet18-imagenet1k-v1/receipt.json"
