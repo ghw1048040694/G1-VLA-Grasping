@@ -411,6 +411,55 @@ class TrajectoryTests(unittest.TestCase):
         self.assertFalse(partial["live_state_modified"])
         np.testing.assert_array_equal(data.qpos, locked_C)
 
+    def test_open_orientation_changes_geodesically_from_applied_reference_but_closed_is_fixed(self):
+        for phase in ("pregrasp", "contact", "lift"):
+            planner = self.planner()
+            start_R = Rotation.from_euler("z", .1).as_matrix()
+            goal_R = Rotation.from_euler("z", .12 if phase == "lift" else .8).as_matrix()
+            planner.contact_rotation = goal_R.copy()
+            planner.center = np.array([0., .05, 0.])
+            planner.lower, planner.upper = np.full(3, -2.), np.full(3, 2.)
+            planner.anchor, planner.velocity, planner.period = np.full(3, .08), np.ones(3), .066
+            planner.names, planner.pairs = ["a", "b", "c"], [(0, 1)] * 9
+            planner.pair_evidence, planner.pair_signature = [], "fake-geometry-test"
+            planner.object_body, planner.model = 0, SimpleNamespace(njnt=0)
+            planner._copy_visited = lambda data: None
+            planner.state_snapshot = lambda data: {"time_s": data.time, "qpos": data.qpos.tolist()}
+            planner.profile.update(pregrasp_lateral_m=.015, pregrasp_height_m=.12,
+                pregrasp_s=.8, contact_approach_s=.9, close_duration_s=.6,
+                lift_height_m=.22, lift_duration_s=2., phase_timeout_scale=3.)
+            planner.settings["waypoint_spacing_m"] = .01
+            # Measured R differs slightly from the applied-reference FK. The
+            # orientation and C path must use the same independent q0 frame.
+            planner.actual_pose = lambda data: {"C": data.qpos.copy(),
+                "R": Rotation.from_euler("z", .104).as_matrix(),
+                "palm": data.qpos - start_R @ planner.center, "arm": data.qpos.copy()}
+            R_workspace, targets = [start_R.copy()], []
+            planner.reference_pose = lambda q: {"C": np.asarray(q).copy(), "R": R_workspace[0].copy(),
+                "palm": np.asarray(q) - R_workspace[0] @ planner.center, "arm": np.asarray(q).copy()}
+            def solve(C, R, seed, *, closed=False):
+                self.assertEqual(closed, phase == "lift")
+                targets.append(np.asarray(R).copy())
+                R_workspace[0] = np.asarray(R).copy()
+                return np.asarray(C).copy(), {"taskpoint_error_m": 0., "R": np.asarray(R).tolist()}
+            planner._solve = solve
+            planner.validate_chord = lambda *args, **kwargs: {"passed": True}
+            q0 = np.array([.3, -.005, 1.08 if phase == "pregrasp" else .92])
+            data = SimpleNamespace(time=3., xpos=np.array([[.3, .01, .8]]), qpos=q0.copy())
+            lock = {"C": q0.tolist(), "R": goal_R.tolist()} if phase == "lift" else None
+            plan = planner.plan_phase(phase, data, q0, grip_lock=lock)
+            self.assertGreater(len(targets), 1)
+            np.testing.assert_allclose(targets[-1], goal_R, atol=1e-12)
+            if phase == "lift":
+                for R in targets:
+                    np.testing.assert_allclose(R, goal_R, atol=1e-12)
+            else:
+                total = rotation_error(start_R, goal_R)
+                self.assertAlmostEqual(rotation_error(start_R, targets[0]), total / len(targets))
+                self.assertLess(rotation_error(start_R, targets[0]), total)
+                self.assertEqual(plan["orientation_schedule"], "entry_reference_FK_geodesic_to_contact_goal")
+            np.testing.assert_array_equal(data.qpos, q0)
+
 
 if __name__ == "__main__":
     unittest.main()

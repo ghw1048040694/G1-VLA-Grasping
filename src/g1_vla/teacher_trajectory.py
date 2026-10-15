@@ -393,6 +393,9 @@ class CartesianTeacherPlanner:
         high_solution, lookahead = None, []
         waypoints, details = [q0], []
         target, goal_R = None, None
+        orientation_schedule = ("entry_reference_FK_geodesic_to_contact_goal"
+            if phase in ("pregrasp", "contact") else "audited_joint_transit"
+            if phase == "high_approach" else "fixed_attained_grip_rotation")
 
         def failure_context(kind, *, checks=None, budget=None):
             return {"phase": phase, "failure_kind": kind, "entry_full_state": entry_snapshot,
@@ -400,6 +403,7 @@ class CartesianTeacherPlanner:
                     "object_position_m": object_position.tolist(),
                     "phase_target_C": None if target is None else np.asarray(target).tolist(),
                     "phase_target_R": None if goal_R is None else np.asarray(goal_R).tolist(),
+                    "orientation_schedule": orientation_schedule, "orientation_schedule_start_R": start["R"].tolist(),
                     "q_waypoints": [q.tolist() for q in waypoints], "waypoint_details": list(details),
                     "high_orientation_lookahead": list(lookahead), "chord_checks": checks, "budget": budget,
                     "collision_pairs": self.pair_evidence, "collision_pair_signature_sha256": self.pair_signature,
@@ -461,7 +465,8 @@ class CartesianTeacherPlanner:
             for index in range(1, count + 1):
                 progress = index / count
                 C = start["C"] + progress * (target - start["C"])
-                R = start["R"] @ Rotation.from_rotvec(progress * delta_R).as_matrix() if phase == "high_approach" else goal_R
+                R = (start["R"] @ Rotation.from_rotvec(progress * delta_R).as_matrix()
+                     if phase in ("pregrasp", "contact") else goal_R)
                 q, detail = checked_solve(C, R, waypoints[-1], closed=closed)
                 waypoints.append(q)
                 details.append(detail)
@@ -487,6 +492,7 @@ class CartesianTeacherPlanner:
                 "joint_names": list(self.names), "target_C": np.asarray(target).tolist(), "target_R": goal_R.tolist(),
                 "endpoint_C": end["C"].tolist(), "endpoint_R": end["R"].tolist(), "endpoint_palm": end["palm"].tolist(),
                 "endpoint_orientation_error_rad": rotation_error(goal_R, end["R"]),
+                "orientation_schedule": orientation_schedule, "orientation_schedule_start_R": start["R"].tolist(),
                 "raw_actual_start_q": actual["arm"].tolist(), "last_applied_start_q": q0.tolist(),
                 "waypoint_details": details, "chord_checks": chord_checks, "budget": budget, "closed": closed,
                 "grip_lock": grip_lock, "planning_wall_s": time.monotonic() - started,
