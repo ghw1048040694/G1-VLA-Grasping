@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -68,6 +68,13 @@ def _protection(inventory):
 
 def execute_stage(stage, config, run):
     report = readiness(config)
+    if stage in ("vision-fetch", "vision-ablate"):
+        from .vision_pretraining import fetch_visual_backbone, train_visual_pretraining
+        result = (fetch_visual_backbone if stage == "vision-fetch" else train_visual_pretraining)(config, run.path)
+        report.update(stage=stage, visual_pretraining=result,
+                      training_started=result.get("training_started", False),
+                      optimizer_steps=result.get("optimizer_steps", 0))
+        return report, result.get("passed") is True
     if stage == "diagnose":
         from .native_diagnostics import run_native_diagnostics
         diagnosed = run_native_diagnostics(config, run.path)

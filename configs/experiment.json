@@ -323,5 +323,32 @@
     "max_gpu_reserved_bytes": 7516192768,
     "output_dir": ".runtime/rebuild/diagnostics/phase5-extension-v1",
     "variants": ["rgb", "rgb_mean", "state_only", "rgb_no_vae"]
+  },
+  "visual_pretraining": {
+    "backend": "grasp_square_visual_pretraining_v1",
+    "variants": [
+      "rgb_scratch",
+      "rgb_pretrained",
+      "rgb_mean",
+      "state_only"
+    ],
+    "use_vae": false,
+    "image_preprocessing": "unchanged_train_rgb_statistics_v1",
+    "seed": 20261014,
+    "max_steps": 2000,
+    "eval_every_steps": 50,
+    "eval_stride": 30,
+    "eval_batch_size": 8,
+    "max_train_wall_s": 1800,
+    "max_gpu_reserved_bytes": 7516192768,
+    "output_dir": ".runtime/rebuild/diagnostics/phase6-vision-pretraining-v1",
+    "reference_ablation_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-act-ablate-extended-01/reports/act_ablation.json",
+    "reference_ablation_report_sha256": "d57edbcbb6909efe815f8eaddfbecb0400201847501b7d3e40dd2968d1c9c92b",
+    "weights_url": "https://download.pytorch.org/models/resnet18-f37072fd.pth",
+    "weights_sha256_prefix": "f37072fd",
+    "weights_sha256": null,
+    "weights_max_bytes": 67108864,
+    "weights_cache_path": ".runtime/rebuild/weights/torchvision-resnet18-imagenet1k-v1/resnet18-f37072fd.pth",
+    "weights_receipt_path": ".runtime/rebuild/weights/torchvision-resnet18-imagenet1k-v1/receipt.json"
   }
 }

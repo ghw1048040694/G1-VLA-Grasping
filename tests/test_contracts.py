@@ -89,6 +89,27 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ConfigError):
                 validate_config(config)
 
+    def test_visual_pretraining_preserves_protocol_and_download_identity(self):
+        for change in ("vae", "missing_control", "changed_budget", "changed_preprocess", "changed_source", "changed_hash", "excess_download"):
+            config = config_fixture()
+            visual = config["visual_pretraining"]
+            if change == "vae":
+                visual["use_vae"] = True
+            elif change == "missing_control":
+                visual["variants"].pop()
+            elif change == "changed_budget":
+                visual["max_steps"] += 50
+            elif change == "changed_preprocess":
+                visual["image_preprocessing"] = "pretrained_only_imagenet_crop"
+            elif change == "changed_source":
+                visual["weights_url"] = "https://unverified.invalid/resnet18.pth"
+            elif change == "changed_hash":
+                visual["weights_sha256"] = "0" * 64
+            else:
+                visual["weights_max_bytes"] = 65 * 1024**2
+            with self.subTest(change=change), self.assertRaises(ConfigError):
+                validate_config(config)
+
     def test_velocity_zero_is_hold_and_bad_limits_are_rejected(self):
         config = config_fixture()
         config["control"]["max_velocity_rad_s"] = [0.] * 31

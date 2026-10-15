@@ -322,6 +322,20 @@ SCHEMA = {
         "max_train_wall_s": _positive, "max_gpu_reserved_bytes": _positive_integer,
         "output_dir": _text, "variants": _strings,
     },
+    "visual_pretraining": {
+        "backend": _literal("grasp_square_visual_pretraining_v1"),
+        "variants": _strings, "use_vae": _literal(False),
+        "image_preprocessing": _literal("unchanged_train_rgb_statistics_v1"),
+        "seed": _integer, "max_steps": _positive_integer,
+        "eval_every_steps": _positive_integer, "eval_stride": _positive_integer,
+        "eval_batch_size": _positive_integer, "max_train_wall_s": _positive,
+        "max_gpu_reserved_bytes": _positive_integer, "output_dir": _text,
+        "reference_ablation_report_path": _text, "reference_ablation_report_sha256": _hash,
+        "weights_url": _literal("https://download.pytorch.org/models/resnet18-f37072fd.pth"),
+        "weights_sha256_prefix": _literal("f37072fd"), "weights_sha256": _optional(_hash),
+        "weights_max_bytes": _positive_integer,
+        "weights_cache_path": _text, "weights_receipt_path": _text,
+    },
 }
 
 OBSERVATION_FIELDS = frozenset({
@@ -398,6 +412,18 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.act_diagnostics", "paired trials must retain the training seed and 7 GiB allocator bound")
     if timing["stationary_speed_rad_s"] >= timing["moving_speed_rad_s"]:
         _error("config.native_diagnostics", "stationary speed threshold must be lower than moving threshold")
+    visual = config["visual_pretraining"]
+    if visual["variants"] != ["rgb_scratch", "rgb_pretrained", "rgb_mean", "state_only"]:
+        _error("config.visual_pretraining.variants", "must retain the ordered no-VAE RGB, pretrained, mean-image and state-only controls")
+    for key in ("seed", "max_steps", "eval_every_steps", "eval_stride", "eval_batch_size", "max_train_wall_s", "max_gpu_reserved_bytes"):
+        if visual[key] != diagnostics[key]:
+            _error("config.visual_pretraining." + key, "must retain the declared stage5 paired training budget")
+    if visual["max_steps"] % visual["eval_every_steps"]:
+        _error("config.visual_pretraining", "the training budget must end at a validation point")
+    if visual["weights_max_bytes"] > 64 * 1024**2:
+        _error("config.visual_pretraining.weights_max_bytes", "must not exceed the 64 MiB pinned ResNet18 download budget")
+    if visual["weights_sha256"] is not None and not visual["weights_sha256"].startswith(visual["weights_sha256_prefix"]):
+        _error("config.visual_pretraining.weights_sha256", "must agree with the trusted TorchVision URL hash prefix")
     return copy.deepcopy(config)
 
 
@@ -414,6 +440,7 @@ _PATH_FIELDS = {
     "grasp_act": ("dataset_manifest_path", "memory_report_path", "checkpoint_path"),
     "native_diagnostics": ("training_report_path",),
     "act_diagnostics": ("reference_checkpoint_path", "reference_config_path", "output_dir"),
+    "visual_pretraining": ("reference_ablation_report_path", "weights_cache_path", "weights_receipt_path", "output_dir"),
 }
 
 

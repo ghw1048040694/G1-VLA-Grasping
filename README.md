@@ -64,6 +64,19 @@ ACT failure diagnosis and controlled ablations use the same configuration and en
 
 `act-diagnose` verifies the original checkpoint against its saved configuration and runtime, then evaluates validation observations with real images, constant training-channel means, a nonidentity within-episode image shift and an image donor from another validation episode. State and targets stay fixed. `act-ablate` compares RGB, constant-image, genuinely state-only and no-CVAE models using identical compatible initial parameters and the same sampled anchors. The state-only adapter creates no visual or environment-state feature, token or projection; an alias of the same observed joints only supplies the original ACT library's batch-size lookup. Removing CVAE tests the whole variational mechanism, and does not isolate KL weight alone. Each variant has a discarded real memory probe and immutable validation-selected checkpoints. The RGB trajectory must reproduce the original first 200 steps before any longer budget is interpreted. Loss, gradient groups, coverage and label-free prior inference are reported separately. No diagnostic stage reads test arrays/images or performs test inference; extending the budget or trying pretrained initialization requires a new declared run and output directory.
 
+Visual backbone initialization is compared through the same configuration and entry point:
+
+```sh
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage vision-fetch
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage vision-ablate
+```
+
+`visual_pretraining` declares four models, all without VAE: RGB from scratch, RGB with TorchVision ResNet18 ImageNet1K V1 initialization, constant training-channel mean images, and state-only. State-hold uses the same evaluation labels and denominator. All models keep the existing native train/validation split, shared compatible head initialization, seed, anchor schedule, optimizer and 2000-step budget. The scratch RGB trajectory must reproduce the preceding no-VAE run before its comparison is accepted. Test payloads and previous test metrics are excluded.
+
+The weight download is limited to the official TorchVision HTTPS URL and its published SHA-256 filename prefix. `vision-fetch` records the full file SHA-256; that full digest must be pinned in the same configuration before training. Loading is restricted to tensors, and every one of the 100 FrozenBatchNorm backbone state keys must match. The two ImageNet classifier keys and 20 batch-count buffers are explicitly excluded. All other initial model tensors remain identical. This replaces convolution weights and FrozenBatchNorm parameters/statistics together, and does not import a public robot policy head.
+
+Both visual models retain the same 320×240 source resize and train-derived RGB normalization. Neither receives a separate ImageNet crop or processor. Official ImageNet preprocessing differs, so this comparison measures initialization under the current recorded-data protocol; it is not a claim that all pretrained preprocessing choices or robot generalization have been evaluated. Each model receives a discarded real optimizer/evaluation memory probe before formal training. Runs, reports, selected checkpoints and predictions are saved in new directories without overwriting earlier evidence.
+
 ## Contracts and evidence
 
 - `configs/experiment.json` is the only active configuration; unknown or duplicate JSON keys are rejected.
