@@ -432,7 +432,7 @@
     "output_dir": ".runtime/rebuild/diagnostics/phase8-expanded-residual-v1",
     "admission_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-expanded-check-01/reports/expanded_residual_admission.json",
     "data_manifest_path": ".runtime/rebuild/data/grasp-square-native-stage8-v1/manifest.json",
-    "data_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "data_manifest_sha256": "afdd619261987aaf9f45df5b8ea669281897f212a300574e0204d273df9e52e1",
     "reference_residual_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-residual-train-01/reports/state_residual_training.json",
     "reference_residual_report_sha256": "63ff2c3d9ca209f0bd57293aa0d618120a085500d31cd89bce97e2cae0b1e7b2"
   }
