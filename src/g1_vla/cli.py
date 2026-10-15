@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -68,6 +68,18 @@ def _protection(inventory):
 
 def execute_stage(stage, config, run):
     report = readiness(config)
+    if stage in ("expansion-audit", "expansion-build"):
+        from .train_expansion import audit_train_expansion, build_train_expansion
+        result = (audit_train_expansion if stage == "expansion-audit" else build_train_expansion)(config, run.path)
+        report.update(stage=stage, train_expansion=result)
+        return report, result.get("passed") is True
+    if stage in ("expanded-check", "expanded-train"):
+        from .expanded_residual import run_expanded_residual_admission, train_expanded_residual
+        result = (run_expanded_residual_admission if stage == "expanded-check" else train_expanded_residual)(config, run.path)
+        report.update(stage=stage, expanded_residual=result,
+                      training_started=result.get("training_started", False),
+                      optimizer_steps=result.get("optimizer_steps", 0))
+        return report, result.get("passed") is True
     if stage == "coverage-audit":
         from .trajectory_coverage import run_trajectory_coverage
         result = run_trajectory_coverage(config, run.path)

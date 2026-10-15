@@ -356,6 +356,31 @@ SCHEMA = {
         "quarter_bins": _literal(4), "expansion_group_limit": _positive_integer,
         "expansion_episodes_per_group": _positive_integer,
     },
+    "train_expansion": {
+        "backend": _literal("grasp_square_train_expansion_v1"),
+        "candidate_episode_ids": _indices,
+        "reference_coverage_report_path": _text, "reference_coverage_report_sha256": _hash,
+        "reference_residual_report_path": _text, "reference_residual_report_sha256": _hash,
+        "session_evidence_path": _text, "session_evidence_sha256": _hash,
+        "candidate_build_dir": _text, "build_dir": _text, "audit_report_path": _text,
+        "max_total_rows": _positive_integer, "max_candidate_derived_bytes": _positive_integer,
+        "max_derived_bytes": _positive_integer, "allow_same_source_coverage": _literal(True),
+        "require_independent_sessions": _literal(False),
+    },
+    "expanded_residual": {
+        "backend": _literal("grasp_square_expanded_state_residual_v1"),
+        "variants": _strings, "use_vae": _literal(False),
+        "target": _literal("raw_action_minus_anchor_q_over_train_action_std_v1"),
+        "decode": _literal("raw_anchor_q_plus_train_action_std_times_residual_zero_exact_v1"),
+        "zero_head_init": _literal(True), "include_step_zero_in_selection": _literal(True),
+        "seed": _integer, "max_steps": _positive_integer,
+        "eval_every_steps": _positive_integer, "eval_stride": _positive_integer,
+        "eval_batch_size": _positive_integer, "max_train_wall_s": _positive,
+        "max_gpu_reserved_bytes": _positive_integer, "output_dir": _text,
+        "data_manifest_path": _text, "data_manifest_sha256": _hash,
+        "reference_residual_report_path": _text, "reference_residual_report_sha256": _hash,
+        "admission_report_path": _text,
+    },
 }
 
 OBSERVATION_FIELDS = frozenset({
@@ -456,6 +481,25 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
             _error("config.trajectory_coverage." + key, "must retain the original motion strata")
     if coverage["expansion_group_limit"] > 4 or coverage["expansion_episodes_per_group"] > 2:
         _error("config.trajectory_coverage", "the metadata-only next-batch proposal is bounded to four groups and two episodes per group")
+    expansion, expanded = config["train_expansion"], config["expanded_residual"]
+    if expansion["candidate_episode_ids"] != [12, 38, 62, 73, 90, 98, 129, 147]:
+        _error("config.train_expansion.candidate_episode_ids", "must retain the eight metadata-predeclared candidates")
+    if config["source_native"]["split_episode_ids"] != {
+            "train": [20, 21, 75, 76, 125, 126], "validation": [180, 181, 182], "test": [280, 281, 282]}:
+        _error("config.train_expansion", "the parent split and original validation identities must remain frozen")
+    if (expansion["max_total_rows"] > 20000 or expansion["max_candidate_derived_bytes"] > 2560 * 1024**2
+            or expansion["max_derived_bytes"] > 5 * 1024**3):
+        _error("config.train_expansion", "the bounded candidate and expanded-data storage/row limits were exceeded")
+    if expanded["variants"] != residual["variants"]:
+        _error("config.expanded_residual.variants", "must retain the state-only and scratch RGB residual controls")
+    for key in ("seed", "max_steps", "eval_every_steps", "eval_stride", "eval_batch_size", "max_train_wall_s", "max_gpu_reserved_bytes"):
+        if expanded[key] != residual[key]:
+            _error("config.expanded_residual." + key, "must retain the fixed stage7 residual training budget")
+    for key in ("reference_residual_report_path", "reference_residual_report_sha256"):
+        if expanded[key] != expansion[key]:
+            _error("config.expanded_residual." + key, "must bind the same frozen residual comparison as the data audit")
+    if Path(expanded["data_manifest_path"]) != Path(expansion["build_dir"]) / "manifest.json":
+        _error("config.expanded_residual.data_manifest_path", "must name the new expanded-data manifest")
     return copy.deepcopy(config)
 
 
@@ -475,6 +519,8 @@ _PATH_FIELDS = {
     "visual_pretraining": ("reference_ablation_report_path", "weights_cache_path", "weights_receipt_path", "output_dir"),
     "state_residual": ("reference_visual_report_path", "admission_report_path", "output_dir"),
     "trajectory_coverage": ("reference_training_report_path",),
+    "train_expansion": ("reference_coverage_report_path", "reference_residual_report_path", "session_evidence_path", "candidate_build_dir", "build_dir", "audit_report_path"),
+    "expanded_residual": ("data_manifest_path", "reference_residual_report_path", "admission_report_path", "output_dir"),
 }
 
 

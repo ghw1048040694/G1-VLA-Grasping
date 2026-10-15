@@ -137,6 +137,39 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ConfigError):
                 validate_config(config)
 
+    def test_expansion_keeps_candidates_parent_split_and_residual_budget_fixed(self):
+        for change in ("candidate", "independent_claim", "coverage_disabled", "rows", "bytes",
+                       "parent_val", "missing_rgb", "steps", "vae", "origin", "manifest", "reference"):
+            config = config_fixture()
+            expansion, model = config["train_expansion"], config["expanded_residual"]
+            if change == "candidate":
+                expansion["candidate_episode_ids"][0] = 13
+            elif change == "independent_claim":
+                expansion["require_independent_sessions"] = True
+            elif change == "coverage_disabled":
+                expansion["allow_same_source_coverage"] = False
+            elif change == "rows":
+                expansion["max_total_rows"] = 20001
+            elif change == "bytes":
+                expansion["max_derived_bytes"] = 6 * 1024**3
+            elif change == "parent_val":
+                config["source_native"]["split_episode_ids"]["validation"][0] = 183
+                config["source_native"]["episode_ids"][6] = 183
+            elif change == "missing_rgb":
+                model["variants"].pop()
+            elif change == "steps":
+                model["max_steps"] += 50
+            elif change == "vae":
+                model["use_vae"] = True
+            elif change == "origin":
+                model["zero_head_init"] = False
+            elif change == "manifest":
+                model["data_manifest_path"] = "old/manifest.json"
+            else:
+                model["reference_residual_report_sha256"] = "0" * 64
+            with self.subTest(change=change), self.assertRaises(ConfigError):
+                validate_config(config)
+
     def test_velocity_zero_is_hold_and_bad_limits_are_rejected(self):
         config = config_fixture()
         config["control"]["max_velocity_rad_s"] = [0.] * 31

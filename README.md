@@ -91,6 +91,19 @@ State-relative action prediction and trajectory coverage use the same entry poin
 
 `coverage-audit` separates sampled-anchor coverage from future-label-row coverage and audits only existing train payloads plus pinned source metadata. Its next-batch proposal is metadata-only: it does not download candidates, expand the active dataset or alter the split. File grouping is storage evidence; missing collection-session, scene and operator identities cannot be inferred from different episode numbers or MP4 shards. Candidate coverage expansion and genuinely independent session acquisition must be reported separately.
 
+The next stage audits the eight predeclared same-source coverage candidates before expanding train. Use the same CLI and configuration:
+
+```sh
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage expansion-audit
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage expansion-build
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage expanded-check
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage expanded-train
+```
+
+`train_expansion` binds the previous coverage/residual reports and a pinned session-source evidence file. The official data card describes multiple collection sessions, but provides no episode-to-session mapping for these eight candidates. Successful data admission therefore adds same-source coverage only. Audit checks original 28D labels, row and all-four-camera file identities, actual left-eye RGB/PTS pairing and unchanged parent validation payloads. Build writes a separate train/validation-only manifest, copies six original train and three original validation episodes without changing their bytes, adds eight admitted train episodes, and recomputes statistics from the fourteen train episodes only. Old test payloads are excluded.
+
+`expanded_residual.data_manifest_sha256` must be set to the actual immutable build hash before admission or training. A zero placeholder is not training admission. Both residual models restart from the original compatible initialization and exact zero head; each retains 2000 optimizer steps, batch two, the same seed/LR, validation identities and checkpoint criterion. They share a new fixed sampler over the expanded anchor population. The larger dataset and its new train-only normalization are part of the intervention; old-model scores retain their original normalization. Reports separate original-train and added-train evaluations, total coverage, step-zero hold, best-trained and final results. No warm-start, extra training budget or test-based selection is implicit.
+
 ## Contracts and evidence
 
 - `configs/experiment.json` is the only active configuration; unknown or duplicate JSON keys are rejected.

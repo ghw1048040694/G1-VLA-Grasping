@@ -383,5 +383,57 @@
     "quarter_bins": 4,
     "expansion_group_limit": 4,
     "expansion_episodes_per_group": 2
+  },
+  "train_expansion": {
+    "backend": "grasp_square_train_expansion_v1",
+    "candidate_episode_ids": [
+      12,
+      38,
+      62,
+      73,
+      90,
+      98,
+      129,
+      147
+    ],
+    "reference_coverage_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-coverage-audit-01/reports/trajectory_coverage.json",
+    "reference_coverage_report_sha256": "359aa9e552bea8bb1f2ee127a5d49d809e452276b59936782573dc11f7fc7929",
+    "reference_residual_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-residual-train-01/reports/state_residual_training.json",
+    "reference_residual_report_sha256": "63ff2c3d9ca209f0bd57293aa0d618120a085500d31cd89bce97e2cae0b1e7b2",
+    "session_evidence_path": "resources/protocols/grasp_square_stage8_sessions.json",
+    "session_evidence_sha256": "2eb99d0e1a158569ff873de16d0c5fff8345bf82e37122740f92e211305c7ff5",
+    "candidate_build_dir": ".runtime/rebuild/data/grasp-square-stage8-candidates-v1",
+    "build_dir": ".runtime/rebuild/data/grasp-square-native-stage8-v1",
+    "audit_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-expansion-audit-01/reports/train_expansion_audit.json",
+    "max_total_rows": 20000,
+    "max_candidate_derived_bytes": 2684354560,
+    "max_derived_bytes": 5368709120,
+    "allow_same_source_coverage": true,
+    "require_independent_sessions": false
+  },
+  "expanded_residual": {
+    "backend": "grasp_square_expanded_state_residual_v1",
+    "variants": [
+      "state_only_residual",
+      "rgb_residual_scratch"
+    ],
+    "use_vae": false,
+    "target": "raw_action_minus_anchor_q_over_train_action_std_v1",
+    "decode": "raw_anchor_q_plus_train_action_std_times_residual_zero_exact_v1",
+    "zero_head_init": true,
+    "include_step_zero_in_selection": true,
+    "seed": 20261014,
+    "max_steps": 2000,
+    "eval_every_steps": 50,
+    "eval_stride": 30,
+    "eval_batch_size": 8,
+    "max_train_wall_s": 1800,
+    "max_gpu_reserved_bytes": 7516192768,
+    "output_dir": ".runtime/rebuild/diagnostics/phase8-expanded-residual-v1",
+    "admission_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-expanded-check-01/reports/expanded_residual_admission.json",
+    "data_manifest_path": ".runtime/rebuild/data/grasp-square-native-stage8-v1/manifest.json",
+    "data_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "reference_residual_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-residual-train-01/reports/state_residual_training.json",
+    "reference_residual_report_sha256": "63ff2c3d9ca209f0bd57293aa0d618120a085500d31cd89bce97e2cae0b1e7b2"
   }
 }
