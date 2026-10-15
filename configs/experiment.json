@@ -341,7 +341,7 @@
     "eval_batch_size": 8,
     "max_train_wall_s": 1800,
     "max_gpu_reserved_bytes": 7516192768,
-    "output_dir": ".runtime/rebuild/diagnostics/phase6-vision-pretraining-v1",
+    "output_dir": ".runtime/rebuild/diagnostics/phase6-vision-pretraining-v2",
     "reference_ablation_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-act-ablate-extended-01/reports/act_ablation.json",
     "reference_ablation_report_sha256": "d57edbcbb6909efe815f8eaddfbecb0400201847501b7d3e40dd2968d1c9c92b",
     "weights_url": "https://download.pytorch.org/models/resnet18-f37072fd.pth",

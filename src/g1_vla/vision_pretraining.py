@@ -130,11 +130,12 @@ def _resnet18_keys():
 def map_resnet18_backbone(source, target, torch):
     """Map every visual conv/FrozenBN tensor; never load an ACT head or ImageNet FC."""
     expected, tracked = _resnet18_keys()
-    if set(source) != expected:
+    source_keys = set(source)
+    if source_keys not in (expected, expected - tracked):
         raise VisionPretrainingError("the public state keys do not exactly match TorchVision ResNet18 ImageNet1K V1")
     if any(not isinstance(value, torch.Tensor) for value in source.values()):
         raise VisionPretrainingError("the public state dictionary contains a non-tensor value")
-    for name in tracked:
+    for name in source_keys & tracked:
         value = source[name]
         if (not isinstance(value, torch.Tensor) or value.dtype != torch.int64 or tuple(value.shape) != ()
                 or int(value) < 0):
@@ -163,8 +164,10 @@ def map_resnet18_backbone(source, target, torch):
         if source[name].dtype != torch.float32 or not bool(torch.isfinite(source[name]).all()):
             raise VisionPretrainingError("the ignored classifier must still contain finite FP32 tensors")
     return mapped, {"mapped_tensor_count": len(mapped), "mapped_source_to_target": mapping,
+                    "source_tensor_count": len(source),
                     "ignored_classifier_keys": ["fc.bias", "fc.weight"],
-                    "ignored_batchnorm_tracking_keys": sorted(tracked),
+                    "ignored_batchnorm_tracking_keys": sorted(source_keys & tracked),
+                    "batch_counter_keys_not_stored": sorted(tracked - source_keys),
                     "all_frozen_batchnorm_affine_and_running_buffers_loaded": True,
                     "non_backbone_tensor_loaded": False,
                     "mapped_tensor_sha256": diagnostics._tensor_digest(mapped)}

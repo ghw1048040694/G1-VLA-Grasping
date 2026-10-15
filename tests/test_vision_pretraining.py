@@ -292,6 +292,39 @@ class ControlledVisualModelTests(unittest.TestCase):
         self.assertTrue(all(torch.equal(value, original[key]) for key, value in target.items()))
         self.assertFalse(any("action_head" in key or "robot_state" in key for key in mapped))
 
+    def test_canonical_102_and_modern_122_tensor_layouts_map_identically_but_partial_counters_fail(self):
+        import torch
+        import torchvision
+        _, _, target, _ = self._blueprint()
+        modern = torchvision.models.resnet18(weights=None).state_dict()
+        counters = sorted(key for key in modern if key.endswith(".num_batches_tracked"))
+        self.assertEqual(len(counters), 20)
+        canonical = {key: tensor for key, tensor in modern.items() if key not in counters}
+        self.assertEqual(len(canonical), 102)
+        modern_mapping, modern_receipt = vision.map_resnet18_backbone(modern, target, torch)
+        canonical_mapping, canonical_receipt = vision.map_resnet18_backbone(canonical, target, torch)
+        self.assertEqual(len(canonical_mapping), 100)
+        self.assertEqual(set(canonical_mapping), set(modern_mapping))
+        for key, tensor in canonical_mapping.items():
+            self.assertTrue(torch.equal(tensor, modern_mapping[key]), key)
+        self.assertEqual(canonical_receipt["source_tensor_count"], 102)
+        self.assertEqual(canonical_receipt["batch_counter_keys_not_stored"], counters)
+        self.assertEqual(canonical_receipt["ignored_batchnorm_tracking_keys"], [])
+        self.assertEqual(modern_receipt["source_tensor_count"], 122)
+        self.assertEqual(modern_receipt["batch_counter_keys_not_stored"], [])
+        self.assertEqual(modern_receipt["ignored_batchnorm_tracking_keys"], counters)
+        # Both historical layouts are complete. Accepting arbitrary omissions
+        # would hide damaged checkpoints or silently broaden the architecture.
+        partial_layouts = ({key: tensor for key, tensor in modern.items() if key != counters[0]},
+                           {**canonical, counters[0]: modern[counters[0]]})
+        for partial in partial_layouts:
+            with self.subTest(source_tensor_count=len(partial)), self.assertRaises(vision.VisionPretrainingError):
+                vision.map_resnet18_backbone(partial, target, torch)
+        for required_key in ("conv1.weight", "bn1.running_mean"):
+            damaged = {key: tensor for key, tensor in canonical.items() if key != required_key}
+            with self.subTest(missing_required=required_key), self.assertRaises(vision.VisionPretrainingError):
+                vision.map_resnet18_backbone(damaged, target, torch)
+
     def test_missing_unexpected_wrong_shape_or_nonfinite_source_tensors_fail_closed(self):
         import torch
         import torchvision
