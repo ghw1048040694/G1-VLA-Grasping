@@ -1,6 +1,6 @@
 # G1 VLA Grasping
 
-G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. A bounded source-native ACT trial is conditionally enabled, with verified data, independent splits and measured training memory required before optimization. World-model optimization remains disabled.
+G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. The current work targets the original twenty-layout green/right teacher acceptance, with training and world-model optimization disabled. Existing source-native ACT results and data remain separate research evidence.
 
 ## Workspace
 
@@ -113,6 +113,7 @@ The next stage audits the eight predeclared same-source coverage candidates befo
 - `pairing` audits raw observation/command timing without repairing, resampling or clipping historical labels. Old sampled commands cannot prove next actual control-command pairing.
 - `teacher-smoke` checks the historical source position separately; `teacher` runs the predeclared 20 unique layouts in `configs/teacher_layouts.json`. The formal gate requires at least 18/20 strict contact lifts of 0.1 m held for 0.5 s, complete RGB pairs, finite physics and declared joint safety. This local grid does not cover the full workspace.
 - Teacher commands use the same anchored codec, velocity limiter and PD executor. Post-step `mj_forward` synchronizes sensors/FK/contact without advancing time. Raw evidence stays diagnostic with training disabled even when a physical episode passes. Inconsistent eight-step chunks are reported and never clipped into compatible labels.
+- The teacher aligns the fingertip workspace with the cube center, plans around the original shoulder/torso collision geometry, and starts closing only after measured palm and arm arrival. Original phase tolerances, timeouts and physical success gates remain in force. Every new episode exports all actual raw camera frames at `500/33` FPS and phase scores, including failures. RGB is sampled before each command; physics metrics describe the following 66 ms interval. Separate higher resolution diagnostic renderings do not change policy observations.
 - Raw successful and failed episodes, source rollouts, journal and research baselines are protected. Historical caches are not automatically accepted as new training data.
 - Old evaluations become regression evidence. A new independent holdout must be sealed before future model selection.
 - Event metrics separate physical contact, sustained lift, stable released placement and strict safety. An in-box flag or text classification alone cannot establish task success.

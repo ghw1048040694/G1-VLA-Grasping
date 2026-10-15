@@ -39,6 +39,7 @@ PROFILE_KEYS = frozenset({
     "lift_height_m", "lift_duration_s", "final_hold_s", "adaptive_regrasp",
     "ik_max_error_m", "record_rgb", "palm_position_tolerance_m",
     "joint_target_tolerance_rad", "phase_timeout_scale",
+    "ik_collision_margin_m", "ik_collision_weight",
 })
 
 
@@ -92,8 +93,8 @@ def validate_teacher(config):
     profile = config["expert"].get("teacher")
     if not isinstance(profile, dict) or set(profile) != PROFILE_KEYS:
         raise ExpertError("expert.teacher must contain the complete explicit physical profile")
-    if profile["profile"] != "green_right_recovery_v1":
-        raise ExpertError("teacher requires the source-audited green_right_recovery_v1 profile")
+    if profile["profile"] not in ("green_right_recovery_v1", "green_right_geometry_feedback_v2"):
+        raise ExpertError("teacher requires a declared green/right physical profile")
     for key in PROFILE_KEYS - {"profile", "finger_scale", "contact_compensation_m", "adaptive_regrasp", "record_rgb", "grasp_yaw_deg"}:
         value = profile[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
@@ -116,13 +117,35 @@ def validate_teacher(config):
     return profile
 
 
+def pose_tracking_reached(tracking, profile):
+    """Check the measured palm and requested arm target using the fixed gates."""
+    return bool(tracking
+                and tracking["palm_position_error_m"] <= profile["palm_position_tolerance_m"]
+                and tracking["requested_joint_error_rad"] <= profile["joint_target_tolerance_rad"])
+
+
+def contact_closure_ready(phase, elapsed_s, tracking, profile):
+    """Keep the hand open until the physical approach, including its time, ends.
+
+    Contact is deliberately not a prerequisite: requiring an open hand to have
+    already established sustained contact would deadlock the closing action.
+    """
+    return bool(phase == "contact" and elapsed_s >= profile["contact_approach_s"]
+                and pose_tracking_reached(tracking, profile))
+
+
+def closure_complete(now_s, close_start_s, profile):
+    """A first touch cannot skip the complete declared closing interval."""
+    return bool(close_start_s is not None
+                and now_s - close_start_s + 1e-9 >= profile["close_duration_s"])
+
+
 def phase_tracking_reached(phase, tracking, profile, *, contact, minimum_lift_m,
                            measured_hold_s, lift_height_m, hold_duration_s):
     """A phase advances by reached physical state, never by elapsed time alone."""
     if phase not in ("home", "high_approach", "pregrasp", "contact", "grasp", "lift", "hold"):
         raise ExpertError("unknown teacher phase")
-    reached = (tracking["palm_position_error_m"] <= profile["palm_position_tolerance_m"]
-               and tracking["requested_joint_error_rad"] <= profile["joint_target_tolerance_rad"])
+    reached = pose_tracking_reached(tracking, profile)
     if phase in ("contact", "grasp", "lift", "hold"):
         reached = reached and contact
     if phase in ("lift", "hold"):
@@ -176,8 +199,51 @@ def arm_ik_contract(model, *, hand=None, mujoco_api=None):
     return names, qpos, lower, upper
 
 
+def arm_torso_collision_pairs(model, *, mujoco_api=None):
+    """Declare the source model's active torso/shoulder geometry pairs once.
+
+    These are the self contacts measured in the failed teacher, not replacement
+    collision shapes. Mask, welded-body, parent-body and explicit-exclusion
+    filters retain the original model's collision eligibility.
+    """
+    api = _api(mujoco_api)
+    torso = api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, "torso_link")
+    shoulders = {api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, name)
+                 for name in ("right_shoulder_roll_link", "right_shoulder_yaw_link")}
+    if torso < 0 or min(shoulders) < 0:
+        raise ExpertError("declared torso/right-shoulder collision bodies are missing")
+    excluded = set(int(value) for value in model.exclude_signature)
+    pairs = []
+    for first in range(model.ngeom):
+        body_a = int(model.geom_bodyid[first])
+        if body_a != torso:
+            continue
+        for second in range(model.ngeom):
+            body_b = int(model.geom_bodyid[second])
+            if body_b not in shoulders:
+                continue
+            compatible = (int(model.geom_contype[first]) & int(model.geom_conaffinity[second])
+                          or int(model.geom_contype[second]) & int(model.geom_conaffinity[first]))
+            weld_a, weld_b = int(model.body_weldid[body_a]), int(model.body_weldid[body_b])
+            adjacent = (int(model.body_parentid[weld_a]) == weld_b
+                        or int(model.body_parentid[weld_b]) == weld_a)
+            signature = (min(body_a, body_b) << 16) + max(body_a, body_b)
+            if compatible and weld_a != weld_b and not adjacent and signature not in excluded:
+                pairs.append((first, second))
+    if len(pairs) != 6:
+        raise ExpertError("source-audited torso/shoulder constraint requires exactly six active geom pairs")
+    return tuple(pairs)
+
+
+def collision_distance_residual(distances_m, margin_m, weight):
+    """Fixed-length signed-distance hinge; all geometry stays in the model."""
+    return tuple(weight * min(0., float(distance) - margin_m) for distance in distances_m)
+
+
 def solve_pose(model, workspace, palm_ids, qpos_ids, lower, upper, targets, seed,
-               orientations, *, orientation_weight=.04, max_error_m=.08, mujoco_api=None):
+               orientations, *, orientation_weight=.04, max_error_m=.08,
+               collision_pairs=(), collision_margin_m=.002, collision_weight=5.,
+               mujoco_api=None):
     """Pure kinematic workspace update; never called on live rollout data."""
     import numpy as np
     from scipy.optimize import least_squares
@@ -185,22 +251,94 @@ def solve_pose(model, workspace, palm_ids, qpos_ids, lower, upper, targets, seed
     api = _api(mujoco_api)
     bounded = np.clip(seed, lower + 1e-6, upper - 1e-6)
 
+    def distances():
+        return tuple(float(api.mj_geomDistance(model, workspace, first, second,
+                                               collision_margin_m + .05, None))
+                     for first, second in collision_pairs)
+
     def residual(values):
         workspace.qpos[qpos_ids] = values
         api.mj_forward(model, workspace)
         position = np.concatenate([workspace.site_xpos[site] - target for site, target in zip(palm_ids, targets)])
         orientation = np.concatenate([Rotation.from_matrix(expected.T @ workspace.site_xmat[site].reshape(3, 3)).as_rotvec()
                                       for site, expected in zip(palm_ids, orientations)])
-        return np.concatenate((position, orientation_weight * orientation, .003 * values))
+        collision = collision_distance_residual(distances(), collision_margin_m, collision_weight)
+        return np.concatenate((position, orientation_weight * orientation, .003 * values, collision))
 
     solution = least_squares(residual, bounded, bounds=(lower, upper), max_nfev=1200,
                              xtol=1e-10, ftol=1e-10, gtol=1e-10)
     residual(solution.x)
     errors = [float(np.linalg.norm(workspace.site_xpos[site] - target)) for site, target in zip(palm_ids, targets)]
-    return solution.x.copy(), {"solver_success": bool(max(errors) <= max_error_m),
+    orientation_errors = [float(np.linalg.norm(Rotation.from_matrix(
+        expected.T @ workspace.site_xmat[site].reshape(3, 3)).as_rotvec()))
+        for site, expected in zip(palm_ids, orientations)]
+    final_distances = distances()
+    object_body = api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, "green_cube")
+    generated_self_contacts = _robot_self_contacts(model, workspace, object_body, api) if collision_pairs else {}
+    pairs_evidence = [{"geom_ids": [int(first), int(second)],
+                       "body_names": [api.mj_id2name(model, api.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[geom]))
+                                      for geom in (first, second)],
+                       "distance_m": distance}
+                      for (first, second), distance in zip(collision_pairs, final_distances)]
+    collision_passed = all(distance >= 0. for distance in final_distances) and not generated_self_contacts
+    return solution.x.copy(), {"solver_success": bool(max(errors) <= max_error_m and collision_passed),
                                "optimizer_converged": bool(solution.success),
                                "seed_was_clipped": bool(np.any(seed != bounded)),
-                               "maximum_position_error_m": max(errors), "cost": float(solution.cost)}
+                               "maximum_position_error_m": max(errors),
+                               "maximum_orientation_error_rad": max(orientation_errors),
+                               "position_acceptance_limit_m": float(max_error_m),
+                               "collision_avoidance_applied": bool(collision_pairs),
+                               "collision_margin_m": float(collision_margin_m),
+                               "collision_weight": float(collision_weight),
+                               "collision_pairs": pairs_evidence,
+                               "collision_pair_signature_sha256": canonical_sha256([
+                                   {"geom_ids": row["geom_ids"], "body_names": row["body_names"]}
+                                   for row in pairs_evidence]),
+                               "minimum_declared_self_pair_distance_m": min(final_distances) if final_distances else None,
+                               "generated_robot_self_contacts": generated_self_contacts,
+                               "collision_acceptance_passed": bool(collision_passed),
+                               "cost": float(solution.cost)}
+
+
+def _robot_self_contacts(model, data, object_body, api):
+    """Read actual generated robot self contacts without changing their masks."""
+    pairs = {}
+    for index in range(data.ncon):
+        contact = data.contact[index]
+        if contact.dist > 0:
+            continue
+        bodies = tuple(int(model.geom_bodyid[int(g)]) for g in (contact.geom1, contact.geom2))
+        if 0 in bodies or object_body in bodies:
+            continue
+        names = [api.mj_id2name(model, api.mjtObj.mjOBJ_BODY, body) or str(body) for body in bodies]
+        key = " :: ".join(sorted(names))
+        pairs[key] = max(pairs.get(key, 0.), max(0., -float(contact.dist)))
+    return pairs
+
+
+def _geometry_evidence(model, data, object_body, palm_id, api):
+    """Snapshot measured geometry; this is privileged teacher diagnostics only."""
+    import numpy as np
+    palm = np.asarray(data.site_xpos[palm_id], dtype=float)
+    rotation = np.asarray(data.site_xmat[palm_id], dtype=float).reshape(3, 3)
+    position = np.asarray(data.xpos[object_body], dtype=float)
+    contacts = []
+    for index in range(data.ncon):
+        contact = data.contact[index]
+        if contact.dist > 0:
+            continue
+        geoms = (int(contact.geom1), int(contact.geom2))
+        contacts.append({
+            "geom_names": [api.mj_id2name(model, api.mjtObj.mjOBJ_GEOM, geom) or str(geom) for geom in geoms],
+            "body_names": [api.mj_id2name(model, api.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[geom]))
+                           or str(int(model.geom_bodyid[geom])) for geom in geoms],
+            "distance_m": float(contact.dist)})
+    return {"timestamp_s": float(data.time), "palm_position_m": palm.tolist(),
+            "object_position_m": position.tolist(),
+            "object_offset_in_palm_frame_m": (rotation.T @ (position - palm)).tolist(),
+            "palm_rotation_world_from_local": rotation.tolist(),
+            "generated_contacts": contacts,
+            "robot_self_contact_penetration_m": _robot_self_contacts(model, data, object_body, api)}
 
 
 def _contact_evidence(model, data, object_body, api):
@@ -268,23 +406,26 @@ def run_teacher_episode(config, spec, run_dir):
     if set(spec.get("positions_m", {})) != {"green_cube"}:
         raise ExpertError("teacher layout must contain only green_cube")
     layout_fingerprint = spec.get("layout_fingerprint") or canonical_sha256(spec["positions_m"])
-    report = {"schema_version": 1, "teacher_protocol": "green_right_strict_shared_pd_v1",
+    report = {"schema_version": 2, "teacher_protocol": "green_right_strict_shared_pd_feedback_v2",
               "task": "green_cube_right_grasp_lift", "layout": spec,
               "layout_fingerprint": layout_fingerprint, "train_started": False,
               "assisted_grasp": False, "profile": dict(profile),
               "effective_contact_compensation_m": list(effective_compensation(profile)),
               "source_evidence": ["G1LANG-585/recovery_0000_green_cube", "G1LANG-586/recovery_0001_green_cube", "G1LANG-589/recovery_0001_green_cube"],
-              "source_evidence_scope": "same original layout, recovery starts, legacy dynamics; requires independent revalidation",
+              "source_evidence_scope": "legacy recovery reference only; current geometry/closure profile requires full physical revalidation",
               "initialization": "declared canonical bilateral home before physical time zero; no in-episode state reset",
               "rollout_joint_scope": "right seven arm and seven hand joints; waist and left upper body held",
-              "changes_from_legacy": ["robot-only damping", "explicit actuator force limits", "command cadence and anchor/velocity limiter", "waist and left arm held"],
+              "changes_from_legacy": ["robot-only damping", "explicit actuator force limits", "command cadence and anchor/velocity limiter", "waist and left arm held", "close only after measured contact-pose approach", "IK position limit cannot exceed physical tracking gate"],
               "passed": False, "failure": None, "record_rgb": profile["record_rgb"],
               "joint_limit_tolerance_rad": config["eval"]["joint_limit_tolerance_rad"],
               "raw_episode": str(raw_path), "report": str(report_path)}
     observations, commands, timing, evidence, requested_rows, after_rows, qacc_rows, target_rows, tracking_rows = [], [], [], [], [], [], [], [], []
     substeps, renderer, controller, model, data = [], None, None, None, None
+    diagnostic_video = None
     phase_records, saturation_counts, maximum_actuator_force, physics_warning_counts = [], {}, {}, []
     replan_ledger = []
+    self_collision_counts, self_collision_penetrations, phase_self_collision_counts = {}, {}, {}
+    closure_start_event = None
     maximum_joint_overrun, pending = {}, {}
     try:
         source = Path(config["scene"]["asset_path"])
@@ -331,6 +472,8 @@ def run_teacher_episode(config, spec, run_dir):
         report["control"] = controller.metadata()
         report["action_contract"] = contract.metadata()
         orientations = np.asarray([Rotation.from_euler("z", profile["grasp_yaw_deg"], degrees=True).as_matrix()])
+        collision_pairs = arm_torso_collision_pairs(model, mujoco_api=api)
+        report["ik_collision_constraint_scope"] = "six source-active torso/right-shoulder geometry pairs; reject any generated robot self contact at the solution"
         poses = {"home": baseline[arm_indices].copy()}
         cartesian_targets = {"home": data.site_xpos[palms[1]].copy()}
         reports = {"home": home_report}
@@ -341,11 +484,16 @@ def run_teacher_episode(config, spec, run_dir):
             workspace.qpos[:] = data.qpos
             workspace.qvel[:] = data.qvel
             values, detail = solve_pose(model, workspace, [palms[1]], ids, low, high, np.asarray([target]), seed,
-                                        orientations, max_error_m=profile["ik_max_error_m"], mujoco_api=api)
+                                        orientations, max_error_m=min(profile["ik_max_error_m"],
+                                            profile["palm_position_tolerance_m"]),
+                                        collision_pairs=collision_pairs,
+                                        collision_margin_m=profile["ik_collision_margin_m"],
+                                        collision_weight=profile["ik_collision_weight"], mujoco_api=api)
             reports[label] = detail
             cartesian_targets[label] = np.asarray(target).copy()
             if not detail["solver_success"]:
-                raise ExpertError("{} IK failed: {:.4f}m".format(label, detail["maximum_position_error_m"]))
+                raise ExpertError("{} IK failed: position={:.4f}m, self_collision_gate={}".format(
+                    label, detail["maximum_position_error_m"], detail["collision_acceptance_passed"]))
             return values
 
         def target_from_object(height=0., lateral=0., compensate=False):
@@ -374,6 +522,12 @@ def run_teacher_episode(config, spec, run_dir):
         poses["lift"] = pose("lift", target_from_object(profile["lift_height_m"], compensate=True), poses["grasp"])
         report["ik"] = reports
         report["initial_joint_position_rad"] = baseline.tolist()
+        report["initial_geometry"] = _geometry_evidence(model, data, object_body, palms[1], api)
+        from .teacher_video import TeacherDiagnosticVideo
+        try:
+            diagnostic_video = TeacherDiagnosticVideo(model, config, run_dir, mujoco_api=api)
+        except (ValueError, RuntimeError, OSError, TypeError) as exc:
+            report["diagnostic_video"] = {"complete": False, "error": "{}: {}".format(type(exc).__name__, exc)}
         builder = None
         if profile["record_rgb"]:
             renderer = api.Renderer(model, height=config["observation"]["image_height"], width=config["observation"]["image_width"])
@@ -408,6 +562,12 @@ def run_teacher_episode(config, spec, run_dir):
                                  "pairs": [], "saturated_actuators": []})
                 raise ControlError("teacher physics became non-finite")
             count, force, pairs = _contact_evidence(model, data, object_body, api)
+            self_contacts = _robot_self_contacts(model, data, object_body, api)
+            for pair, penetration in self_contacts.items():
+                self_collision_counts[pair] = self_collision_counts.get(pair, 0) + 1
+                self_collision_penetrations[pair] = max(self_collision_penetrations.get(pair, 0.), penetration)
+                phase_counts = phase_self_collision_counts.setdefault(current_phase, {})
+                phase_counts[pair] = phase_counts.get(pair, 0) + 1
             lift = float(data.xpos[object_body, 2] - initial_position[2])
             if not math.isfinite(lift):
                 lift = 0.
@@ -427,7 +587,8 @@ def run_teacher_episode(config, spec, run_dir):
             substeps.append({"timestamp_s": float(data.time), "contact_count": count, "normal_force_n": force,
                              "lift_height_m": lift, "joint_safe": safe, "finite": finite,
                              "max_abs_qacc": float(np.max(np.abs(data.qacc))) if finite else None,
-                             "pairs": pairs, "saturated_actuators": saturated})
+                             "pairs": pairs, "saturated_actuators": saturated,
+                             "robot_self_contact_pairs": sorted(self_contacts)})
             if not finite:
                 raise ControlError("teacher physics became non-finite")
             warnings = np.asarray([item.number for item in data.warning], dtype=int)
@@ -438,6 +599,8 @@ def run_teacher_episode(config, spec, run_dir):
         def observer(**event):
             nonlocal hold_seconds
             if event["event"] == "before":
+                if diagnostic_video is not None:
+                    diagnostic_video.capture(data, current_phase)
                 interval_contacts.clear()
                 interval_lift.clear()
                 interval_safe.clear()
@@ -499,6 +662,17 @@ def run_teacher_episode(config, spec, run_dir):
         completed = False
         while not completed:
             elapsed = float(data.time) - phase_start
+            if close_start_s is None and contact_closure_ready(current_phase, elapsed, latest_tracking, profile):
+                close_start_s = float(data.time)
+                closure_start_event = {
+                    "timestamp_s": close_start_s, "phase": current_phase,
+                    "elapsed_contact_approach_s": elapsed,
+                    "trigger": "completed_nominal_open_approach_and_measured_palm_and_arm_gates",
+                    "tracking": dict(latest_tracking),
+                    "geometry": _geometry_evidence(model, data, object_body, palms[1], api),
+                    "right_hand_joint_position_rad": {
+                        name: float(data.qpos[bindings[index]["qpos_id"]])
+                        for index, name in enumerate(names) if name.startswith("right_hand_")}}
             desired = poses[destination[current_phase]]
             active_cartesian_target = cartesian_targets[destination[current_phase]]
             target = baseline.copy()
@@ -516,10 +690,15 @@ def run_teacher_episode(config, spec, run_dir):
             reached = phase_tracking_reached(current_phase, latest_tracking, profile,
                         contact=contact_now, minimum_lift_m=min(interval_lift), measured_hold_s=hold_seconds,
                         lift_height_m=config["eval"]["lift_height_m"], hold_duration_s=config["eval"]["hold_duration_s"])
+            if current_phase == "contact":
+                reached = reached and closure_complete(float(data.time), close_start_s, profile)
             if elapsed >= duration[current_phase] and reached:
                 phase_records.append({"phase": current_phase, "start_s": phase_start,
                                       "end_s": float(data.time), "tracking": dict(latest_tracking),
-                                      "actual_contact": contact_now, "completed": True})
+                                      "actual_contact": contact_now, "completed": True,
+                                      "geometry": _geometry_evidence(model, data, object_body, palms[1], api),
+                                      "closure_started": close_start_s is not None,
+                                      "closure_complete": closure_complete(float(data.time), close_start_s, profile)})
                 if current_phase == "hold":
                     completed = True
                     continue
@@ -532,7 +711,6 @@ def run_teacher_episode(config, spec, run_dir):
                     # The cube has physically settled by now. Spawn coordinates
                     # are not the current contact goal or the visited IK seed.
                     refresh_phase_pose(next_phase, "grasp", target_from_object(compensate=True))
-                    close_start_s = float(data.time)
                 elif next_phase == "grasp":
                     refresh_phase_pose(next_phase, "grasp", target_from_object(compensate=True))
                 elif next_phase == "lift":
@@ -547,7 +725,10 @@ def run_teacher_episode(config, spec, run_dir):
             elif elapsed >= duration[current_phase] * profile["phase_timeout_scale"]:
                 phase_records.append({"phase": current_phase, "start_s": phase_start,
                                       "end_s": float(data.time), "tracking": dict(latest_tracking),
-                                      "actual_contact": contact_now, "completed": False})
+                                      "actual_contact": contact_now, "completed": False,
+                                      "geometry": _geometry_evidence(model, data, object_body, palms[1], api),
+                                      "closure_started": close_start_s is not None,
+                                      "closure_complete": closure_complete(float(data.time), close_start_s, profile)})
                 raise ExpertError("{} timeout: actual palm/joint/contact/lift gate did not pass".format(current_phase))
         gate = physical_gate(evidence, lift_height_m=config["eval"]["lift_height_m"], hold_duration_s=config["eval"]["hold_duration_s"])
         report.update(gate)
@@ -558,6 +739,11 @@ def run_teacher_episode(config, spec, run_dir):
         report["failure"] = "{}: {}".format(type(exc).__name__, exc)
         report["passed"] = False
     finally:
+        if diagnostic_video is not None:
+            try:
+                report["diagnostic_video"] = diagnostic_video.finish()
+            except (ValueError, RuntimeError, OSError, TypeError) as exc:
+                report["diagnostic_video"] = {"complete": False, "error": "{}: {}".format(type(exc).__name__, exc)}
         if renderer is not None:
             try:
                 renderer.close()
@@ -599,6 +785,11 @@ def run_teacher_episode(config, spec, run_dir):
         np.savez_compressed(interrupted_path, **diagnostic)
         report["interrupted_control_artifact"] = str(interrupted_path)
     report["phase_replan_ledger"] = replan_ledger
+    report["closure_start_event"] = closure_start_event
+    report["closure_planning"] = "open through completed contact approach and measured palm/arm tracking gates; full declared close interval required before contact phase passes"
+    report["robot_self_collision_substeps_by_pair"] = self_collision_counts
+    report["maximum_self_collision_penetration_m_by_pair"] = self_collision_penetrations
+    report["phase_robot_self_collision_substeps_by_pair"] = phase_self_collision_counts
     report["phase_planning"] = "refresh each phase from actual object state and visited right-arm seed; hold preserves completed lift reference"
     report["phases"] = phase_records
     report["actuation_saturation_substeps_by_joint"] = saturation_counts

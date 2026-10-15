@@ -127,6 +127,13 @@ class TeacherManifestTests(unittest.TestCase):
 
 
 class TeacherAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        # Suite accounting tests use synthetic pixels and no video encoder.
+        patcher = patch("g1_vla.teacher_acceptance.export_teacher_evidence",
+                        return_value={"complete": True, "videos": []})
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
     def test_full_18_of_20_preserves_exception_denominator(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -213,7 +213,7 @@ SCHEMA = {
         "include_restart_wait_labels": _literal(False),
         "separate_waypoint_recovery": _literal(True),
         "teacher": {
-            "profile": _literal("green_right_recovery_v1"),
+            "profile": _choice("green_right_recovery_v1", "green_right_geometry_feedback_v2"),
             "grasp_yaw_deg": _finite, "closure_multiplier": _positive,
             "finger_scale": _triple, "contact_compensation_m": _triple,
             "pregrasp_height_m": _positive, "pregrasp_lateral_m": _positive,
@@ -223,6 +223,7 @@ SCHEMA = {
             "grasp_hold_s": _positive, "lift_height_m": _positive,
             "lift_duration_s": _positive, "final_hold_s": _positive,
             "adaptive_regrasp": _boolean, "ik_max_error_m": _positive,
+            "ik_collision_margin_m": _positive, "ik_collision_weight": _positive,
             "record_rgb": _literal(True), "palm_position_tolerance_m": _positive,
             "joint_target_tolerance_rad": _positive, "phase_timeout_scale": _positive,
         },

@@ -17,6 +17,7 @@ from .data_pairing import _load_npz, audit_raw_pairing, encode_paired_chunks
 from .expert import run_teacher_episode
 from .runtime.experiment import write_new_json
 from .sim.scene import FIXED_BASE_EQUALITY, OBJECT_NAMES, assert_fixed_scene
+from .teacher_evidence import PHASES, export_teacher_evidence, phase_scores
 
 
 class TeacherAcceptanceError(ValueError):
@@ -87,7 +88,9 @@ def _summary(report):
     keys = ("passed", "failure", "control_steps", "physics_steps", "maximum_lift_m",
             "physical_contact_substeps", "maximum_contact_normal_force_n",
             "joint_limit_violation_substeps", "all_numeric_finite", "maximum_limiter_adjustment_rad",
-            "command_limit_audit", "actual_tracking", "phases", "report", "raw_episode")
+            "command_limit_audit", "actual_tracking", "phases", "report", "raw_episode",
+            "sustained_lift_hold_s", "physical_grasp_passed", "closure_start_event",
+            "robot_self_collision_substeps_by_pair", "diagnostic_video")
     return {key: report.get(key) for key in keys}
 
 
@@ -182,12 +185,15 @@ def run_teacher_acceptance(config, run_dir, *, smoke=False):
                   "teacher": None, "failure_reasons": [], "exception": None,
                   "scene_audit": None,
                   "raw_path": str(raw_path) if raw_path.is_file() else None,
-                  "pairing": None, "chunks": None, "training_eligible": False, "split": "diagnostic"}
+                  "pairing": None, "chunks": None, "evidence": None, "evidence_error": None,
+                  "phase_scores": None, "training_eligible": False, "split": "diagnostic"}
+        episode_report = {}
         try:
             episode_report = run_teacher_episode(config, copy.deepcopy(spec), episode_dir)
             if not isinstance(episode_report, dict):
                 raise TeacherAcceptanceError("teacher must return its explicit episode report")
             result["teacher"] = _summary(episode_report)
+            result["phase_scores"] = phase_scores(episode_report)
             try:
                 result["scene_audit"] = _scene_audit(episode_report, spec, episode_dir, config)
             except (OSError, ValueError, TypeError, ET.ParseError) as error:
@@ -207,6 +213,12 @@ def run_teacher_acceptance(config, run_dir, *, smoke=False):
                 "parent_rollout_id": spec["layout_id"], "layout_fingerprint": spec["layout_fingerprint"],
                 "target_object": "green_cube", "training_eligible": False, "split": "diagnostic",
             })
+            try:
+                result["evidence"] = export_teacher_evidence(episode_report, raw_path, episode_dir, config)
+            except Exception as error:
+                # A failed evidence export cannot silently remove a failed
+                # layout or change the established physical success criterion.
+                result["evidence_error"] = _exception(error)
         else:
             result["failure_reasons"].append("raw_episode_missing")
         results.append(result)
@@ -266,6 +278,10 @@ def run_teacher_acceptance(config, run_dir, *, smoke=False):
         "contract_consistent_chunk_count": sum((row["chunks"] or {}).get("contract_consistent_chunk_count", 0) for row in results),
         "contract_inconsistent_chunk_count": sum((row["chunks"] or {}).get("contract_inconsistent_chunk_count", 0) for row in results),
         "training_eligible_count": 0,
+        "video_complete_layout_count": sum((row["evidence"] or {}).get("complete") is True for row in results),
+        "video_export_error_count": sum(row["evidence_error"] is not None for row in results),
+        "phase_completed_counts": {phase: sum(((row["phase_scores"] or {}).get(phase) or {}).get("completed") is True
+                                                for row in results) for phase in PHASES},
     }
     command_audits = [(result["teacher"] or {}).get("command_limit_audit") or {} for result in results]
     limiter = {
@@ -289,6 +305,7 @@ def run_teacher_acceptance(config, run_dir, *, smoke=False):
         "pairing_errors": pairing_report["errors"], "action_contract_sha256": contract.contract_sha256,
         "chunk_consistency_scope": "diagnostic of unmodified 8-step future labels; independent of the physical lift/hold gate",
         "training_started": False, "training_eligible": False, "split": "diagnostic",
+        "evidence_complete": all((row["evidence"] or {}).get("complete") is True for row in results),
     }
     write_new_json(output_path, report)
     return report

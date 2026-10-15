@@ -14,6 +14,7 @@
 | `control_limits.py` | Source-hashed green/right command-envelope audit |
 | `data_pairing.py` | Exact pre-command/post-command pairing, historical rejection and eight-step chunk consistency |
 | `expert.py`, `teacher_acceptance.py` | Privileged green/right physical teacher and frozen-layout acceptance; no policy fallback |
+| `teacher_evidence.py`, `teacher_video.py` | Actual sensor videos, separate diagnostic renders, phase scores and frame/time provenance, including failures |
 | `observation.py`, `sim/scene.py` | Sensor-only observation and strict scene preparation |
 | `policy.py` | Self-contained continuous model and explicit historical-checkpoint loading |
 | `training.py` | Aligned dataset/statistics/loss/resume primitives and disabled optimizer gate |
