@@ -110,6 +110,33 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ConfigError):
                 validate_config(config)
 
+    def test_state_residual_and_coverage_preserve_zero_identity_and_budget(self):
+        for change in ("nonzero_head", "drop_step_zero", "vae", "center_target", "inverse_anchor", "missing_control", "budget", "motion", "bins", "unbounded_candidates"):
+            config = config_fixture()
+            residual, coverage = config["state_residual"], config["trajectory_coverage"]
+            if change == "nonzero_head":
+                residual["zero_head_init"] = False
+            elif change == "drop_step_zero":
+                residual["include_step_zero_in_selection"] = False
+            elif change == "vae":
+                residual["use_vae"] = True
+            elif change == "center_target":
+                residual["target"] = "mean_centered_residual"
+            elif change == "inverse_anchor":
+                residual["decode"] = "inverse_normalized_state_anchor"
+            elif change == "missing_control":
+                residual["variants"] = ["rgb_residual_scratch"]
+            elif change == "budget":
+                residual["max_steps"] += 50
+            elif change == "motion":
+                coverage["moving_speed_rad_s"] = 0.2
+            elif change == "bins":
+                coverage["quarter_bins"] = 3
+            else:
+                coverage["expansion_group_limit"] = 5
+            with self.subTest(change=change), self.assertRaises(ConfigError):
+                validate_config(config)
+
     def test_velocity_zero_is_hold_and_bad_limits_are_rejected(self):
         config = config_fixture()
         config["control"]["max_velocity_rad_s"] = [0.] * 31

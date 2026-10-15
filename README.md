@@ -77,6 +77,20 @@ The weight download is limited to the official TorchVision HTTPS URL and its pub
 
 Both visual models retain the same 320×240 source resize and train-derived RGB normalization. Neither receives a separate ImageNet crop or processor. Official ImageNet preprocessing differs, so this comparison measures initialization under the current recorded-data protocol; it is not a claim that all pretrained preprocessing choices or robot generalization have been evaluated. Each model receives a discarded real optimizer/evaluation memory probe before formal training. Runs, reports, selected checkpoints and predictions are saved in new directories without overwriting earlier evidence.
 
+State-relative action prediction and trajectory coverage use the same entry point:
+
+```sh
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage coverage-audit
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage residual-check
+/home/ubuntu/VLA-Learning/.envs/g1-audit/bin/python -m g1_vla.cli experiment --config configs/experiment.json --stage residual-train
+```
+
+`state_residual` fixes two no-VAE models: state-only and RGB from scratch. Both use the previous data split, compatible shared initial tensors, anchor schedule and 2000-step optimizer budget. Their final action head starts at zero. The label for every future row is `(raw_action[t+h] - raw_state[t]) / train_action_std`; there is no residual mean or changed scale. Reconstruction uses the original float32 source anchor, `raw_state[t] + train_action_std * prediction`. Zero residual explicitly copies the raw anchor, preserving exact state-hold values including signed zero. The anchor is never reconstructed from normalized model input. Training applies L1 directly to scaled residuals, so the exact-zero inference branch does not suppress the head gradient.
+
+`residual-check` verifies zero identity and performs one discarded real optimizer/evaluation memory probe per model. `residual-train` requires that report with matching configuration, data, source, runtime and initial-model bindings, then starts fresh formal models without duplicating the admission probes. The first zero-head backward has zero upstream gradients by construction; AdamW weight decay may still update those parameters. Initial step 0 is a declared checkpoint candidate. Best-trained and last-trained results are reported separately, so selecting hold cannot be presented as learned improvement. Validation includes per-episode, horizon and anchor-motion comparisons using the same hold denominator. Test payloads and previous test scores are excluded.
+
+`coverage-audit` separates sampled-anchor coverage from future-label-row coverage and audits only existing train payloads plus pinned source metadata. Its next-batch proposal is metadata-only: it does not download candidates, expand the active dataset or alter the split. File grouping is storage evidence; missing collection-session, scene and operator identities cannot be inferred from different episode numbers or MP4 shards. Candidate coverage expansion and genuinely independent session acquisition must be reported separately.
+
 ## Contracts and evidence
 
 - `configs/experiment.json` is the only active configuration; unknown or duplicate JSON keys are rejected.

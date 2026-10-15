@@ -336,6 +336,26 @@ SCHEMA = {
         "weights_max_bytes": _positive_integer,
         "weights_cache_path": _text, "weights_receipt_path": _text,
     },
+    "state_residual": {
+        "backend": _literal("grasp_square_state_residual_v1"),
+        "variants": _strings, "use_vae": _literal(False),
+        "target": _literal("raw_action_minus_anchor_q_over_train_action_std_v1"),
+        "decode": _literal("raw_anchor_q_plus_train_action_std_times_residual_zero_exact_v1"),
+        "zero_head_init": _literal(True), "include_step_zero_in_selection": _literal(True),
+        "seed": _integer, "max_steps": _positive_integer,
+        "eval_every_steps": _positive_integer, "eval_stride": _positive_integer,
+        "eval_batch_size": _positive_integer, "max_train_wall_s": _positive,
+        "max_gpu_reserved_bytes": _positive_integer, "output_dir": _text,
+        "reference_visual_report_path": _text, "reference_visual_report_sha256": _hash,
+        "admission_report_path": _text,
+    },
+    "trajectory_coverage": {
+        "backend": _literal("grasp_square_trajectory_coverage_v1"),
+        "reference_training_report_path": _text, "reference_training_report_sha256": _hash,
+        "stationary_speed_rad_s": _positive, "moving_speed_rad_s": _positive,
+        "quarter_bins": _literal(4), "expansion_group_limit": _positive_integer,
+        "expansion_episodes_per_group": _positive_integer,
+    },
 }
 
 OBSERVATION_FIELDS = frozenset({
@@ -424,6 +444,18 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.visual_pretraining.weights_max_bytes", "must not exceed the 64 MiB pinned ResNet18 download budget")
     if visual["weights_sha256"] is not None and not visual["weights_sha256"].startswith(visual["weights_sha256_prefix"]):
         _error("config.visual_pretraining.weights_sha256", "must agree with the trusted TorchVision URL hash prefix")
+    residual = config["state_residual"]
+    if residual["variants"] != ["state_only_residual", "rgb_residual_scratch"]:
+        _error("config.state_residual.variants", "must retain the ordered state-only and fresh RGB residual controls")
+    for key in ("seed", "max_steps", "eval_every_steps", "eval_stride", "eval_batch_size", "max_train_wall_s", "max_gpu_reserved_bytes"):
+        if residual[key] != visual[key]:
+            _error("config.state_residual." + key, "must retain the declared stage6 training budget")
+    coverage = config["trajectory_coverage"]
+    for key in ("stationary_speed_rad_s", "moving_speed_rad_s"):
+        if coverage[key] != timing[key]:
+            _error("config.trajectory_coverage." + key, "must retain the original motion strata")
+    if coverage["expansion_group_limit"] > 4 or coverage["expansion_episodes_per_group"] > 2:
+        _error("config.trajectory_coverage", "the metadata-only next-batch proposal is bounded to four groups and two episodes per group")
     return copy.deepcopy(config)
 
 
@@ -441,6 +473,8 @@ _PATH_FIELDS = {
     "native_diagnostics": ("training_report_path",),
     "act_diagnostics": ("reference_checkpoint_path", "reference_config_path", "output_dir"),
     "visual_pretraining": ("reference_ablation_report_path", "weights_cache_path", "weights_receipt_path", "output_dir"),
+    "state_residual": ("reference_visual_report_path", "admission_report_path", "output_dir"),
+    "trajectory_coverage": ("reference_training_report_path",),
 }
 
 

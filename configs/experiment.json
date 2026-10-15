@@ -350,5 +350,38 @@
     "weights_max_bytes": 67108864,
     "weights_cache_path": ".runtime/rebuild/weights/torchvision-resnet18-imagenet1k-v1/resnet18-f37072fd.pth",
     "weights_receipt_path": ".runtime/rebuild/weights/torchvision-resnet18-imagenet1k-v1/receipt.json"
+  },
+  "state_residual": {
+    "backend": "grasp_square_state_residual_v1",
+    "variants": [
+      "state_only_residual",
+      "rgb_residual_scratch"
+    ],
+    "use_vae": false,
+    "target": "raw_action_minus_anchor_q_over_train_action_std_v1",
+    "decode": "raw_anchor_q_plus_train_action_std_times_residual_zero_exact_v1",
+    "zero_head_init": true,
+    "include_step_zero_in_selection": true,
+    "seed": 20261014,
+    "max_steps": 2000,
+    "eval_every_steps": 50,
+    "eval_stride": 30,
+    "eval_batch_size": 8,
+    "max_train_wall_s": 1800,
+    "max_gpu_reserved_bytes": 7516192768,
+    "output_dir": ".runtime/rebuild/diagnostics/phase7-state-residual-v1",
+    "reference_visual_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-vision-ablate-02/reports/visual_pretraining.json",
+    "reference_visual_report_sha256": "4ae9989769567e5fe7da5fb1a4a32fa4ec835b00e8152002645de1477b5b2ed5",
+    "admission_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-residual-check-01/reports/state_residual_admission.json"
+  },
+  "trajectory_coverage": {
+    "backend": "grasp_square_trajectory_coverage_v1",
+    "reference_training_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-vision-ablate-02/reports/visual_pretraining.json",
+    "reference_training_report_sha256": "4ae9989769567e5fe7da5fb1a4a32fa4ec835b00e8152002645de1477b5b2ed5",
+    "stationary_speed_rad_s": 0.02,
+    "moving_speed_rad_s": 0.1,
+    "quarter_bins": 4,
+    "expansion_group_limit": 4,
+    "expansion_episodes_per_group": 2
   }
 }
