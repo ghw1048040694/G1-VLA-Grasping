@@ -100,7 +100,7 @@
     "include_restart_wait_labels": false,
     "separate_waypoint_recovery": true,
     "teacher": {
-      "profile": "green_right_cavity_feedback_v3",
+      "profile": "green_right_cartesian_feedback_v4",
       "grasp_yaw_deg": 0.0,
       "closure_multiplier": 1.2,
       "finger_scale": [
@@ -135,6 +135,22 @@
       "palm_position_tolerance_m": 0.03,
       "joint_target_tolerance_rad": 0.06,
       "phase_timeout_scale": 3.0
+    },
+    "trajectory": {
+      "backend": "actual_grasp_center_cartesian_v1",
+      "waypoint_spacing_m": 0.01,
+      "interpolation_samples": 11,
+      "maximum_joint_sample_spacing_rad": 0.02,
+      "position_weight": 10.0,
+      "collision_cost_scale": 10.0,
+      "taskpoint_tolerance_m": 0.015,
+      "reference_tracking_rad": 0.02,
+      "reference_tracking_m": 0.003,
+      "solver_max_nfev": 1200,
+      "solver_finite_difference_rad": 0.0001,
+      "joint_continuity_weight": 0.003,
+      "closed_orientation_weight": 1.0,
+      "closed_orientation_tolerance_rad": 0.05
     }
   },
   "data": {

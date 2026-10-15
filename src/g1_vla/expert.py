@@ -84,7 +84,7 @@ def green_target_from_position(object_position, profile, *, height=0., lateral=0
     """Build a privileged teacher goal from the measured, current object center."""
     if len(object_position) != 3 or any(not math.isfinite(float(value)) for value in object_position):
         raise ExpertError("current green object position must contain three finite coordinates")
-    if profile["profile"] == "green_right_cavity_feedback_v3":
+    if profile["profile"] in ("green_right_cavity_feedback_v3", "green_right_cartesian_feedback_v4"):
         # The site is at local x=.14, close to the finger roots.  The grasp
         # cavity is on their shared +local-y side toward the opposing thumb.
         # Every stage uses this same frame relation, including its approach.
@@ -121,7 +121,7 @@ def validate_teacher(config):
     if not isinstance(profile, dict) or set(profile) != PROFILE_KEYS:
         raise ExpertError("expert.teacher must contain the complete explicit physical profile")
     if profile["profile"] not in ("green_right_recovery_v1", "green_right_geometry_feedback_v2",
-                                  "green_right_cavity_feedback_v3"):
+                                  "green_right_cavity_feedback_v3", "green_right_cartesian_feedback_v4"):
         raise ExpertError("teacher requires a declared green/right physical profile")
     for key in PROFILE_KEYS - {"profile", "finger_scale", "contact_compensation_m", "grasp_center_in_palm_m", "adaptive_regrasp", "record_rgb", "grasp_yaw_deg"}:
         value = profile[key]
@@ -136,9 +136,12 @@ def validate_teacher(config):
             raise ExpertError("{} requires three finite values".format(key))
     if any(v <= 0 for v in profile["finger_scale"]):
         raise ExpertError("finger_scale must be positive")
-    if (profile["profile"] == "green_right_cavity_feedback_v3"
+    if (profile["profile"] in ("green_right_cavity_feedback_v3", "green_right_cartesian_feedback_v4")
             and any(value != 0 for value in profile["contact_compensation_m"])):
-        raise ExpertError("cavity v3 requires zero legacy contact compensation")
+        raise ExpertError("cavity profiles require zero legacy contact compensation")
+    if profile["profile"] == "green_right_cartesian_feedback_v4":
+        if config["expert"].get("trajectory", {}).get("backend") != "actual_grasp_center_cartesian_v1":
+            raise ExpertError("Cartesian v4 requires its explicit trajectory configuration")
     if not all(isinstance(profile[key], bool) for key in ("adaptive_regrasp", "record_rgb")):
         raise ExpertError("adaptive_regrasp and record_rgb must be booleans")
     if profile["phase_timeout_scale"] < 1:
@@ -169,6 +172,14 @@ def closure_complete(now_s, close_start_s, profile):
     """A first touch cannot skip the complete declared closing interval."""
     return bool(close_start_s is not None
                 and now_s - close_start_s + 1e-9 >= profile["close_duration_s"])
+
+
+def cartesian_path_executed(progress, actual_endpoint_reached, requested_arm, applied_arm):
+    """A proposed endpoint is insufficient without execution and true tracking."""
+    return bool(progress and progress.get("end_reference_reached") and actual_endpoint_reached
+                and len(requested_arm) == len(applied_arm)
+                and all(abs(float(first) - float(second)) <= 1e-9
+                        for first, second in zip(requested_arm, applied_arm)))
 
 
 def phase_tracking_reached(phase, tracking, profile, *, contact, minimum_lift_m,
@@ -473,8 +484,9 @@ def run_teacher_episode(config, spec, run_dir):
     if set(spec.get("positions_m", {})) != {"green_cube"}:
         raise ExpertError("teacher layout must contain only green_cube")
     layout_fingerprint = spec.get("layout_fingerprint") or canonical_sha256(spec["positions_m"])
+    cartesian_profile = profile["profile"] == "green_right_cartesian_feedback_v4"
     report = {"schema_version": 2,
-              "teacher_protocol": ("green_right_strict_shared_pd_cavity_v3"
+              "teacher_protocol": ("green_right_strict_shared_pd_cartesian_v4" if cartesian_profile else "green_right_strict_shared_pd_cavity_v3"
                                    if profile["profile"] == "green_right_cavity_feedback_v3"
                                    else "green_right_strict_shared_pd_feedback_v2"),
               "task": "green_cube_right_grasp_lift", "layout": spec,
@@ -503,6 +515,14 @@ def run_teacher_episode(config, spec, run_dir):
     closure_start_event = None
     current_phase, planned_next_phase = None, None
     maximum_joint_overrun, pending = {}, {}
+    planner, active_plan, path_progress, path_status, grip_lock = None, None, None, {}, None
+    trajectory = {"backend": config["expert"].get("trajectory", {}).get("backend") if cartesian_profile else None,
+                  "plans": [], "execution_ledger": [], "grip_lock": None, "progress_blocked_count": 0,
+                  "workspace_snapshots": [],
+                  "limiter_mismatch_count": 0, "planning_failure": None,
+                  "settings": dict(config["expert"].get("trajectory", {})) if cartesian_profile else None,
+                  "maximum_closed_rotation_error_rad": 0., "maximum_taskpoint_tracking_error_m": 0.,
+                  "rotation_measurement_scope": "actual lift/hold post-control states relative to the post-grasp grip lock at the original control cadence; not every physics substep"}
     try:
         source = Path(config["scene"]["asset_path"])
         if not source.is_absolute():
@@ -549,20 +569,24 @@ def run_teacher_episode(config, spec, run_dir):
         report["control"] = controller.metadata()
         report["action_contract"] = contract.metadata()
         orientations = np.asarray([Rotation.from_euler("z", profile["grasp_yaw_deg"], degrees=True).as_matrix()])
-        cavity_profile = profile["profile"] == "green_right_cavity_feedback_v3"
+        cavity_profile = profile["profile"] in ("green_right_cavity_feedback_v3", "green_right_cartesian_feedback_v4")
         collision_pairs = arm_torso_collision_pairs(model, include_elbow=cavity_profile, mujoco_api=api)
         report["ik_collision_constraint_scope"] = (
             "nine source-active torso/right-shoulder-and-elbow geometry pairs; reject any generated robot self contact at the solution"
             if cavity_profile else "six source-active torso/right-shoulder geometry pairs; reject any generated robot self contact at the solution")
         report["ik_collision_pair_count"] = len(collision_pairs)
         report["grasp_target_geometry"] = {
-            "mapping": ("object_world - Rz(configured_yaw) @ grasp_center_in_palm_m + world_phase_lateral_and_height"
+            "mapping": ("actual taskpoint C(q)=palm(q)+R(q)@grasp_center_in_palm_m; fixed planned endpoint palm retains original tracking gate" if cartesian_profile else "object_world - Rz(configured_yaw) @ grasp_center_in_palm_m + world_phase_lateral_and_height"
                         if cavity_profile else "legacy object assist offset, world lateral - .03m, optional mirrored legacy compensation"),
             "grasp_center_in_palm_m": list(profile["grasp_center_in_palm_m"]) if cavity_profile else None,
             "grasp_yaw_deg": float(profile["grasp_yaw_deg"]),
             "contact_palm_offset_world_m": list(green_target_from_position((0., 0., 0.), profile, compensate=True)),
             "legacy_assist_offset_applied": not cavity_profile,
             "ik_orientation_weight": float(profile["ik_orientation_weight"])}
+        if cartesian_profile:
+            report["grasp_target_geometry"]["nominal_offset_scope"] = "ideal-yaw diagnostic only; planner and execution use actual FK palm rotation"
+            trajectory["scene_reference"] = {key: report["scene"][key]
+                for key in ("source", "source_sha256", "scene", "scene_sha256")}
         poses = {"home": baseline[arm_indices].copy()}
         cartesian_targets = {"home": data.site_xpos[palms[1]].copy()}
         reports = {"home": home_report}
@@ -591,7 +615,7 @@ def run_teacher_episode(config, spec, run_dir):
                               height=height, lateral=lateral, compensate=compensate))
 
         def refresh_phase_pose(phase, key, target, *, target_relation="current_object_center"):
-            nonlocal planned_next_phase
+            nonlocal planned_next_phase, active_plan, path_progress, path_status, grip_lock
             planned_next_phase = phase
             visited_seed = data.qpos[ids].copy()
             label = "{}_live".format(phase)
@@ -603,9 +627,53 @@ def run_teacher_episode(config, spec, run_dir):
                 "target_palm_position_m": np.asarray(target).tolist(),
                 "target_relation": target_relation, "live_state_modified": False}
             report["latest_phase_planning_attempt"] = attempt
+            if cartesian_profile:
+                attempt["entry_full_state"] = planner.state_snapshot(data)
             try:
-                values = pose(label, target, visited_seed)
+                if cartesian_profile:
+                    from .teacher_path_progress import JointPathProgress
+                    if phase == "lift":
+                        if grip_lock is not None:
+                            raise ExpertError("actual post-grasp grip may only be locked once")
+                        grip_lock = planner.latch_grip(data)
+                        trajectory["grip_lock"] = grip_lock
+                    next_plan = planner.plan_phase(phase, data,
+                        np.asarray(controller.previous_target)[arm_indices],
+                        grip_lock=grip_lock, previous_plan=active_plan)
+                    active_plan, path_status = next_plan, {}
+                    trajectory["plans"].append(next_plan)
+                    values = np.asarray(next_plan["q_waypoints"][-1])
+                    target = np.asarray(next_plan["endpoint_palm"])
+                    attempt["target_palm_position_m"] = target.tolist()
+                    attempt["target_relation"] = target_relation = "fixed_FK_endpoint_of_audited_actual_taskpoint_path"
+                    reports[label] = {"solver_success": True, "reference_sha256": next_plan["reference_sha256"],
+                        "maximum_position_error_m": max((item["taskpoint_error_m"] for item in next_plan["waypoint_details"]), default=0.),
+                        "collision_acceptance_passed": True, "budget": next_plan["budget"],
+                        "target_C": next_plan["target_C"], "target_R": next_plan["target_R"],
+                        "fixed_endpoint_palm_m": next_plan["endpoint_palm"]}
+
+                    def online_chord(first, second, context):
+                        # The object remains free: refresh its actual quaternion,
+                        # translation and every hand joint before each query.
+                        planner.sync_actual(data)
+                        snapshots = trajectory["workspace_snapshots"]
+                        if not snapshots or snapshots[-1]["time_s"] != float(data.time):
+                            snapshots.append(planner.state_snapshot(data))
+                        closed_geometry = active_plan["closed"] or close_start_s is not None
+                        result = planner.validate_chord(first, second, context, closed=closed_geometry,
+                            lock_rotation=active_plan["target_R"] if active_plan["closed"] else None)
+                        result["workspace_snapshot_index"] = len(snapshots) - 1
+                        return result
+
+                    path_progress = JointPathProgress(next_plan["q_waypoints"], planner.velocity,
+                        controller.cadence.period_s, low, high,
+                        max_anchor_delta=float(np.min(planner.anchor)), chord_validator=online_chord)
+                else:
+                    values = pose(label, target, visited_seed)
             except (ValueError, RuntimeError, OSError, TypeError) as exc:
+                if cartesian_profile:
+                    trajectory["planning_failure"] = {"phase": phase, "error": str(exc),
+                                                       "detail": getattr(exc, "detail", {})}
                 attempt.update({"status": "rejected", "ik": reports.get(label),
                                 "error": "{}: {}".format(type(exc).__name__, exc)})
                 report["failure_phase"] = phase
@@ -638,6 +706,11 @@ def run_teacher_episode(config, spec, run_dir):
         if profile["record_rgb"]:
             renderer = api.Renderer(model, height=config["observation"]["image_height"], width=config["observation"]["image_width"])
             builder = ObservationBuilder(model, renderer, names, ObservationSpec.from_config(config), mujoco_api=api)
+        if cartesian_profile:
+            from .teacher_trajectory import CartesianTeacherPlanner
+            planner = CartesianTeacherPlanner(model, config, contract, mujoco_api=api)
+            trajectory["collision_pairs"] = planner.pair_evidence
+            trajectory["collision_pair_signature_sha256"] = planner.pair_signature
         language = "grasp the green cube with the right hand and lift it"
         current_phase, phase_start = "home", 0.
         actual_phase_seed = data.qpos[ids].copy()
@@ -767,6 +840,37 @@ def run_teacher_episode(config, spec, run_dir):
                     "right_hand_requested_error_rad": max(abs(pending["requested"][i] - after[i]) for i, name in enumerate(names) if name.startswith("right_hand_")),
                     "command_limiter_delta_rad": float(np.max(np.abs(np.asarray(pending["requested"]) - pending["command"]))),
                 })
+                if cartesian_profile and active_plan is not None:
+                    from .teacher_trajectory import rotation_error
+                    actual_pose = planner.actual_pose(data)
+                    planner.sync_actual(data)
+                    reference = planner.reference_pose(np.asarray(pending["requested"])[arm_indices])
+                    tracking_error = float(np.linalg.norm(actual_pose["C"] - reference["C"]))
+                    closed_error = (rotation_error(grip_lock["R"], actual_pose["R"])
+                                    if grip_lock is not None and active_plan["closed"] else None)
+                    mismatch = float(np.max(np.abs(np.asarray(pending["requested"])[arm_indices]
+                                                   - np.asarray(pending["command"])[arm_indices])))
+                    path_executed = cartesian_path_executed(path_status, planner.end_reached(active_plan, data),
+                        np.asarray(pending["requested"])[arm_indices], np.asarray(pending["command"])[arm_indices])
+                    latest_tracking.update({"cartesian_path_executed": path_executed,
+                        "actual_grasp_center_m": actual_pose["C"].tolist(),
+                        "reference_grasp_center_m": reference["C"].tolist(),
+                        "endpoint_grasp_center_error_m": float(np.linalg.norm(actual_pose["C"] - active_plan["target_C"])),
+                        "declared_taskpoint_goal_error_m": float(np.linalg.norm(actual_pose["C"] - active_plan["target_C"])),
+                        "fixed_endpoint_reference_C_error_m": float(np.linalg.norm(actual_pose["C"] - active_plan["endpoint_C"])),
+                        "taskpoint_reference_tracking_error_m": tracking_error,
+                        "closed_grip_rotation_error_rad": closed_error, "arm_limiter_delta_rad": mismatch})
+                    trajectory["maximum_taskpoint_tracking_error_m"] = max(trajectory["maximum_taskpoint_tracking_error_m"], tracking_error)
+                    if closed_error is not None:
+                        trajectory["maximum_closed_rotation_error_rad"] = max(trajectory["maximum_closed_rotation_error_rad"], closed_error)
+                    trajectory["limiter_mismatch_count"] += int(mismatch > 1e-9)
+                    trajectory["execution_ledger"].append({"timestamp_s": end_s, "phase": current_phase,
+                        "reference_sha256": active_plan["reference_sha256"], "progress": dict(path_status),
+                        "raw_actual_arm_qpos_rad": actual_pose["arm"].tolist(),
+                        "actual_C": actual_pose["C"].tolist(), "actual_R": actual_pose["R"].tolist(),
+                        "requested_arm_rad": np.asarray(pending["requested"])[arm_indices].tolist(),
+                        "applied_arm_rad": np.asarray(pending["command"])[arm_indices].tolist(),
+                        "fixed_endpoint_palm_m": active_plan["endpoint_palm"], "tracking": dict(latest_tracking)})
                 tracking_rows.append(dict(latest_tracking))
                 pending.clear()
             else:
@@ -783,7 +887,8 @@ def run_teacher_episode(config, spec, run_dir):
         completed = False
         while not completed:
             elapsed = float(data.time) - phase_start
-            if close_start_s is None and contact_closure_ready(current_phase, elapsed, latest_tracking, profile):
+            if (close_start_s is None and contact_closure_ready(current_phase, elapsed, latest_tracking, profile)
+                    and (not cartesian_profile or latest_tracking.get("cartesian_path_executed", False))):
                 close_start_s = float(data.time)
                 closure_start_event = {
                     "timestamp_s": close_start_s, "phase": current_phase,
@@ -797,7 +902,24 @@ def run_teacher_episode(config, spec, run_dir):
             desired = poses[destination[current_phase]]
             active_cartesian_target = cartesian_targets[destination[current_phase]]
             target = baseline.copy()
-            target[arm_indices] = interpolate(phase_seed, desired, elapsed / duration[current_phase])
+            if cartesian_profile and current_phase != "home":
+                from .teacher_trajectory import rotation_error
+                planner.sync_actual(data)
+                actual_pose = planner.actual_pose(data)
+                reference_pose = planner.reference_pose(path_progress.reference)
+                settings = config["expert"]["trajectory"]
+                tracking_ready = bool(
+                    np.max(np.abs(actual_pose["arm"] - path_progress.reference)) <= settings["reference_tracking_rad"]
+                    and np.linalg.norm(actual_pose["C"] - reference_pose["C"]) <= settings["reference_tracking_m"]
+                    and (not active_plan["closed"] or rotation_error(active_plan["target_R"], actual_pose["R"])
+                         <= settings["closed_orientation_tolerance_rad"]))
+                path_status = path_progress.step(actual_pose["arm"], np.asarray(controller.previous_target)[arm_indices], tracking_ready)
+                trajectory["progress_blocked_count"] += int(path_status["blocked"])
+                if path_status["reference"] is None:
+                    raise ExpertError("Cartesian follower has no legal acknowledged reference: {}".format(path_status["reason"]))
+                target[arm_indices] = path_status["reference"]
+            else:
+                target[arm_indices] = interpolate(phase_seed, desired, elapsed / duration[current_phase])
             close = smoothstep((float(data.time) - close_start_s) / profile["close_duration_s"]) if close_start_s is not None else 0.
             for index, name in enumerate(names):
                 if name.startswith("right_hand_"):
@@ -806,6 +928,8 @@ def run_teacher_episode(config, spec, run_dir):
             # is built from eight next real control commands by the shared codec.
             controller.execute_target(target.tolist(), joint_names=names,
                                       observer=observer, substep_observer=substep_observer)
+            if cartesian_profile and latest_tracking.get("arm_limiter_delta_rad", 0.) > 1e-9:
+                raise ExpertError("shared limiter changed an audited Cartesian arm reference")
             elapsed = float(data.time) - phase_start
             contact_now = bool(interval_contacts) and all(interval_contacts)
             reached = phase_tracking_reached(current_phase, latest_tracking, profile,
@@ -813,6 +937,8 @@ def run_teacher_episode(config, spec, run_dir):
                         lift_height_m=config["eval"]["lift_height_m"], hold_duration_s=config["eval"]["hold_duration_s"])
             if current_phase == "contact":
                 reached = reached and closure_complete(float(data.time), close_start_s, profile)
+            if cartesian_profile and current_phase != "home":
+                reached = reached and latest_tracking.get("cartesian_path_executed", False)
             if elapsed >= duration[current_phase] and reached:
                 phase_records.append({"phase": current_phase, "start_s": phase_start,
                                       "end_s": float(data.time), "tracking": dict(latest_tracking),
@@ -916,13 +1042,21 @@ def run_teacher_episode(config, spec, run_dir):
         np.savez_compressed(interrupted_path, **diagnostic)
         report["interrupted_control_artifact"] = str(interrupted_path)
     report["phase_replan_ledger"] = replan_ledger
+    if cartesian_profile:
+        report["trajectory"] = trajectory
+        report["trajectory"]["live_state_modified"] = False
+        report["trajectory"]["acceptance_scope"] = "additional path/taskpoint/orientation conditions AND original palm/joint/contact/lift/hold gates; no phase duration or timeout extension"
     report["phase_reference_ledger"] = phase_reference_ledger
     report["planning_seed_reference"] = "mechanically bounded copy of raw measured right-arm state for interpolation only; live qpos, observation, controller anchor and original joint-safety tolerance remain unchanged"
+    if cartesian_profile:
+        report["planning_seed_reference"] = "v4 path starts at the prior actually applied legal command; raw actual state is retained for tracking, all FK snapshots and the unchanged safety gate; legacy bounded-plan-seed ledger is diagnostic only"
     report["active_execution_phase"] = current_phase
     report["planned_next_phase"] = planned_next_phase
     report.setdefault("failed_ik_label", None)
     report["closure_start_event"] = closure_start_event
     report["closure_planning"] = "open through completed contact approach and measured palm/arm tracking gates; full declared close interval required before contact phase passes"
+    if cartesian_profile:
+        report["closure_planning"] += "; additionally requires executed full Cartesian path and true actual taskpoint within configured {}m; no early close while descending".format(config["expert"]["trajectory"]["taskpoint_tolerance_m"])
     report["robot_self_collision_substeps_by_pair"] = self_collision_counts
     report["maximum_self_collision_penetration_m_by_pair"] = self_collision_penetrations
     report["phase_robot_self_collision_substeps_by_pair"] = phase_self_collision_counts

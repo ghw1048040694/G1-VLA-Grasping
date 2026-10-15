@@ -213,7 +213,7 @@ SCHEMA = {
         "include_restart_wait_labels": _literal(False),
         "separate_waypoint_recovery": _literal(True),
         "teacher": {
-            "profile": _choice("green_right_recovery_v1", "green_right_geometry_feedback_v2", "green_right_cavity_feedback_v3"),
+            "profile": _choice("green_right_recovery_v1", "green_right_geometry_feedback_v2", "green_right_cavity_feedback_v3", "green_right_cartesian_feedback_v4"),
             "grasp_yaw_deg": _finite, "closure_multiplier": _positive,
             "finger_scale": _triple, "contact_compensation_m": _triple,
             "grasp_center_in_palm_m": _triple,
@@ -228,6 +228,17 @@ SCHEMA = {
             "ik_collision_margin_m": _positive, "ik_collision_weight": _positive,
             "record_rgb": _literal(True), "palm_position_tolerance_m": _positive,
             "joint_target_tolerance_rad": _positive, "phase_timeout_scale": _positive,
+        },
+        "trajectory": {
+            "backend": _literal("actual_grasp_center_cartesian_v1"),
+            "waypoint_spacing_m": _positive, "interpolation_samples": _positive_integer,
+            "maximum_joint_sample_spacing_rad": _positive,
+            "position_weight": _positive, "collision_cost_scale": _positive,
+            "taskpoint_tolerance_m": _positive, "reference_tracking_rad": _positive,
+            "reference_tracking_m": _positive, "solver_max_nfev": _positive_integer,
+            "solver_finite_difference_rad": _positive,
+            "joint_continuity_weight": _positive,
+            "closed_orientation_weight": _positive, "closed_orientation_tolerance_rad": _positive,
         },
     },
     "data": {
@@ -468,9 +479,20 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if config["train"]["resume_checkpoint"] and config["train"]["warm_start_checkpoint"]:
         _error("config.train", "resume_checkpoint and warm_start_checkpoint are mutually exclusive")
     teacher = config["expert"]["teacher"]
-    if (teacher["profile"] == "green_right_cavity_feedback_v3"
+    if (teacher["profile"] in ("green_right_cavity_feedback_v3", "green_right_cartesian_feedback_v4")
             and any(value != 0 for value in teacher["contact_compensation_m"])):
         _error("config.expert.teacher.contact_compensation_m", "cavity profile forbids legacy world compensation")
+    trajectory = config["expert"]["trajectory"]
+    if trajectory["interpolation_samples"] < 2:
+        _error("config.expert.trajectory.interpolation_samples", "must inspect both segment endpoints")
+    if max(trajectory["taskpoint_tolerance_m"], trajectory["reference_tracking_m"]) > teacher["palm_position_tolerance_m"]:
+        _error("config.expert.trajectory", "taskpoint and reference gates cannot exceed the original palm gate")
+    if trajectory["reference_tracking_rad"] > teacher["joint_target_tolerance_rad"]:
+        _error("config.expert.trajectory.reference_tracking_rad", "cannot exceed the original requested-joint gate")
+    if trajectory["maximum_joint_sample_spacing_rad"] > teacher["joint_target_tolerance_rad"]:
+        _error("config.expert.trajectory.maximum_joint_sample_spacing_rad", "cannot exceed the original requested-joint gate")
+    if trajectory["solver_finite_difference_rad"] > trajectory["maximum_joint_sample_spacing_rad"]:
+        _error("config.expert.trajectory.solver_finite_difference_rad", "cannot exceed the declared geometry sample spacing")
     if any(value <= 0 for value in teacher["finger_scale"]):
         _error("config.expert.teacher.finger_scale", "must be positive")
     if teacher["phase_timeout_scale"] < 1:

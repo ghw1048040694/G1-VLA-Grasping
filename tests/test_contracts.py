@@ -57,6 +57,20 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaisesRegex(ConfigError, "unknown keys"):
                 validate_config(config)
 
+    def test_cartesian_planning_cannot_bypass_original_tracking_gates(self):
+        for key, value in (("taskpoint_tolerance_m", .04), ("reference_tracking_m", .04),
+                           ("reference_tracking_rad", .07), ("interpolation_samples", 1),
+                           ("maximum_joint_sample_spacing_rad", .07),
+                           ("solver_finite_difference_rad", .03)):
+            config = config_fixture()
+            config["expert"]["trajectory"][key] = value
+            with self.subTest(key=key), self.assertRaises(ConfigError):
+                validate_config(config)
+        config = config_fixture()
+        config["expert"]["teacher"]["contact_compensation_m"][0] = .01
+        with self.assertRaisesRegex(ConfigError, "forbids legacy"):
+            validate_config(config)
+
     def test_native_split_and_model_cadence_are_not_silent_overrides(self):
         for change in ("split_overlap", "discovery_episode", "chunk_mismatch", "eval_overlap"):
             config = config_fixture()

@@ -94,7 +94,16 @@ def _summary(report):
             "robot_self_collision_substeps_by_pair", "diagnostic_video",
             "active_execution_phase", "planned_next_phase", "failed_ik_label",
             "maximum_green_hand_contact_penetration_m", "maximum_green_table_contact_penetration_m")
-    return {key: report.get(key) for key in keys}
+    result = {key: report.get(key) for key in keys}
+    trajectory = report.get("trajectory")
+    result["trajectory"] = ({key: trajectory.get(key) for key in (
+        "backend", "progress_blocked_count", "limiter_mismatch_count",
+        "maximum_closed_rotation_error_rad", "maximum_taskpoint_tracking_error_m",
+        "rotation_measurement_scope")}
+        if isinstance(trajectory, dict) else None)
+    if result["trajectory"] is not None:
+        result["trajectory"]["planning_failed"] = trajectory.get("planning_failure") is not None
+    return result
 
 
 def _write_scores(path, layouts):
@@ -103,7 +112,9 @@ def _write_scores(path, layouts):
         "maximum_lift_m", "sustained_lift_hold_s", "physical_contact_substeps",
         "maximum_green_hand_contact_penetration_m", "maximum_green_table_contact_penetration_m",
         "joint_limit_violation_substeps", "command_limits_passed", "numeric_finite",
-        "pairing_eligible", "sensor_complete", "raw_videos_complete", "diagnostic_videos_complete"]
+        "pairing_eligible", "sensor_complete", "raw_videos_complete", "diagnostic_videos_complete",
+        "trajectory_backend", "trajectory_progress_blocked_count", "trajectory_limiter_mismatch_count",
+        "trajectory_planning_failed", "maximum_closed_rotation_error_rad", "maximum_taskpoint_tracking_error_m"]
     with Path(path).open("x", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -117,6 +128,11 @@ def _write_scores(path, layouts):
                        pairing_eligible=pairing.get("pairing_eligible"), sensor_complete=pairing.get("sensor_complete"),
                        raw_videos_complete=(layout["evidence"] or {}).get("complete"),
                        diagnostic_videos_complete=(teacher.get("diagnostic_video") or {}).get("complete"))
+            trajectory = teacher.get("trajectory") or {}
+            for key in ("backend", "progress_blocked_count", "limiter_mismatch_count", "planning_failed"):
+                row["trajectory_" + key] = trajectory.get(key)
+            for key in ("maximum_closed_rotation_error_rad", "maximum_taskpoint_tracking_error_m"):
+                row[key] = trajectory.get(key)
             for phase in PHASES:
                 score = (layout["phase_scores"] or {}).get(phase, {})
                 row[phase] = "completed" if score.get("completed") else "failed" if score.get("entered") else "not_entered"

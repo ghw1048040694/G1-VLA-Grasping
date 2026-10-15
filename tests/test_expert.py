@@ -12,7 +12,7 @@ from g1_vla.expert import (ExpertError, effective_compensation, hand_target,
                            _robot_self_contacts, collision_distance_residual,
                            arm_torso_collision_pairs, run_teacher_episode,
                            green_contact_penetration_evidence, bounded_planning_seed,
-                           interpolate)
+                           interpolate, cartesian_path_executed)
 
 
 PROFILE = {
@@ -40,6 +40,28 @@ def sample(start, duration=.1, *, contact=True, height=.12, assisted=False, safe
 class TeacherTests(unittest.TestCase):
     def gate(self, rows):
         return physical_gate(rows, lift_height_m=.1, hold_duration_s=.5)
+
+    def test_cartesian_closure_needs_executed_endpoint_and_actual_tracking(self):
+        end = {"end_reference_reached": True}
+        self.assertFalse(cartesian_path_executed({}, True, [0.], [0.]))
+        self.assertFalse(cartesian_path_executed(end, False, [0.], [0.]))
+        self.assertFalse(cartesian_path_executed(end, True, [.01], [.009]))
+        self.assertTrue(cartesian_path_executed(end, True, [.01], [.01]))
+
+    def test_cartesian_profile_requires_declared_planner_and_no_legacy_bias(self):
+        profile = copy.deepcopy(PROFILE)
+        profile.update(profile="green_right_cartesian_feedback_v4", contact_compensation_m=[0., 0., 0.])
+        config = {"train": {"enabled": False}, "wm": {"enabled": False},
+            "task": {"mode": "grasp_lift", "hand": "right", "object_ids": ["green_cube"]},
+            "scene": {"assisted_grasp": False}, "eval": {"assisted_grasp": False, "hold_duration_s": .5},
+            "expert": {"teacher": profile}}
+        with self.assertRaisesRegex(ExpertError, "trajectory configuration"):
+            validate_teacher(config)
+        config["expert"]["trajectory"] = {"backend": "actual_grasp_center_cartesian_v1"}
+        self.assertEqual(validate_teacher(config)["profile"], profile["profile"])
+        profile["contact_compensation_m"][0] = .001
+        with self.assertRaisesRegex(ExpertError, "zero legacy"):
+            validate_teacher(config)
 
     def test_future_phase_ik_is_lazy_and_video_exists_before_first_control(self):
         source = inspect.getsource(run_teacher_episode)
