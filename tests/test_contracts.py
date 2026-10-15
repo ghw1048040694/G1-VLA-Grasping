@@ -200,6 +200,21 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ConfigError):
                 validate_config(config)
 
+    def test_state_conditioning_cannot_add_training_test_or_tuned_interventions(self):
+        changes = {"optimizer_steps": 1, "modes": ["real", "train_mean"],
+                   "eval_splits": ["train", "validation", "test"],
+                   "variants": ["state_only_residual"], "eval_stride": 1, "eval_batch_size": 16,
+                   "within_episode_rule": "label_nearest", "cross_episode_rule": "best_validation_donor",
+                   "real_reproduction_atol": 1e-2, "tie_tolerance_rad": 1e-3,
+                   "max_eval_wall_s": 601, "max_gpu_reserved_bytes": 8 * 1024**3,
+                   "model_output_constant_method": "validation_fitted_constant",
+                   "reference_expanded_report_sha256": "0" * 64}
+        for key, value in changes.items():
+            config = config_fixture()
+            config["state_conditioning"][key] = value
+            with self.subTest(key=key), self.assertRaises(ConfigError):
+                validate_config(config)
+
     def test_velocity_zero_is_hold_and_bad_limits_are_rejected(self):
         config = config_fixture()
         config["control"]["max_velocity_rad_s"] = [0.] * 31

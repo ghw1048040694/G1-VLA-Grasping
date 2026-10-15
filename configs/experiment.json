@@ -479,5 +479,37 @@
     "output_dir": ".runtime/rebuild/diagnostics/phase9-constant-residual-v1",
     "reference_expanded_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-expanded-train-01/reports/expanded_residual_training.json",
     "reference_expanded_report_sha256": "211be9d5ae95e4efc2e81ab601dcc7b616efad613a3cea1ecc6fdb8b202bba15"
+  },
+  "state_conditioning": {
+    "backend": "grasp_square_frozen_state_conditioning_v1",
+    "variants": [
+      "state_only_residual",
+      "rgb_residual_scratch"
+    ],
+    "modes": [
+      "real",
+      "train_mean",
+      "within_episode_shift",
+      "cross_episode_swap"
+    ],
+    "eval_splits": [
+      "train",
+      "validation"
+    ],
+    "eval_stride": 30,
+    "eval_batch_size": 8,
+    "within_episode_rule": "half_length_cyclic_shift_v1",
+    "cross_episode_rule": "next_sorted_episode_same_relative_rank_v1",
+    "real_reproduction_atol": 1e-06,
+    "optimizer_steps": 0,
+    "model_output_constant_method": "train_eval_model_raw_residual_coordinate_median_fp32scale_fp64fit_v1",
+    "tie_tolerance_rad": 0.0,
+    "max_eval_wall_s": 600,
+    "max_gpu_reserved_bytes": 7516192768,
+    "reference_expanded_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-expanded-train-01/reports/expanded_residual_training.json",
+    "reference_expanded_report_sha256": "211be9d5ae95e4efc2e81ab601dcc7b616efad613a3cea1ecc6fdb8b202bba15",
+    "reference_constant_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261015-constant-residual-01/reports/constant_residual.json",
+    "reference_constant_report_sha256": "bd84ccabcb80bac73ea48c8e0f53cb1a9ab65e1417438c28be8dae26476f9aaf",
+    "output_dir": ".runtime/rebuild/diagnostics/phase10-state-conditioning-v1"
   }
 }

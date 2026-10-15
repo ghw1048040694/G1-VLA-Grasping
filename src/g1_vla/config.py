@@ -406,6 +406,20 @@ SCHEMA = {
         "fit_cohorts": _strings, "eval_stride": _positive_integer, "output_dir": _text,
         "reference_expanded_report_path": _text, "reference_expanded_report_sha256": _hash,
     },
+    "state_conditioning": {
+        "backend": _literal("grasp_square_frozen_state_conditioning_v1"),
+        "variants": _strings, "modes": _strings, "eval_splits": _strings,
+        "eval_stride": _positive_integer, "eval_batch_size": _positive_integer,
+        "within_episode_rule": _literal("half_length_cyclic_shift_v1"),
+        "cross_episode_rule": _literal("next_sorted_episode_same_relative_rank_v1"),
+        "real_reproduction_atol": _literal(1e-6), "optimizer_steps": _literal(0),
+        "model_output_constant_method": _literal("train_eval_model_raw_residual_coordinate_median_fp32scale_fp64fit_v1"),
+        "tie_tolerance_rad": _literal(0.0), "max_eval_wall_s": _positive,
+        "max_gpu_reserved_bytes": _positive_integer,
+        "reference_expanded_report_path": _text, "reference_expanded_report_sha256": _hash,
+        "reference_constant_report_path": _text, "reference_constant_report_sha256": _hash,
+        "output_dir": _text,
+    },
 }
 
 OBSERVATION_FIELDS = frozenset({
@@ -540,6 +554,21 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("reference_expanded_report_path", "reference_expanded_report_sha256"):
         if constant[key] != attribution[key]:
             _error("config.constant_residual." + key, "must bind the same frozen fourteen-train comparison")
+    conditioning = config["state_conditioning"]
+    if conditioning["variants"] != expanded["variants"]:
+        _error("config.state_conditioning.variants", "must retain both frozen fourteen-train residual models")
+    if conditioning["modes"] != ["real", "train_mean", "within_episode_shift", "cross_episode_swap"]:
+        _error("config.state_conditioning.modes", "must retain the four ordered predeclared network-state interventions")
+    if conditioning["eval_splits"] != ["train", "validation"]:
+        _error("config.state_conditioning.eval_splits", "only train fitting and frozen validation diagnostics are admitted")
+    for key in ("eval_stride", "eval_batch_size", "max_gpu_reserved_bytes"):
+        if conditioning[key] != expanded[key]:
+            _error("config.state_conditioning." + key, "must retain the frozen expanded evaluation protocol")
+    for key in ("reference_expanded_report_path", "reference_expanded_report_sha256"):
+        if conditioning[key] != attribution[key]:
+            _error("config.state_conditioning." + key, "must bind the frozen fourteen-train/new-statistics reference")
+    if conditioning["max_eval_wall_s"] > 600:
+        _error("config.state_conditioning.max_eval_wall_s", "the inference-only diagnostic wall bound is 600 seconds")
     return copy.deepcopy(config)
 
 
@@ -563,6 +592,7 @@ _PATH_FIELDS = {
     "expanded_residual": ("data_manifest_path", "reference_residual_report_path", "admission_report_path", "output_dir"),
     "normalization_attribution": ("data_manifest_path", "reference_residual_report_path", "reference_expanded_report_path", "reference_statistics_manifest_path", "admission_report_path", "output_dir"),
     "constant_residual": ("reference_expanded_report_path", "output_dir"),
+    "state_conditioning": ("reference_expanded_report_path", "reference_constant_report_path", "output_dir"),
 }
 
 
