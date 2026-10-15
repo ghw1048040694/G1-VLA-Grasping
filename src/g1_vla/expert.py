@@ -365,6 +365,39 @@ def _contact_evidence(model, data, object_body, api):
     return count, maximum, pairs
 
 
+def green_contact_penetration_evidence(model, data, object_body, api):
+    """Read hand/table overlap depths separately from unchanged success gates.
+
+    The inherited source mesh and contact capsules can both be active. Positive
+    depth is a numerical/model-fidelity diagnostic, never hidden by a PASS.
+    """
+    maximum = {kind: {"penetration_m": 0., "pair": None} for kind in ("hand", "table")}
+    for index in range(data.ncon):
+        contact = data.contact[index]
+        if contact.dist > 0:
+            continue
+        geoms = (int(contact.geom1), int(contact.geom2))
+        bodies = tuple(int(model.geom_bodyid[geom]) for geom in geoms)
+        if object_body not in bodies:
+            continue
+        other = 1 - bodies.index(object_body)
+        body_name = api.mj_id2name(model, api.mjtObj.mjOBJ_BODY, bodies[other]) or ""
+        geom_name = api.mj_id2name(model, api.mjtObj.mjOBJ_GEOM, geoms[other]) or ""
+        kind = ("hand" if body_name.startswith("right_hand_") or geom_name == "right_palm_contact_pad"
+                else "table" if geom_name == "calibration_table" else None)
+        depth = max(0., -float(contact.dist))
+        if kind is None or depth <= maximum[kind]["penetration_m"]:
+            continue
+        maximum[kind] = {
+            "penetration_m": depth,
+            "pair": {"geom_ids": list(geoms),
+                     "geom_names": [api.mj_id2name(model, api.mjtObj.mjOBJ_GEOM, geom)
+                                    or "geom#{}".format(geom) for geom in geoms],
+                     "body_names": [api.mj_id2name(model, api.mjtObj.mjOBJ_BODY, body)
+                                    or "body#{}".format(body) for body in bodies]}}
+    return maximum
+
+
 def state_is_finite(data):
     """Include forces/time, even when a controller aborts before its callback."""
     fields = ("qpos", "qvel", "qacc", "ctrl", "actuator_force", "qfrc_bias")
@@ -418,6 +451,8 @@ def run_teacher_episode(config, spec, run_dir):
               "changes_from_legacy": ["robot-only damping", "explicit actuator force limits", "command cadence and anchor/velocity limiter", "waist and left arm held", "close only after measured contact-pose approach", "IK position limit cannot exceed physical tracking gate"],
               "passed": False, "failure": None, "record_rgb": profile["record_rgb"],
               "joint_limit_tolerance_rad": config["eval"]["joint_limit_tolerance_rad"],
+              "future_phase_poses_precomputed": False,
+              "latest_phase_planning_attempt": None,
               "raw_episode": str(raw_path), "report": str(report_path)}
     observations, commands, timing, evidence, requested_rows, after_rows, qacc_rows, target_rows, tracking_rows = [], [], [], [], [], [], [], [], []
     substeps, renderer, controller, model, data = [], None, None, None, None
@@ -425,7 +460,10 @@ def run_teacher_episode(config, spec, run_dir):
     phase_records, saturation_counts, maximum_actuator_force, physics_warning_counts = [], {}, {}, []
     replan_ledger = []
     self_collision_counts, self_collision_penetrations, phase_self_collision_counts = {}, {}, {}
+    maximum_green_penetration = {kind: {"penetration_m": 0., "pair": None,
+                                      "timestamp_s": None, "phase": None} for kind in ("hand", "table")}
     closure_start_event = None
+    current_phase, planned_next_phase = None, None
     maximum_joint_overrun, pending = {}, {}
     try:
         source = Path(config["scene"]["asset_path"])
@@ -448,6 +486,7 @@ def run_teacher_episode(config, spec, run_dir):
                                        max_error_m=profile["ik_max_error_m"], mujoco_api=api)
         report["ik"] = {"home": home_report}
         if not home_report["solver_success"]:
+            report["failed_ik_label"] = "home"
             raise ExpertError("canonical home IK failed")
         # This is the single declared initialization before all recorded control.
         data.qpos[canonical_ids] = home
@@ -501,9 +540,29 @@ def run_teacher_episode(config, spec, run_dir):
                               height=height, lateral=lateral, compensate=compensate))
 
         def refresh_phase_pose(phase, key, target, *, target_relation="current_object_center"):
+            nonlocal planned_next_phase
+            planned_next_phase = phase
             visited_seed = data.qpos[ids].copy()
             label = "{}_live".format(phase)
-            values = pose(label, target, visited_seed)
+            attempt = {
+                "phase": phase, "previous_phase": current_phase,
+                "timestamp_s": float(data.time), "status": "solving",
+                "current_object_position_m": data.xpos[object_body].copy().tolist(),
+                "visited_right_arm_qpos_rad": visited_seed.tolist(),
+                "target_palm_position_m": np.asarray(target).tolist(),
+                "target_relation": target_relation, "live_state_modified": False}
+            report["latest_phase_planning_attempt"] = attempt
+            try:
+                values = pose(label, target, visited_seed)
+            except (ValueError, RuntimeError, OSError, TypeError) as exc:
+                attempt.update({"status": "rejected", "ik": reports.get(label),
+                                "error": "{}: {}".format(type(exc).__name__, exc)})
+                report["failure_phase"] = phase
+                report["failure_kind"] = "phase_entry_ik_rejection"
+                report["failed_ik_label"] = label
+                raise
+            attempt.update({"status": "accepted", "ik": dict(reports[label]),
+                            "solution_right_arm_qpos_rad": values.tolist()})
             poses[key] = values
             cartesian_targets[key] = np.asarray(target).copy()
             replan_ledger.append({
@@ -516,10 +575,6 @@ def run_teacher_episode(config, spec, run_dir):
                 "ik": dict(reports[label]),
                 "live_state_modified": False})
 
-        poses["high"] = pose("high", target_from_object(profile["high_pregrasp_height_m"]), poses["home"])
-        poses["pregrasp"] = pose("pregrasp", target_from_object(profile["pregrasp_height_m"], -profile["pregrasp_lateral_m"]), poses["high"])
-        poses["grasp"] = pose("grasp", target_from_object(compensate=True), poses["pregrasp"])
-        poses["lift"] = pose("lift", target_from_object(profile["lift_height_m"], compensate=True), poses["grasp"])
         report["ik"] = reports
         report["initial_joint_position_rad"] = baseline.tolist()
         report["initial_geometry"] = _geometry_evidence(model, data, object_body, palms[1], api)
@@ -562,6 +617,10 @@ def run_teacher_episode(config, spec, run_dir):
                                  "pairs": [], "saturated_actuators": []})
                 raise ControlError("teacher physics became non-finite")
             count, force, pairs = _contact_evidence(model, data, object_body, api)
+            green_penetration = green_contact_penetration_evidence(model, data, object_body, api)
+            for kind, detail in green_penetration.items():
+                if detail["penetration_m"] > maximum_green_penetration[kind]["penetration_m"]:
+                    maximum_green_penetration[kind] = dict(detail, timestamp_s=float(data.time), phase=current_phase)
             self_contacts = _robot_self_contacts(model, data, object_body, api)
             for pair, penetration in self_contacts.items():
                 self_collision_counts[pair] = self_collision_counts.get(pair, 0) + 1
@@ -588,6 +647,7 @@ def run_teacher_episode(config, spec, run_dir):
                              "lift_height_m": lift, "joint_safe": safe, "finite": finite,
                              "max_abs_qacc": float(np.max(np.abs(data.qacc))) if finite else None,
                              "pairs": pairs, "saturated_actuators": saturated,
+                             "green_contact_penetration": green_penetration,
                              "robot_self_contact_pairs": sorted(self_contacts)})
             if not finite:
                 raise ControlError("teacher physics became non-finite")
@@ -722,6 +782,7 @@ def run_teacher_episode(config, spec, run_dir):
                                        target_relation="preserve_completed_lift_reference")
                 phase_seed = data.qpos[ids].copy()
                 current_phase, phase_start = next_phase, float(data.time)
+                planned_next_phase = None
             elif elapsed >= duration[current_phase] * profile["phase_timeout_scale"]:
                 phase_records.append({"phase": current_phase, "start_s": phase_start,
                                       "end_s": float(data.time), "tracking": dict(latest_tracking),
@@ -785,12 +846,19 @@ def run_teacher_episode(config, spec, run_dir):
         np.savez_compressed(interrupted_path, **diagnostic)
         report["interrupted_control_artifact"] = str(interrupted_path)
     report["phase_replan_ledger"] = replan_ledger
+    report["active_execution_phase"] = current_phase
+    report["planned_next_phase"] = planned_next_phase
+    report.setdefault("failed_ik_label", None)
     report["closure_start_event"] = closure_start_event
     report["closure_planning"] = "open through completed contact approach and measured palm/arm tracking gates; full declared close interval required before contact phase passes"
     report["robot_self_collision_substeps_by_pair"] = self_collision_counts
     report["maximum_self_collision_penetration_m_by_pair"] = self_collision_penetrations
     report["phase_robot_self_collision_substeps_by_pair"] = phase_self_collision_counts
-    report["phase_planning"] = "refresh each phase from actual object state and visited right-arm seed; hold preserves completed lift reference"
+    report["maximum_green_contact_penetration_evidence"] = maximum_green_penetration
+    report["maximum_green_hand_contact_penetration_m"] = maximum_green_penetration["hand"]["penetration_m"]
+    report["maximum_green_table_contact_penetration_m"] = maximum_green_penetration["table"]["penetration_m"]
+    report["contact_penetration_diagnostic_scope"] = "actual every-substep green/right-hand and green/calibration-table contacts; inherited mesh/capsule overlap retained; depth does not modify the original acceptance gate"
+    report["phase_planning"] = "home initialization only before control/video; future poses solved once their phase is entered from actual object state and visited right-arm seed; rejected entry records latest_phase_planning_attempt; hold preserves completed lift reference"
     report["phases"] = phase_records
     report["actuation_saturation_substeps_by_joint"] = saturation_counts
     report["maximum_actual_actuator_force_by_joint"] = maximum_actuator_force

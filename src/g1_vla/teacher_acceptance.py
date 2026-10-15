@@ -6,6 +6,7 @@ Smoke is separate evidence and never contributes a success to the formal suite.
 """
 
 import copy
+import csv
 import json
 import math
 import xml.etree.ElementTree as ET
@@ -90,8 +91,36 @@ def _summary(report):
             "joint_limit_violation_substeps", "all_numeric_finite", "maximum_limiter_adjustment_rad",
             "command_limit_audit", "actual_tracking", "phases", "report", "raw_episode",
             "sustained_lift_hold_s", "physical_grasp_passed", "closure_start_event",
-            "robot_self_collision_substeps_by_pair", "diagnostic_video")
+            "robot_self_collision_substeps_by_pair", "diagnostic_video",
+            "active_execution_phase", "planned_next_phase", "failed_ik_label",
+            "maximum_green_hand_contact_penetration_m", "maximum_green_table_contact_penetration_m")
     return {key: report.get(key) for key in keys}
+
+
+def _write_scores(path, layouts):
+    """One row per declared layout, including every exception and failed phase."""
+    fields = ["layout_id", "passed", "failure", "exception"] + list(PHASES) + [
+        "maximum_lift_m", "sustained_lift_hold_s", "physical_contact_substeps",
+        "maximum_green_hand_contact_penetration_m", "maximum_green_table_contact_penetration_m",
+        "joint_limit_violation_substeps", "command_limits_passed", "numeric_finite",
+        "pairing_eligible", "sensor_complete", "raw_videos_complete", "diagnostic_videos_complete"]
+    with Path(path).open("x", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for layout in layouts:
+            teacher, pairing = layout["teacher"] or {}, layout["pairing"] or {}
+            row = {key: teacher.get(key) for key in fields if key in teacher}
+            row.update(layout_id=layout["layout_id"], passed=layout["passed"],
+                       failure=teacher.get("failure"), exception=json.dumps(layout["exception"], ensure_ascii=False),
+                       command_limits_passed=(teacher.get("command_limit_audit") or {}).get("passed"),
+                       numeric_finite=teacher.get("all_numeric_finite"),
+                       pairing_eligible=pairing.get("pairing_eligible"), sensor_complete=pairing.get("sensor_complete"),
+                       raw_videos_complete=(layout["evidence"] or {}).get("complete"),
+                       diagnostic_videos_complete=(teacher.get("diagnostic_video") or {}).get("complete"))
+            for phase in PHASES:
+                score = (layout["phase_scores"] or {}).get(phase, {})
+                row[phase] = "completed" if score.get("completed") else "failed" if score.get("entered") else "not_entered"
+            writer.writerow(row)
 
 
 def _scene_audit(teacher_report, spec, episode_dir, config):
@@ -306,6 +335,8 @@ def run_teacher_acceptance(config, run_dir, *, smoke=False):
         "chunk_consistency_scope": "diagnostic of unmodified 8-step future labels; independent of the physical lift/hold gate",
         "training_started": False, "training_eligible": False, "split": "diagnostic",
         "evidence_complete": all((row["evidence"] or {}).get("complete") is True for row in results),
+        "scores_csv": str(destination / "teacher_scores.csv"),
     }
+    _write_scores(destination / "teacher_scores.csv", results)
     write_new_json(output_path, report)
     return report

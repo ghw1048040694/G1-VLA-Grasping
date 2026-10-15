@@ -20,6 +20,9 @@ class TeacherEvidenceTests(unittest.TestCase):
         self.assertFalse(scores["contact"]["completed"])
         self.assertFalse(scores["hold"]["entered"])
         self.assertFalse(scores["hold"]["completed"])
+        interrupted = phase_scores({"active_execution_phase": "contact", "phases": []})
+        self.assertTrue(interrupted["contact"]["entered"])
+        self.assertFalse(interrupted["contact"]["completed"])
 
     def fixture(self, directory, *, gap=False, missing_camera=False):
         root = Path(directory)

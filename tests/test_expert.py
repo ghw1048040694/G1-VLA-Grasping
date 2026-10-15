@@ -1,5 +1,7 @@
 """Physical-success accounting rejects launch, contact loss and unsafe holds."""
 import copy
+import ast
+import inspect
 import unittest
 from types import SimpleNamespace
 
@@ -8,7 +10,8 @@ from g1_vla.expert import (ExpertError, effective_compensation, hand_target,
                            joint_limit_excesses, state_is_finite, green_target_from_position,
                            pose_tracking_reached, contact_closure_ready, closure_complete,
                            _robot_self_contacts, collision_distance_residual,
-                           arm_torso_collision_pairs)
+                           arm_torso_collision_pairs, run_teacher_episode,
+                           green_contact_penetration_evidence)
 
 
 PROFILE = {
@@ -35,6 +38,33 @@ def sample(start, duration=.1, *, contact=True, height=.12, assisted=False, safe
 class TeacherTests(unittest.TestCase):
     def gate(self, rows):
         return physical_gate(rows, lift_height_m=.1, hold_duration_s=.5)
+
+    def test_future_phase_ik_is_lazy_and_video_exists_before_first_control(self):
+        source = inspect.getsource(run_teacher_episode)
+        function = ast.parse(source).body[0]
+        parent = {}
+        for node in ast.walk(function):
+            for child in ast.iter_child_nodes(node):
+                parent[child] = node
+        future_calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name) and node.func.id == "pose"]
+        self.assertEqual(len(future_calls), 1)
+        owner = parent[future_calls[0]]
+        while not isinstance(owner, ast.FunctionDef):
+            owner = parent[owner]
+        self.assertEqual(owner.name, "refresh_phase_pose")
+        control_loop = next(node for node in ast.walk(function) if isinstance(node, ast.While))
+        video_constructor = next(node for node in ast.walk(function) if isinstance(node, ast.Call)
+                                 and isinstance(node.func, ast.Name)
+                                 and node.func.id == "TeacherDiagnosticVideo")
+        self.assertLess(video_constructor.lineno, control_loop.lineno)
+        first_control = next(node for node in ast.walk(control_loop) if isinstance(node, ast.Call)
+                             and isinstance(node.func, ast.Attribute)
+                             and node.func.attr == "execute_target")
+        entries = [node for node in ast.walk(function) if isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Name) and node.func.id == "refresh_phase_pose"]
+        self.assertTrue(entries)
+        self.assertTrue(all(node.lineno > first_control.lineno for node in entries))
 
     def test_launch_without_contact_cannot_pass(self):
         rows = [sample(i * .1, contact=False, height=.4) for i in range(12)]
@@ -101,6 +131,25 @@ class TeacherTests(unittest.TestCase):
         data = SimpleNamespace(ncon=len(contacts), contact=contacts)
         self.assertEqual(_robot_self_contacts(model, data, 3, api),
                          {"right_shoulder_yaw_link :: torso_link": .004})
+
+    def test_green_overlap_diagnostic_keeps_mesh_and_capsule_and_table_separate(self):
+        body_names = {0: "world", 1: "green_cube", 2: "right_hand_index_1_link", 3: "torso_link"}
+        geom_names = {0: "green_cube_geom", 1: "source_finger_mesh", 2: "finger_capsule",
+                      3: "calibration_table", 4: "torso_geom"}
+        api = SimpleNamespace(mjtObj=SimpleNamespace(mjOBJ_BODY=1, mjOBJ_GEOM=2),
+                              mj_id2name=lambda _model, kind, item:
+                              (body_names if kind == 1 else geom_names).get(item))
+        model = SimpleNamespace(geom_bodyid=[1, 2, 2, 0, 3])
+        contacts = [SimpleNamespace(geom1=0, geom2=1, dist=-.035),
+                    SimpleNamespace(geom1=2, geom2=0, dist=-.014),
+                    SimpleNamespace(geom1=0, geom2=3, dist=-.0097),
+                    SimpleNamespace(geom1=4, geom2=0, dist=-.04)]
+        result = green_contact_penetration_evidence(model,
+                    SimpleNamespace(ncon=len(contacts), contact=contacts), 1, api)
+        self.assertAlmostEqual(result["hand"]["penetration_m"], .035)
+        self.assertEqual(result["hand"]["pair"]["geom_names"], ["green_cube_geom", "source_finger_mesh"])
+        self.assertAlmostEqual(result["table"]["penetration_m"], .0097)
+        self.assertEqual(result["table"]["pair"]["geom_ids"], [0, 3])
 
     def test_collision_distance_residual_keeps_length_and_repels_approaching_geometry(self):
         residual = collision_distance_residual([.05, .002, .001, -.003], .002, 5.)

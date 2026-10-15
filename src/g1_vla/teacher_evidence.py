@@ -25,8 +25,9 @@ def phase_scores(report):
     result = {}
     for phase in PHASES:
         row = records.get(phase)
+        active = report.get("active_execution_phase") == phase
         result[phase] = {
-            "entered": row is not None,
+            "entered": row is not None or active,
             "completed": bool(row and row.get("completed") is True),
             "start_s": row.get("start_s") if row else None,
             "end_s": row.get("end_s") if row else None,
@@ -49,12 +50,15 @@ def _write_video(path, frames, fps):
     rate = str(Fraction(fps).limit_denominator(1000000))
     with imageio.get_writer(str(temporary), fps=fps, codec="libx264", quality=8,
                             pixelformat="yuv444p", macro_block_size=1,
-                            input_params=["-r", rate]) as writer:
+                            input_params=["-r", rate], ffmpeg_log_level="error") as writer:
         for frame in frames:
             writer.append_data(frame)
     decoder = imageio_ffmpeg.read_frames(str(temporary), pix_fmt="rgb24")
-    metadata = next(decoder)
-    decoded_count = sum(1 for _ in decoder)
+    try:
+        metadata = next(decoder)
+        decoded_count = sum(1 for _ in decoder)
+    finally:
+        decoder.close()
     height, width = frames.shape[1:3]
     if decoded_count != len(frames) or list(metadata["size"]) != [width, height]:
         raise ValueError("encoded teacher video frame count/dimensions differ from the raw sensor")
