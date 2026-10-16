@@ -127,6 +127,36 @@ class TeacherManifestTests(unittest.TestCase):
 
 
 class TeacherAcceptanceTests(unittest.TestCase):
+    def test_focus_uses_original_ids_and_never_claims_formal_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = configuration(root)
+            config["eval"]["diagnostic_layout_ids"] = ["layout_15", "layout_19"]
+            def teacher(configuration, spec, episode_dir):
+                return fake_teacher(configuration, spec, episode_dir,
+                                    report_passed=spec["layout_id"] != "layout_19")
+            with patch("g1_vla.teacher_acceptance.run_teacher_episode", side_effect=teacher):
+                report = run_teacher_acceptance(config, root / "runs/focus", focus=True)
+            self.assertEqual([row["layout_id"] for row in report["layouts"]], ["layout_15", "layout_19"])
+            self.assertEqual(report["summary"]["denominator"], 2)
+            self.assertEqual(report["summary"]["required_successes"], 2)
+            self.assertEqual(report["summary"]["formal_required_successes"], 18)
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["formal_gate_evaluated"])
+            self.assertIsNone(report["formal_acceptance_passed"])
+            self.assertFalse(report["training_started"])
+
+    def test_focus_rejects_unknown_or_duplicate_ids(self):
+        for ids in (["unknown"], ["layout_15", "layout_15"]):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = configuration(root)
+                config["eval"]["diagnostic_layout_ids"] = ids
+                with patch("g1_vla.teacher_acceptance.run_teacher_episode") as teacher:
+                    with self.assertRaises(ValueError):
+                        run_teacher_acceptance(config, root / "runs/focus", focus=True)
+                    teacher.assert_not_called()
+
     def setUp(self):
         # Suite accounting tests use synthetic pixels and no video encoder.
         patcher = patch("g1_vla.teacher_acceptance.export_teacher_evidence",

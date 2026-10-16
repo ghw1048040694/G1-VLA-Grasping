@@ -181,9 +181,9 @@ def _scene_audit(teacher_report, spec, episode_dir, config):
             "object_names": ["green_cube"], "assisted_grasp": False, "fixed_base_equality": FIXED_BASE_EQUALITY}
 
 
-def run_teacher_acceptance(config, run_dir, *, smoke=False):
+def run_teacher_acceptance(config, run_dir, *, smoke=False, focus=False):
     """Run predeclared layouts and keep every failure in the suite denominator."""
-    if type(smoke) is not bool:
+    if type(smoke) is not bool or type(focus) is not bool or (smoke and focus):
         raise TeacherAcceptanceError("smoke must be an explicit boolean")
     if config["train"]["enabled"] or config["wm"]["enabled"]:
         raise TeacherAcceptanceError("teacher acceptance requires disabled training and world model")
@@ -221,6 +221,12 @@ def run_teacher_acceptance(config, run_dir, *, smoke=False):
         "action_contract_sha256": contract.contract_sha256, "training_started": False,
     })
     selected = [manifest["smoke"]] if smoke else manifest["layouts"]
+    if focus:
+        ids = config["eval"]["diagnostic_layout_ids"]
+        known = {row["layout_id"] for row in manifest["layouts"]}
+        if not ids or len(set(ids)) != len(ids) or not set(ids).issubset(known):
+            raise TeacherAcceptanceError("focus IDs must be unique members of the original frozen layouts")
+        selected = [row for row in manifest["layouts"] if row["layout_id"] in ids]
     results, records = [], []
     for spec in selected:
         episode_dir = destination / "teacher" / spec["layout_id"]
@@ -311,7 +317,7 @@ def run_teacher_acceptance(config, run_dir, *, smoke=False):
         result["failure_reasons"] = sorted(set(result["failure_reasons"]))
         result["passed"] = not bool(result["failure_reasons"])
     successes = sum(result["passed"] for result in results)
-    threshold = 1 if smoke else required
+    threshold = len(selected) if focus else 1 if smoke else required
     passed = successes >= threshold
     summary = {
         "layout_count": len(selected), "evaluated_layout_count": len(results), "denominator": len(selected),
@@ -340,8 +346,9 @@ def run_teacher_acceptance(config, run_dir, *, smoke=False):
     }
     report = {
         "schema_version": 1, "protocol": "green_right_teacher_acceptance_suite_v1", "status": "passed" if passed else "failed",
-        "passed": passed, "smoke": smoke, "scope": manifest["scope"],
-        "formal_gate_evaluated": not smoke, "formal_acceptance_passed": None if smoke else passed,
+        "passed": passed, "smoke": smoke, "focus": focus, "scope": manifest["scope"],
+        "focus_layout_ids": [row["layout_id"] for row in selected] if focus else [],
+        "formal_gate_evaluated": not (smoke or focus), "formal_acceptance_passed": None if smoke or focus else passed,
         "smoke_counts_toward_formal_acceptance": False, "summary": summary, "limiter": limiter, "layouts": results,
         "raw_paths": [record["raw_path"] for record in records],
         "manifest": str(manifest_path), "manifest_provenance": str(provenance_path),

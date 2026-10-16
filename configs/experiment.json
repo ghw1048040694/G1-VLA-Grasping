@@ -113,7 +113,11 @@
         0.0,
         0.0
       ],
-      "grasp_center_in_palm_m": [0.0, 0.05, 0.0],
+      "grasp_center_in_palm_m": [
+        0.0,
+        0.05,
+        0.0
+      ],
       "pregrasp_height_m": 0.12,
       "pregrasp_lateral_m": 0.015,
       "high_pregrasp_height_m": 0.28,
@@ -151,6 +155,9 @@
       "joint_continuity_weight": 0.003,
       "closed_orientation_weight": 1.0,
       "closed_orientation_tolerance_rad": 0.05
+    },
+    "contact_diagnostics": {
+      "enabled": true
     }
   },
   "data": {
@@ -196,7 +203,11 @@
       "policy_contact_rate": 0.9,
       "policy_lift_rate": 0.8
     },
-    "joint_limit_tolerance_rad": 0.003
+    "joint_limit_tolerance_rad": 0.003,
+    "diagnostic_layout_ids": [
+      "green-right-15",
+      "green-right-19"
+    ]
   },
   "artifacts": {
     "runs_dir": ".runtime/rebuild",
@@ -275,11 +286,39 @@
   },
   "source_native": {
     "backend": "grasp_square_native_v1",
-    "episode_ids": [20, 21, 75, 76, 125, 126, 180, 181, 182, 280, 281, 282],
+    "episode_ids": [
+      20,
+      21,
+      75,
+      76,
+      125,
+      126,
+      180,
+      181,
+      182,
+      280,
+      281,
+      282
+    ],
     "split_episode_ids": {
-      "train": [20, 21, 75, 76, 125, 126],
-      "validation": [180, 181, 182],
-      "test": [280, 281, 282]
+      "train": [
+        20,
+        21,
+        75,
+        76,
+        125,
+        126
+      ],
+      "validation": [
+        180,
+        181,
+        182
+      ],
+      "test": [
+        280,
+        281,
+        282
+      ]
     },
     "split_unit": "source_video_file_group",
     "camera_key": "observation.images.cam_left_high",
@@ -322,7 +361,15 @@
   },
   "native_diagnostics": {
     "training_report_path": ".runtime/rebuild/runs/G1-REBUILD-20261014-grasp-train-01/reports/grasp_act_training.json",
-    "lag_frames": [-3, -2, -1, 0, 1, 2, 3],
+    "lag_frames": [
+      -3,
+      -2,
+      -1,
+      0,
+      1,
+      2,
+      3
+    ],
     "stationary_speed_rad_s": 0.02,
     "moving_speed_rad_s": 0.1,
     "loss_window_steps": 20,
@@ -334,7 +381,12 @@
     "reference_config_path": ".runtime/rebuild/runs/G1-REBUILD-20261014-grasp-train-01/checkpoint_best/experiment_config.json",
     "eval_stride": 30,
     "eval_batch_size": 8,
-    "visual_modes": ["real", "mean_image", "within_episode_shift", "cross_episode_swap"],
+    "visual_modes": [
+      "real",
+      "mean_image",
+      "within_episode_shift",
+      "cross_episode_swap"
+    ],
     "image_shift_fraction": 0.5,
     "seed": 20261014,
     "max_steps": 2000,
@@ -342,7 +394,12 @@
     "max_train_wall_s": 1800,
     "max_gpu_reserved_bytes": 7516192768,
     "output_dir": ".runtime/rebuild/diagnostics/phase5-extension-v1",
-    "variants": ["rgb", "rgb_mean", "state_only", "rgb_no_vae"]
+    "variants": [
+      "rgb",
+      "rgb_mean",
+      "state_only",
+      "rgb_no_vae"
+    ]
   },
   "visual_pretraining": {
     "backend": "grasp_square_visual_pretraining_v1",

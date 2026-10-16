@@ -229,6 +229,7 @@ SCHEMA = {
             "record_rgb": _literal(True), "palm_position_tolerance_m": _positive,
             "joint_target_tolerance_rad": _positive, "phase_timeout_scale": _positive,
         },
+        "contact_diagnostics": {"enabled": _boolean},
         "trajectory": {
             "backend": _literal("actual_grasp_center_cartesian_v1"),
             "waypoint_spacing_m": _positive, "interpolation_samples": _positive_integer,
@@ -263,7 +264,7 @@ SCHEMA = {
     },
     "eval": {
         "checkpoint": _optional(_text), "layouts_path": _optional(_text),
-        "num_layouts": _positive_integer,
+        "num_layouts": _positive_integer, "diagnostic_layout_ids": _strings,
         "lift_height_m": _positive, "hold_duration_s": _positive,
         "joint_limit_tolerance_rad": _positive,
         "assisted_grasp": _literal(False),

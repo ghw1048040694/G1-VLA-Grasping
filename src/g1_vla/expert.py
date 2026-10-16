@@ -513,6 +513,7 @@ def run_teacher_episode(config, spec, run_dir):
     maximum_green_penetration = {kind: {"penetration_m": 0., "pair": None,
                                       "timestamp_s": None, "phase": None} for kind in ("hand", "table")}
     closure_start_event = None
+    hand_contact_rows = []
     current_phase, planned_next_phase = None, None
     maximum_joint_overrun, pending = {}, {}
     planner, active_plan, path_progress, path_status, grip_lock = None, None, None, {}, None
@@ -758,6 +759,9 @@ def run_teacher_episode(config, spec, run_dir):
                 raise ControlError("teacher physics became non-finite")
             count, force, pairs = _contact_evidence(model, data, object_body, api)
             green_penetration = green_contact_penetration_evidence(model, data, object_body, api)
+            if config["expert"].get("contact_diagnostics", {}).get("enabled", False):
+                from .hand_contact import native_hand_contacts
+                hand_contact_rows.append(dict(native_hand_contacts(model, data, object_body, api), phase=current_phase))
             for kind, detail in green_penetration.items():
                 if detail["penetration_m"] > maximum_green_penetration[kind]["penetration_m"]:
                     maximum_green_penetration[kind] = dict(detail, timestamp_s=float(data.time), phase=current_phase)
@@ -879,6 +883,8 @@ def run_teacher_episode(config, spec, run_dir):
                         "raw_actual_arm_qpos_rad": actual_pose["arm"].tolist(),
                         "actual_C": actual_pose["C"].tolist(), "actual_R": actual_pose["R"].tolist(),
                         "full_state": planner.state_snapshot(data),
+                        "post_control_state": {"held_ctrl": data.ctrl.copy().tolist(),
+                                               "qacc_warmstart": data.qacc_warmstart.copy().tolist()},
                         "requested_arm_rad": np.asarray(pending["requested"])[arm_indices].tolist(),
                         "applied_arm_rad": np.asarray(pending["command"])[arm_indices].tolist(),
                         "fixed_endpoint_palm_m": active_plan["endpoint_palm"], "tracking": dict(latest_tracking)})
@@ -1074,6 +1080,10 @@ def run_teacher_episode(config, spec, run_dir):
     report["maximum_green_contact_penetration_evidence"] = maximum_green_penetration
     report["maximum_green_hand_contact_penetration_m"] = maximum_green_penetration["hand"]["penetration_m"]
     report["maximum_green_table_contact_penetration_m"] = maximum_green_penetration["table"]["penetration_m"]
+    report["hand_contact_diagnostics"] = {
+        "enabled": config["expert"].get("contact_diagnostics", {}).get("enabled", False),
+        "original_success_gate_unchanged": True, "physics_substeps": hand_contact_rows,
+        "force_scope": "after baseline mj_step->mj_forward, same post-state as original gates; under held ctrl, not integrated solver force"}
     report["contact_penetration_diagnostic_scope"] = "actual every-substep green/right-hand and green/calibration-table contacts; inherited mesh/capsule overlap retained; depth does not modify the original acceptance gate"
     report["phase_planning"] = "home initialization only before control/video; future poses solved once their phase is entered from actual object state and visited right-arm seed; rejected entry records latest_phase_planning_attempt; hold preserves completed lift reference"
     report["phases"] = phase_records

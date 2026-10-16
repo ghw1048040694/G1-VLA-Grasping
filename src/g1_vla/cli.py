@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "constant-residual", "normalization-check", "normalization-train", "state-conditioning", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "teacher-smoke", "teacher", "teacher-focus", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "constant-residual", "normalization-check", "normalization-train", "state-conditioning", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -203,9 +203,9 @@ def execute_stage(stage, config, run):
                       raw_pairing_path=str(run.path / "reports" / "raw_pairing.json"),
                       errors=pairing["errors"], split_leakage=pairing["split_leakage"])
         return report, not pairing["errors"] and not pairing["split_leakage"]
-    if stage in ("teacher-smoke", "teacher"):
+    if stage in ("teacher-smoke", "teacher", "teacher-focus"):
         from .teacher_acceptance import run_teacher_acceptance
-        acceptance = run_teacher_acceptance(config, run.path, smoke=stage == "teacher-smoke")
+        acceptance = run_teacher_acceptance(config, run.path, smoke=stage == "teacher-smoke", focus=stage == "teacher-focus")
         report.update(stage=stage, teacher_acceptance=acceptance)
         return report, bool(acceptance["passed"])
     if stage == "inventory":
