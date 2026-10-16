@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 RL_PROTOCOL = "g1_official_dex3_fixed_root_pregrasp_privileged_v2"
-RL_PHYSICS = "physx_unitree_official_usd_fixed_root_tgs_v2"
+RL_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v3"
 RIGHT_ACTION_JOINTS = [
     "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
     "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
@@ -25,8 +25,8 @@ RL_TEACHER_DEFAULTS = {
     "asset_manifest_path": ".runtime/rebuild/rl_assets/official_v1/asset_manifest.json",
     "asset_manifest_sha256": None, "seed_state_sha256": None,
     "checkpoint_path": None, "checkpoint_sha256": None,
-    "action_joint_names": RIGHT_ACTION_JOINTS, "device": "cuda:0", "num_envs": 512,
-    "smoke_env_counts": [1, 8, 32, 128, 256, 512], "smoke_steps": 128, "seed": 2026101601,
+    "action_joint_names": RIGHT_ACTION_JOINTS, "device": "cuda:0", "num_envs": 256,
+    "smoke_env_counts": [1, 8, 32, 128, 256], "smoke_steps": 128, "seed": 2026101601,
     "evaluation_seed": 2026101602, "smoke_seed": 2026101603, "episode_length_s": 6.0,
     "steps_per_env": 32, "max_iterations": 400, "max_wall_time_s": 3600,
     "eval_interval": 50, "eval_episodes": 32, "eval_num_envs": 8, "save_interval": 50,

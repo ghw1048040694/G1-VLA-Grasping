@@ -522,6 +522,28 @@ def verify_contact_collection_crosscheck(final_audit: dict) -> dict:
     return check
 
 
+def verify_contact_measurements(audit: dict, *, require_table_witness: bool = False) -> dict | None:
+    """Require explicit measurement availability and, for admission, table load."""
+    if (audit.get("qualification_supported") is not True or
+            "contact_data_unavailable_reason" not in audit or audit["contact_data_unavailable_reason"] is not None):
+        raise NumericalFailure("Contact qualification measurements are unavailable: " + str({
+            "qualification_supported": audit.get("qualification_supported"),
+            "contact_data_unavailable_reason": audit.get("contact_data_unavailable_reason", "missing")}))
+    if not require_table_witness:
+        return None
+    channel = audit.get("table_contact_channel")
+    if not isinstance(channel, dict):
+        raise NumericalFailure("Table contact channel audit is missing")
+    force = channel.get("max_force_n")
+    samples = channel.get("positive_force_physics_samples")
+    if (any(channel.get(key) is not True for key in ("supported", "table_kinematic", "disable_gravity")) or
+            "unavailable_reason" not in channel or channel["unavailable_reason"] is not None or
+            type(samples) is not int or samples <= 0 or
+            type(force) not in (int, float) or not math.isfinite(force) or force <= 0):
+        raise NumericalFailure("Table contact channel lacks supported kinematic positive-force evidence: " + str(channel))
+    return channel
+
+
 def _record_profile_memory(profile: dict, phase: str, torch: Any, device: str,
                            stream: EvidenceStream, *, require_headroom: bool = False) -> dict:
     snapshot = _gpu_memory(torch, device)
@@ -584,6 +606,7 @@ def _record_step(environment: Any, extras: dict, streams: dict,
     environment._g1_last_step_audit = audit
     streams["steps"].write({"phase": phase, "control_step": step, "update": update,
                            "environment": audit, "verified_cadence": timing})
+    verify_contact_measurements(audit)
     outcomes = environment.unwrapped.pop_episode_outcomes()
     for row in outcomes:
         streams["episodes"].write({"phase": phase, "update": update, **row})
@@ -909,6 +932,7 @@ def _smoke(environment: Any, settings: dict, streams: dict, deadline: Deadline,
     final = _json_safe(environment.unwrapped.step_audit())
     if memory_profile is not None:
         memory_profile["final_step_audit"] = final
+    table_channel = verify_contact_measurements(final, require_table_witness=True)
     crosscheck = verify_contact_collection_crosscheck(final) if profile == 1 else None
     reset_envs = sorted({row["env_id"] for row in outcomes})
     if reset_envs != list(range(profile)) or final["reset_count"] <= initial["reset_count"]:
@@ -918,6 +942,7 @@ def _smoke(environment: Any, settings: dict, streams: dict, deadline: Deadline,
             "optimizer_steps": 0, "actions": "first half zero target-hold, second half seeded bounded uniform",
             "initial_step_audit": initial, "final_step_audit": final,
             "contact_collection_crosscheck": crosscheck,
+            "table_contact_channel": table_channel,
             "terminal_reset_observed_for_env_ids": reset_envs,
             "outcomes": summarize_outcomes(outcomes), "gpu_memory": _gpu_memory(torch, settings["device"]),
             "success_claim_scope": "smoke execution and numerical checks only"}
@@ -1054,6 +1079,10 @@ def run_native_stage(stage: str, config: dict, run_dir: str | Path) -> dict:
             else:
                 profile = _evaluation(environment, settings, run_dir, streams, deadline, torch, audit)
             active_profile.update(profile)
+            if stage != "rl-audit":
+                final_audit = _json_safe(environment.unwrapped.step_audit())
+                active_profile["final_step_audit"] = final_audit
+                active_profile["table_contact_channel"] = verify_contact_measurements(final_audit, require_table_witness=True)
             _record_profile_memory(active_profile, "after_execution", torch, settings["device"], streams["memory"],
                                    require_headroom=stage == "rl-smoke")
             environment.close()
@@ -1076,6 +1105,11 @@ def run_native_stage(stage: str, config: dict, run_dir: str | Path) -> dict:
         if active_profile is not None:
             active_profile.update(passed=False, status=result["status"], failure_type=type(exc).__name__,
                                   failure_message=str(exc), out_of_memory=result["failure"]["out_of_memory"])
+            if environment is not None:
+                try:
+                    active_profile["final_step_audit"] = _json_safe(environment.unwrapped.step_audit())
+                except BaseException as audit_error:
+                    active_profile["failure_step_audit_unavailable"] = str(audit_error)
             if torch is not None:
                 try:
                     _record_profile_memory(active_profile, "at_failure", torch, settings["device"], streams["memory"])

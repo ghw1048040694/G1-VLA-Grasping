@@ -40,6 +40,13 @@ def outcome(env, episode, success=False):
             "failure_reasons": [] if success else ["support_failed"]}
 
 
+def measurement_audit():
+    return {"qualification_supported": True, "contact_data_unavailable_reason": None,
+            "table_contact_channel": {"supported": True, "table_kinematic": True,
+                "disable_gravity": True, "positive_force_physics_samples": 1,
+                "positive_force_env_samples": 1, "max_force_n": 0.7848, "unavailable_reason": None}}
+
+
 class RunnerContractTests(unittest.TestCase):
     def test_import_has_no_torch_or_simulator_side_effects(self):
         source = str(Path(rl_ppo.__file__).resolve().parents[1])
@@ -132,9 +139,52 @@ class RunnerContractTests(unittest.TestCase):
         with self.assertRaises(rl_ppo.NumericalFailure):
             rl_ppo.verify_contact_collection_crosscheck({})
 
+    def test_contact_admission_requires_available_measurements_and_positive_kinematic_table_witness(self):
+        good = measurement_audit()
+        self.assertEqual(rl_ppo.verify_contact_measurements(good, require_table_witness=True), good["table_contact_channel"])
+        for key, value in (("qualification_supported", False), ("qualification_supported", None),
+                           ("contact_data_unavailable_reason", "Table unsupported"), ("table_contact_channel", None)):
+            with self.subTest(key=key):
+                with self.assertRaises(rl_ppo.NumericalFailure):
+                    rl_ppo.verify_contact_measurements(dict(good, **{key: value}), require_table_witness=True)
+        for key in ("qualification_supported", "contact_data_unavailable_reason", "table_contact_channel"):
+            changed = copy.deepcopy(good)
+            del changed[key]
+            with self.subTest(missing=key):
+                with self.assertRaises(rl_ppo.NumericalFailure):
+                    rl_ppo.verify_contact_measurements(changed, require_table_witness=True)
+        for key, value in (("supported", False), ("table_kinematic", False), ("disable_gravity", False),
+                           ("positive_force_physics_samples", 0), ("positive_force_physics_samples", True),
+                           ("max_force_n", 0), ("max_force_n", -1), ("max_force_n", True),
+                           ("max_force_n", float("nan")), ("max_force_n", float("inf")),
+                           ("unavailable_reason", "backend unavailable")):
+            changed = copy.deepcopy(good)
+            changed["table_contact_channel"][key] = value
+            with self.subTest(channel_key=key, value=value):
+                with self.assertRaises(rl_ppo.NumericalFailure):
+                    rl_ppo.verify_contact_measurements(changed, require_table_witness=True)
+        changed = copy.deepcopy(good)
+        changed["table_contact_channel"]["positive_force_physics_samples"] = 0
+        changed["table_contact_channel"]["max_force_n"] = 0
+        self.assertIsNone(rl_ppo.verify_contact_measurements(changed))
+
+    def test_missing_contact_measurements_are_recorded_and_rejected_before_episode_consumption(self):
+        audit = {"physics_samples": 33, "sim_time_s": 0.066, "reset_count": 1,
+                 "qualification_supported": False, "contact_data_unavailable_reason": "native pair read failed"}
+        env = types.SimpleNamespace()
+        env.unwrapped = types.SimpleNamespace(step_audit=lambda: audit, pop_episode_outcomes=mock.Mock())
+        streams = {"steps": types.SimpleNamespace(write=mock.Mock()),
+                   "episodes": types.SimpleNamespace(write=mock.Mock())}
+        with self.assertRaises(rl_ppo.NumericalFailure):
+            rl_ppo._record_step(env, {}, streams, "training", 1, 1, None)
+        streams["steps"].write.assert_called_once()
+        self.assertEqual(streams["steps"].write.call_args.args[0]["environment"], audit)
+        env.unwrapped.pop_episode_outcomes.assert_not_called()
+
     @contextlib.contextmanager
     def native_capacity_fakes(self, directory):
-        state = {"built": [], "closed": [], "fail_build_count": None, "low_after_first": False}
+        state = {"built": [], "closed": [], "fail_build_count": None, "low_after_first": False,
+                 "missing_table_witness_count": None}
         app = types.SimpleNamespace(close=mock.Mock())
         torch = types.SimpleNamespace(cuda=types.SimpleNamespace(reset_peak_memory_stats=mock.Mock(),
                                                                  empty_cache=mock.Mock()))
@@ -143,7 +193,12 @@ class RunnerContractTests(unittest.TestCase):
             count = kwargs["num_envs"]
             if state["fail_build_count"] == count:
                 raise MemoryError("capacity allocation failed")
-            env = types.SimpleNamespace(num_envs=count, step_audit=lambda: {}, get_observations=lambda: {})
+            def step_audit():
+                audit = measurement_audit()
+                if state["missing_table_witness_count"] == count:
+                    audit["table_contact_channel"].update(positive_force_physics_samples=0, max_force_n=0.0)
+                return audit
+            env = types.SimpleNamespace(num_envs=count, step_audit=step_audit, get_observations=lambda: {})
             env.unwrapped = env
             env.close = lambda: state["closed"].append(count)
             return env
@@ -206,6 +261,20 @@ class RunnerContractTests(unittest.TestCase):
             self.assertTrue(report["profiles"][1]["out_of_memory"])
             self.assertEqual(report["capacity_summary"]["highest_completed_num_envs"], 1)
             self.assertIn("at_failure", report["profiles"][1]["memory"])
+
+    def test_larger_profile_without_table_load_cannot_pass_or_qualify_training(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.native_capacity_fakes(directory) as (state, config):
+                state["missing_table_witness_count"] = 8
+                run = Path(directory) / "run"
+                with self.assertRaises(rl_ppo.NumericalFailure):
+                    rl_ppo.run_native_stage("rl-smoke", config, run)
+            report = json.loads((run / "native_report.json").read_text())
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["profiles"][1]["passed"])
+            self.assertEqual(report["profiles"][1]["final_step_audit"]["table_contact_channel"]["positive_force_physics_samples"], 0)
+            self.assertEqual(report["capacity_summary"]["completed_profiles"], [1])
+            self.assertFalse(report["capacity_summary"]["requested_training_capacity_smoke_passed"])
 
     def test_identity_ignores_only_host_selection_and_execution_budgets(self):
         config = {"rl_teacher": flat_config(), "control": {"gain": 12}, "action": {"joint_names": ["a"]}}
@@ -471,7 +540,7 @@ class TorchOptimizerTests(unittest.TestCase):
                 return self.get_observations(), torch.ones(2), torch.ones(2, dtype=torch.long), {}
 
             def step_audit(self):
-                return {"physics_samples": self.samples, "sim_time_s": self.samples * 0.002,
+                return {**measurement_audit(), "physics_samples": self.samples, "sim_time_s": self.samples * 0.002,
                         "reset_count": self.resets, "nonfinite_state": False}
 
             def pop_episode_outcomes(self):

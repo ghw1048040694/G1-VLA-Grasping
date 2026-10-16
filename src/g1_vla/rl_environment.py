@@ -19,6 +19,9 @@ from .contracts import canonical_sha256, read_joint_order
 ENVIRONMENT_VERSION = "g1_physx_official_precontact_rl_v2"
 CONTACT_COLLECTION_VERSION = "cube_partner_once_v3"
 SUPPORT_GATE_VERSION = "physx_complete_partner_manifold_actual_contact_v4"
+TABLE_BODY_PROTOCOL = {"version": "kinematic_rigid_table_contact_channel_v3",
+                       "kinematic_enabled": True, "disable_gravity": True,
+                       "size_m": (0.84, 1.1, 0.06), "position_m": (0.52, 0.0, 0.72)}
 CONTACT_CROSSCHECK = {"num_envs": 1, "physics_samples": 33, "minimum_nonzero_contact_samples": 1,
                       "force_atol_n": 1e-5, "force_rtol": 1e-4,
                       "position_atol_m": 1e-6, "normal_atol": 1e-5}
@@ -89,6 +92,54 @@ class RLEnvironmentError(ValueError):
 
 class ContactEquivalenceError(AssertionError):
     """A same-step native contact-view crosscheck failed; never unsupported."""
+
+
+class TableContactChannel:
+    """Require a native rigid binding and a positive measured load witness."""
+
+    def __init__(self):
+        self._bound = False
+        self._failed = False
+        self._state = {"supported": False, "table_kinematic": True, "disable_gravity": True,
+                       "valid_physics_samples": 0, "positive_force_physics_samples": 0,
+                       "positive_force_physics_samples_semantics": "minimum per-environment positive 2ms sample count; positive means every Table channel witnessed",
+                       "positive_force_any_env_physics_samples": 0, "bound_env_count": 0,
+                       "positive_force_env_samples": 0, "max_force_n": 0.0,
+                       "unavailable_reason": "awaiting_native_table_binding_and_positive_force_witness"}
+
+    def bind(self, paths, num_envs, *, kinematic, disable_gravity):
+        if (not kinematic or not disable_gravity or len(paths) != num_envs or len(set(paths)) != num_envs
+                or any(path.rsplit("/", 1)[-1] != "Table" for path in paths)):
+            self.unavailable("native Table binding or kinematic/gravity declaration invalid")
+            raise RLEnvironmentError(self._state["unavailable_reason"])
+        self._bound = True
+        self._state["bound_env_count"] = num_envs
+        self._state["unavailable_reason"] = "awaiting_positive_normal_force_witness"
+
+    def observe(self, positive_env_count, max_force_n, min_per_env_positive_samples):
+        if (not isinstance(positive_env_count, int) or isinstance(positive_env_count, bool) or positive_env_count < 0
+                or not isinstance(min_per_env_positive_samples, int) or isinstance(min_per_env_positive_samples, bool)
+                or min_per_env_positive_samples < self._state["positive_force_physics_samples"]
+                or not math.isfinite(float(max_force_n)) or max_force_n < 0):
+            raise FloatingPointError("invalid or nonfinite native Table load summary")
+        if not self._bound or self._failed:
+            self.unavailable("Table force read without a valid native rigid channel")
+            return
+        self._state["valid_physics_samples"] += 1
+        self._state["positive_force_any_env_physics_samples"] += int(positive_env_count > 0)
+        self._state["positive_force_physics_samples"] = min_per_env_positive_samples
+        self._state["positive_force_env_samples"] += positive_env_count
+        self._state["max_force_n"] = max(self._state["max_force_n"], float(max_force_n))
+        if self._state["positive_force_physics_samples"]:
+            self._state["supported"] = True
+            self._state["unavailable_reason"] = None
+
+    def unavailable(self, reason):
+        self._failed = True
+        self._state.update(supported=False, unavailable_reason=str(reason))
+
+    def snapshot(self):
+        return dict(self._state)
 
 
 def wxyz_to_xyzw(quaternion):
@@ -617,6 +668,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._pending_physics_sample = False
             self._force_unavailable = None
             self._qualification_supported = False
+            self._table_contact_channel = TableContactChannel()
             self._standalone_video = bool(eval_mode)
             self._evaluation_camera = None
             self._video_status = {"requested": bool(eval_mode), "enabled": False,
@@ -642,6 +694,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 if len(paths) != self.num_envs or any(path.rsplit("/", 1)[-1] != name for path in paths):
                     raise RLEnvironmentError("native contact sensor did not bind exactly one declared rigid body per environment: " + name)
                 self._contact_body_binding_audit[name] = paths
+            table_paths = list(self.table.root_view.prim_paths)
+            self._table_contact_channel.bind(table_paths, self.num_envs,
+                                             kinematic=self._table_schema_audit["kinematic_enabled"],
+                                             disable_gravity=self._table_schema_audit["disable_gravity"])
+            self._contact_body_binding_audit["Table"] = table_paths
             # The full Cube ledger explicitly names every hand. Only the
             # bounded one-environment crosscheck creates the old eight views.
             self._cube_hand_filter_indices = [self._cube_filter_body_names.index(name) for name in sensor_body_names]
@@ -687,6 +744,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._actions = torch.zeros(self.num_envs, 14, device=self.device)
             self._previous_actions = torch.zeros_like(self._actions)
             self._episode_ids = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+            self._table_positive_per_env = torch.zeros_like(self._episode_ids)
             self._episode_return = torch.zeros(self.num_envs, device=self.device)
             self._support_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
             self._support_qualified = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -751,12 +809,22 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                           visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.8, 0.1))),
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=tuple(initial["cube_pose_xyzw"][:3]), rot=tuple(initial["cube_pose_xyzw"][3:]))))
-            table = sim_utils.CuboidCfg(size=(0.84, 1.1, 0.06), collision_props=collision,
+            table = sim_utils.CuboidCfg(size=TABLE_BODY_PROTOCOL["size_m"], collision_props=collision,
+                                        rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True),
+                                        activate_contact_sensors=True,
                                         physics_material=material(settings["table_friction"]))
-            table.func("/World/envs/env_.*/Table", table, translation=(0.52, 0.0, 0.72))
+            self.table = RigidObject(RigidObjectCfg(prim_path="/World/envs/env_.*/Table", spawn=table,
+                                                   init_state=RigidObjectCfg.InitialStateCfg(pos=TABLE_BODY_PROTOCOL["position_m"])))
             self.scene.articulations["robot"] = self.robot
             self.scene.rigid_objects["cube"] = self.cube
+            self.scene.rigid_objects["table"] = self.table
             stage = get_current_stage()
+            table_prim = stage.GetPrimAtPath("/World/envs/env_0/Table")
+            self._table_schema_audit = {"rigid_body_api": table_prim.HasAPI(UsdPhysics.RigidBodyAPI),
+                                        "kinematic_enabled": bool(table_prim.GetAttribute("physics:kinematicEnabled").Get()),
+                                        "disable_gravity": bool(table_prim.GetAttribute("physxRigidBody:disableGravity").Get())}
+            if not all(self._table_schema_audit.values()):
+                raise RLEnvironmentError("Table must be a gravity-disabled native kinematic rigid body")
             fixed_joints = []
             self._joint_schema_audit = {}
             task_names = {"floor", "calibration_table", "green_cube", "red_triangle", "yellow_rod", "warehouse_tote"}
@@ -1176,13 +1244,21 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 depth, normal_vertical = summary["depth"], summary["normal_vertical"]
                 opposition = summary["opposition"]
                 table_fn, table_loaded_count = cube_contacts["table_fn"], cube_contacts["table_loaded_count"]
+                table_positive = table_fn > 0
+                self._table_positive_per_env += table_positive.long()
+                table_stats = torch.stack((table_positive.sum().to(table_fn.dtype), table_fn.amax(),
+                                           self._table_positive_per_env.amin().to(table_fn.dtype))).detach().cpu().tolist()
+                self._table_contact_channel.observe(int(table_stats[0]), table_stats[1], int(table_stats[2]))
                 depth = torch.maximum(depth, cube_contacts["maximum_penetration_m"])
                 other_force = cube_contacts["other_fn"] + cube_contacts["unfiltered_normal_residual_n"]
                 other_loaded_count = cube_contacts["other_loaded_count"]
-                self._qualification_supported = self._force_unavailable is None
+                table_supported = self._table_contact_channel.snapshot()["supported"]
+                self._qualification_supported = self._force_unavailable is None and table_supported
+                contact_available &= table_supported
             except (AttributeError, TypeError, RuntimeError, RLEnvironmentError) as exc:
                 self._force_unavailable = type(exc).__name__ + ": " + str(exc)
                 self._qualification_supported = False
+                self._table_contact_channel.unavailable(self._force_unavailable)
                 contact_available = False
                 table_fn = torch.full_like(depth, float("inf"))
                 other_force = torch.full_like(depth, float("inf"))
@@ -1261,13 +1337,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             # executes or claims the original 0.1 m lift / 0.5 s carry gate.
             self._local_success = qualified_now & ~self._unsafe
             self._max_clearance = torch.maximum(self._max_clearance, clearance)
+            table_supported = self._table_contact_channel.snapshot()["supported"]
+            unknown_table = torch.full_like(table_fn, float("nan"))
             self._last_metrics = {"clearance_m": clearance, "object_speed_m_s": speed,
                                   "object_lift_height_m": lift_height,
                                   "object_angular_speed_rad_s": spin, "grip_drift_m": drift,
                                   "grip_reference_locked": self._grip_locked,
-                                  "relative_rotation_rad": rotation_error, "table_normal_force_n": table_fn,
+                                  "relative_rotation_rad": rotation_error,
+                                  "table_normal_force_n": table_fn if table_supported else unknown_table,
+                                  "table_pair_measurement_supported": torch.full((self.num_envs,), table_supported, dtype=torch.bool, device=self.device),
                                   "hand_upward_force_n": upward, "other_normal_force_n": other_force,
-                                  "no_loaded_table_contact": table_loaded_count == 0,
+                                  "no_loaded_table_contact": (table_loaded_count == 0) if table_supported else unknown_table,
                                   "no_other_loaded_external_contact": other_loaded_count == 0,
                                   "group_normal_force_n": groups, "maximum_penetration_m": depth,
                                   "group_physical_loaded_contact_count": group_physical,
@@ -1287,6 +1367,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                        "episode_id": self._episode_ids[:count].detach().cpu().tolist(),
                        "env_ids": list(range(count)), "force_unavailable": self._force_unavailable,
                        "qualification_supported": self._qualification_supported,
+                       "table_contact_channel": self._table_contact_channel.snapshot(),
                        "main_lift_authorized": False,
                        "metrics": {name: value[:count].detach().cpu().tolist() for name, value in self._last_metrics.items()},
                        "joint_position_rad": tensor(self.robot.data.joint_pos)[:count].detach().cpu().tolist(),
@@ -1454,6 +1535,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                       "maximum_support_samples": self._max_support_samples}
             field_batch = {name: value[terminal_ids].detach().cpu().tolist()
                            for name, value in fields.items()} if terminal_indices else {}
+            measurement_unavailable = self._force_unavailable or self._table_contact_channel.snapshot()["unavailable_reason"]
             for offset, index in enumerate(terminal_indices):
                 metrics = {name: _json_finite(values[offset]) for name, values in metric_batch.items()}
                 episode = {name: values[offset] for name, values in field_batch.items()}
@@ -1482,10 +1564,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                        "elapsed_steps": int(episode["elapsed_steps"]),
                                        "sim_time_s": float(episode["elapsed_steps"]*self.step_dt),
                                        "episode_return": float(episode["episode_return"]),
-                                       "success": None if self._force_unavailable else bool(episode["local_success"]),
-                                       "local_success": False if self._force_unavailable else bool(episode["local_success"]),
+                                       "success": None if measurement_unavailable else bool(episode["local_success"]),
+                                       "local_success": False if measurement_unavailable else bool(episode["local_success"]),
                                        "qualification_supported": self._qualification_supported,
-                                       "unavailable_reason": self._force_unavailable, "gates": gates, "metrics": metrics,
+                                       "unavailable_reason": measurement_unavailable, "gates": gates, "metrics": metrics,
                                        "max_clearance_m": float(episode["max_clearance_m"]),
                                        "maximum_support_samples": int(episode["maximum_support_samples"]),
                                        "failure_reasons": failure})
@@ -1647,6 +1729,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "policy_contract": {"environment_version": ENVIRONMENT_VERSION,
                                         "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
                                         "support_gate_version": SUPPORT_GATE_VERSION,
+                                        "table_body_protocol": TABLE_BODY_PROTOCOL,
+                                        "table_rigid_schema": self._table_schema_audit,
+                                        "table_channel_admission": "native rigid binding plus positive normal-force witness required; unsupported Table fields export null; kinematic body remains at original fixed pose without episode writes",
                                         "actual_side_contact_definition": "distal opposition uses abs(raw signed Fn)>20mN AND separation<=0; side-normal limit checks max(abs(world-z),abs(cube-local-z)) for every physical Fn>0,separation<=0 point including weaker points; every thumb/index/middle requires a physical loaded point; positive gaps cannot provide opposition or grip lock",
                                         "aggregate_force_scope": "full forces retained for shaping; qualification and first grip lock forbid every hand nonzero Fn at positive gap; every partner with any nonzero raw friction patch requires a nonempty complete normal manifold with all separations<=0 including zero-Fn points; failure is current qualification false, not sticky API failure; no patch-to-point separation equivalence or MuJoCo efc claim",
                                         "raw_contact_orientation": "reversed view preserves canonical point normals and negates signed scalar force; aggregate normal/friction vectors negate; Cube raw ledger unchanged",
@@ -1698,12 +1783,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "initial_state": initial, "physics_version": config["rl_teacher"]["physics_protocol"],
                     "asset_kind": "official_native_usd" if native_official_asset else "historical_mjcf_conversion_control",
                     "physics_differences": ["PhysX TGS, not MuJoCo Noslip10", "hard root fixation, not compliant base weld",
+                                            "source static table is now a gravity-disabled kinematic rigid body at the same geometry, material and fixed pose for native GPU pair contacts",
                                             "implicit shared gains without MuJoCo qfrc_bias feedforward",
                                             "explicit max static/dynamic friction, no MuJoCo torsional/rolling friction mapping",
                                             "official USD collision geometry retained with 1 mm contact offset" if native_official_asset else
                                                 "historical PhysX convex collision conversion with 1 mm contact offset"],
                     "source_joint_limit_differences_rad": self._source_joint_limit_differences,
                     "contact_body_binding_audit": self._contact_body_binding_audit,
+                    "table_contact_channel": self._table_contact_channel.snapshot(),
                     "cube_raw_contact_capacity_per_env": 256,
                     "reference_hand_raw_contact_capacity_per_body_per_env": 32,
                     "contact_collection_crosscheck": dict(self._contact_crosscheck),
@@ -1732,6 +1819,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
                     "contact_collection_crosscheck": dict(self._contact_crosscheck),
                     "qualification_supported": self._qualification_supported,
+                    "table_contact_channel": self._table_contact_channel.snapshot(),
                     "evaluation_video": dict(self._video_status),
                     "nonfinite_state": bool((~self._last_metrics.get("finite", torch.ones(self.num_envs, dtype=torch.bool, device=self.device))).any()),
                     "success_count_pending": sum(row["success"] is True for row in self._outcomes),

@@ -15,6 +15,8 @@ from g1_vla.rl_environment import (
     ACTION_JOINT_NAMES,
     DEFAULT_SETTINGS,
     RLEnvironmentError,
+    TABLE_BODY_PROTOCOL,
+    TableContactChannel,
     _actuator_specifications,
     _seed_state,
     _compare_hand_contacts,
@@ -98,6 +100,45 @@ class PhysicalGeometryTest(unittest.TestCase):
 
 
 class ProtocolInputsTest(unittest.TestCase):
+    def test_table_is_declared_as_gravity_disabled_kinematic_at_original_geometry(self):
+        self.assertTrue(TABLE_BODY_PROTOCOL["kinematic_enabled"])
+        self.assertTrue(TABLE_BODY_PROTOCOL["disable_gravity"])
+        self.assertEqual(TABLE_BODY_PROTOCOL["size_m"], (.84, 1.1, .06))
+        self.assertEqual(TABLE_BODY_PROTOCOL["position_m"], (.52, 0, .72))
+
+    def test_table_channel_requires_native_binding_and_positive_load_witness(self):
+        channel = TableContactChannel()
+        self.assertFalse(channel.snapshot()["supported"])
+        channel.bind(["/World/envs/env_0/Table", "/World/envs/env_1/Table"], 2,
+                     kinematic=True, disable_gravity=True)
+        channel.observe(0, 0, 0)
+        self.assertFalse(channel.snapshot()["supported"])
+        channel.observe(1, .785, 0)
+        self.assertFalse(channel.snapshot()["supported"])
+        channel.observe(2, .3, 1)
+        state = channel.snapshot()
+        self.assertTrue(state["supported"])
+        self.assertEqual(state["valid_physics_samples"], 3)
+        self.assertEqual(state["positive_force_physics_samples"], 1)
+        self.assertEqual(state["positive_force_any_env_physics_samples"], 2)
+        self.assertEqual(state["bound_env_count"], 2)
+        self.assertEqual(state["positive_force_env_samples"], 3)
+        self.assertEqual(state["max_force_n"], .785)
+        self.assertIsNone(state["unavailable_reason"])
+        channel.unavailable("native pair read failed")
+        channel.observe(2, .9, 2)
+        self.assertFalse(channel.snapshot()["supported"])
+
+    def test_table_channel_cannot_treat_missing_binding_or_nonfinite_force_as_zero(self):
+        channel = TableContactChannel()
+        with self.assertRaises(RLEnvironmentError):
+            channel.bind(["/Robot/floor"], 1, kinematic=True, disable_gravity=True)
+        self.assertFalse(channel.snapshot()["supported"])
+        with self.assertRaises(FloatingPointError):
+            channel.observe(0, float("nan"), 0)
+        with self.assertRaises(FloatingPointError):
+            channel.observe(-1, .5, 0)
+
     def test_contact_collection_backend_cannot_silently_change(self):
         config = configuration()
         config["rl_teacher"]["contact_extraction_backend"] = "old-nine-views"
