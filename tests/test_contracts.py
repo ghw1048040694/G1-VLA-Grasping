@@ -9,7 +9,7 @@ from pathlib import Path
 
 from g1_vla.config import ConfigError, load_config, validate_config
 from g1_vla.contracts import (
-    ActionContract, ContractError, canonical_sha256, make_checkpoint_metadata,
+    ActionContract, ContractError, canonical_sha256, make_checkpoint_metadata, scene_protocol_for_contact_model,
     observation_spec_from_config, read_joint_order, validate_checkpoint_metadata, validate_observation,
 )
 
@@ -35,6 +35,27 @@ def contract_fixture():
 
 
 class ConfigTests(unittest.TestCase):
+    def test_contact_model_identity_cannot_silently_reuse_the_original_contract(self):
+        config = config_fixture()
+        original = {"backend": "source_default_v1", "time_constant_s": .02, "damping_ratio": 1.}
+        self.assertEqual(scene_protocol_for_contact_model(None), scene_protocol_for_contact_model(original))
+        candidate = {"backend": "right_hand_green_compliance_v2", "time_constant_s": .006, "damping_ratio": 1.}
+        config["scene"]["contact_model"] = original
+        first = ActionContract.from_config(config, metadata=source_metadata())
+        config["scene"]["contact_model"] = candidate
+        second = ActionContract.from_config(config, metadata=source_metadata())
+        self.assertNotEqual(first.contract_sha256, second.contract_sha256)
+        self.assertEqual(first.joint_names, second.joint_names)
+        self.assertEqual(first.max_velocity_rad_s, second.max_velocity_rad_s)
+        self.assertEqual(second.scene_protocol, scene_protocol_for_contact_model(candidate))
+        config["scene"]["contact_model"]["time_constant_s"] = .008
+        self.assertNotEqual(second.contract_sha256, ActionContract.from_config(config, metadata=source_metadata()).contract_sha256)
+        config["scene"]["contact_model"]["time_constant_s"] = .002
+        with self.assertRaisesRegex(ConfigError, "three physics"):
+            validate_config(config)
+        with self.assertRaises(ContractError):
+            scene_protocol_for_contact_model({**original, "time_constant_s": .006})
+
     def test_current_teacher_configuration_disables_training(self):
         config = load_config(PROJECT / "configs" / "experiment.json")
         self.assertFalse(config["train"]["enabled"])

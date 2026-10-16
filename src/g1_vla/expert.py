@@ -531,7 +531,8 @@ def run_teacher_episode(config, spec, run_dir):
         if not source.is_absolute():
             source = Path(config["paths"]["root"]) / source
         report["scene"] = build_scene(source, run_dir / "scene.xml", spec["positions_m"], run_dir=run_dir,
-                                      preserve_source_camera=False, include_blue_box=False)
+                                      preserve_source_camera=False, include_blue_box=False,
+                                      contact_model=config["scene"].get("contact_model"))
         model = api.MjModel.from_xml_path(report["scene"]["scene"])
         data, workspace = api.MjData(model), api.MjData(model)
         api.mj_forward(model, data)

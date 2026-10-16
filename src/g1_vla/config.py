@@ -184,6 +184,10 @@ SCHEMA = {
         "backend": _literal("mujoco"), "asset_path": _optional(_text),
         "fixed_stance": _literal(True), "assisted_grasp": _literal(False),
         "seed": _integer,
+        "contact_model": {
+            "backend": _choice("source_default_v1", "right_hand_green_compliance_v2"),
+            "time_constant_s": _positive, "damping_ratio": _literal(1.0),
+        },
     },
     "observation": {
         "fields": _strings, "camera_ids": _optional(_strings),
@@ -492,6 +496,13 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.train", "resume_checkpoint and warm_start_checkpoint are mutually exclusive")
     teacher = config["expert"]["teacher"]
     hand_control = config["expert"]["hand_control"]
+    contact_model = config["scene"]["contact_model"]
+    if contact_model["backend"] == "source_default_v1" and contact_model["time_constant_s"] != .02:
+        _error("config.scene.contact_model", "source default has the original 0.02 second reference")
+    if (contact_model["backend"] == "right_hand_green_compliance_v2"
+            and (control["physics_dt_s"] is None
+                 or contact_model["time_constant_s"] < 3 * control["physics_dt_s"])):
+        _error("config.scene.contact_model", "candidate contact reference requires at least three physics timesteps")
     if hand_control["normal_force_target_n"] >= hand_control["maximum_group_force_n"]:
         _error("config.expert.hand_control", "normal setpoint must be below the unload limit")
     if hand_control["minimum_loaded_force_n"] >= hand_control["normal_force_target_n"]:

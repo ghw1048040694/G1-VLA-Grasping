@@ -28,6 +28,33 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def scene_protocol_for_contact_model(settings) -> str:
+    """Keep the original identity, or bind the explicit candidate physics.
+
+    Candidate contacts are a simulation hypothesis, not hardware calibration.
+    Their complete declaration is hashed so cached labels/checkpoints cannot
+    silently cross a different contact model under the same action identity.
+    """
+    original = "g1_strict_scene_force_transfer_v1"
+    if settings is None:
+        return original
+    if not isinstance(settings, Mapping) or set(settings) != {"backend", "time_constant_s", "damping_ratio"}:
+        raise ContractError("contact model requires its complete explicit declaration")
+    time_constant, damping = settings["time_constant_s"], settings["damping_ratio"]
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0
+           for v in (time_constant, damping)) or damping != 1.:
+        raise ContractError("contact model requires a positive time constant and critical damping")
+    if settings["backend"] == "source_default_v1":
+        if time_constant != .02:
+            raise ContractError("source default contact model has a 0.02 second reference")
+        return original
+    if settings["backend"] != "right_hand_green_compliance_v2":
+        raise ContractError("unknown contact model protocol")
+    declaration = {"backend": settings["backend"], "time_constant_s": float(time_constant),
+                   "damping_ratio": float(damping)}
+    return "g1_strict_scene_right_hand_green_compliance_v2_" + canonical_sha256(declaration)
+
+
 def _joint_names(names: Any) -> Tuple[str, ...]:
     if not isinstance(names, (list, tuple)) or len(names) != 31:
         raise ContractError("joint order must contain exactly 31 names from source metadata")
@@ -118,7 +145,11 @@ class ActionContract:
         actual = (self.protocol, self.history_steps, self.chunk_steps, self.execute_steps, self.anchor)
         if actual != expected or any(isinstance(getattr(self, key), bool) for key in ("history_steps", "chunk_steps", "execute_steps")):
             raise ContractError("rebuild contract requires history=4, chunk=8, execute=4 and one qpos_at_plan anchor")
-        if (self.dynamics_profile != "robot_regularized_v1" or self.scene_protocol != "g1_strict_scene_force_transfer_v1"
+        candidate_prefix = "g1_strict_scene_right_hand_green_compliance_v2_"
+        candidate_digest = self.scene_protocol[len(candidate_prefix):] if isinstance(self.scene_protocol, str) and self.scene_protocol.startswith(candidate_prefix) else ""
+        valid_scene = self.scene_protocol == "g1_strict_scene_force_transfer_v1" or (
+            len(candidate_digest) == 64 and all(character in "0123456789abcdef" for character in candidate_digest))
+        if (self.dynamics_profile != "robot_regularized_v1" or not valid_scene
                 or self.controller_protocol != "g1_pd_substep_feedback_v2"):
             raise ContractError("execution dynamics/scene protocol differs from the rebuild controller")
 
@@ -159,7 +190,8 @@ class ActionContract:
                    protocol=action["protocol"], history_steps=action["history_steps"],
                    chunk_steps=action["chunk_steps"], execute_steps=action["execute_steps"],
                    anchor=action["anchor"], body_gain_scale=control["body_gain_scale"],
-                   hand_gain_scale=control["hand_gain_scale"])
+                   hand_gain_scale=control["hand_gain_scale"],
+                   scene_protocol=scene_protocol_for_contact_model(config["scene"].get("contact_model")))
 
     @property
     def action_dim(self) -> int:

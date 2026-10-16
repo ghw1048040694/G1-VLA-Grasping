@@ -203,6 +203,86 @@ class SceneTests(unittest.TestCase):
                 build_scene(source, source.parent / "new_scene.xml", {"green_cube": [0, 0, 0]}, run_dir=source.parent)
         self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
 
+    def test_default_contact_backend_keeps_exact_xml_and_original_scene_identity(self):
+        source = PROJECT / "resources" / "g1_warehouse_pregrasp.xml"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = build_scene(source, root / "implicit.xml", {"green_cube": [0.36, -.1, .795]}, run_dir=root)
+            second = build_scene(source, root / "explicit.xml", {"green_cube": [0.36, -.1, .795]}, run_dir=root,
+                                 contact_model={"backend": "source_default_v1", "time_constant_s": .02, "damping_ratio": 1.})
+            self.assertEqual((root / "implicit.xml").read_bytes(), (root / "explicit.xml").read_bytes())
+            self.assertEqual(first["scene_protocol"], "g1_strict_scene_force_transfer_v1")
+            self.assertEqual(second["scene_protocol"], first["scene_protocol"])
+            self.assertNotIn("contact_model", first)
+            self.assertEqual(second["contact_model"]["explicit_pairs"], [])
+
+    def test_candidate_changes_only_fifteen_original_hand_green_pair_solrefs(self):
+        source = PROJECT / "resources" / "g1_warehouse_pregrasp.xml"
+        before = source.read_bytes()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = build_scene(source, root / "baseline.xml", {"green_cube": [0.36, -.1, .795]}, run_dir=root)
+            candidate = build_scene(source, root / "candidate.xml", {"green_cube": [0.36, -.1, .795]}, run_dir=root,
+                                    contact_model={"backend": "right_hand_green_compliance_v2", "time_constant_s": .006, "damping_ratio": 1.})
+            xml = ET.parse(root / "candidate.xml").getroot()
+            detail = candidate["contact_model"]
+            pairs = xml.find("contact").findall("pair")
+            self.assertEqual(len(pairs), 15)
+            self.assertEqual(len(detail["new_names_for_original_unnamed_active_geoms"]), 7)
+            self.assertTrue(candidate["scene_protocol"].startswith("g1_strict_scene_right_hand_green_compliance_v2_"))
+            self.assertNotEqual(candidate["scene_protocol"], baseline["scene_protocol"])
+            self.assertTrue(detail["uncalibrated_simulation_hypothesis"])
+            self.assertEqual(detail["time_constant_in_physics_steps"], 3.)
+            for pair, record in zip(pairs, detail["explicit_pairs"]):
+                self.assertEqual(pair.get("geom2"), "green_cube_geom")
+                self.assertNotIn("calibration_table", pair.attrib.values())
+                self.assertEqual(pair.get("condim"), "3")
+                self.assertEqual([float(v) for v in pair.get("solref").split()], [.006, 1.])
+                self.assertEqual([float(v) for v in pair.get("solimp").split()], [.9, .95, .001, .5, 2.])
+                self.assertEqual(float(pair.get("margin")), 0.)
+                self.assertEqual(float(pair.get("gap")), 0.)
+                mu = 2. if pair.get("geom1") == "right_palm_contact_pad" else 2.2
+                self.assertEqual([float(v) for v in pair.get("friction").split()], [mu, mu, .05, .005, .005])
+                expected = dict(record["original_dynamic_contact_parameters"], solref=[.006, 1.])
+                self.assertEqual(record["compiled_expected_parameters"], expected)
+                self.assertTrue(record["original_dynamic_mask_compatible"])
+                geom = xml.find(".//geom[@name='{}']".format(pair.get("geom1")))
+                self.assertEqual((geom.get("contype"), geom.get("conaffinity")), ("2", "4"))
+            # Names have no dynamics; remove just the aliases and new pairs to
+            # recover the original XML, including all geometry/forces/masks.
+            for name in detail["new_names_for_original_unnamed_active_geoms"]:
+                xml.find(".//geom[@name='{}']".format(name)).attrib.pop("name")
+            xml.remove(xml.find("contact"))
+            self.assertEqual(ET.tostring(xml), (root / "baseline.xml").read_bytes())
+            self.assertEqual(candidate["actuator_force_transfers"], baseline["actuator_force_transfers"])
+        self.assertEqual(before, source.read_bytes())
+
+    def test_contact_candidate_rejects_unknown_inheritance_exclusion_and_unsafe_timeconstant(self):
+        source = PROJECT / "resources" / "g1_warehouse_pregrasp.xml"
+        settings = {"backend": "right_hand_green_compliance_v2", "time_constant_s": .006, "damping_ratio": 1.}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resources = root / "resources"
+            resources.mkdir()
+            for index, mutation in enumerate(("defaults", "exclusion", "predefined")):
+                xml = ET.fromstring(source.read_bytes())
+                if mutation == "defaults":
+                    ET.SubElement(xml, "default")
+                else:
+                    contact = ET.SubElement(xml, "contact")
+                    if mutation == "exclusion":
+                        ET.SubElement(contact, "exclude", body1="right_hand_index_0_link", body2="green_cube")
+                    else:
+                        ET.SubElement(contact, "pair", geom1="right_palm_contact_pad", geom2="green_cube_geom")
+                modified = resources / (mutation + ".xml")
+                modified.write_bytes(ET.tostring(xml))
+                with self.assertRaises(SceneError):
+                    build_scene(modified, root / ("bad_{}.xml".format(index)), {"green_cube": [0.36, -.1, .795]}, run_dir=root, contact_model=settings)
+            for index, invalid in enumerate((dict(settings, time_constant_s=.004), dict(settings, damping_ratio=.5),
+                                               dict(settings, backend="unknown"))):
+                with self.assertRaises(SceneError):
+                    build_scene(source, root / ("invalid_{}.xml".format(index)), {"green_cube": [0.36, -.1, .795]}, run_dir=root, contact_model=invalid)
+
     def test_camera_preservation_is_explicit(self):
         source = PROJECT / "resources" / "g1_warehouse_pregrasp.xml"
         original_camera = ET.parse(source).getroot().find(".//camera[@name='head_camera']")

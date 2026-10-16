@@ -16,7 +16,12 @@
     "asset_path": "resources/g1_warehouse_pregrasp.xml",
     "fixed_stance": true,
     "assisted_grasp": false,
-    "seed": 42
+    "seed": 42,
+    "contact_model": {
+      "backend": "right_hand_green_compliance_v2",
+      "time_constant_s": 0.006,
+      "damping_ratio": 1.0
+    }
   },
   "observation": {
     "fields": [

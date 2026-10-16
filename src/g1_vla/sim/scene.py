@@ -411,9 +411,145 @@ def _within(path: Path, parent: Path):
         return False
 
 
+def _contact_values(geom):
+    """Resolve this strict source's explicit geom attributes + MuJoCo defaults.
+
+    Default classes are rejected by the caller rather than approximated here.
+    """
+    def values(key, default, count):
+        try:
+            result = [float(item) for item in geom.get(key, default).split()]
+        except ValueError as exc:
+            raise SceneError("invalid original geom contact parameter " + key) from exc
+        if len(result) != count or not all(math.isfinite(item) for item in result):
+            raise SceneError("unsupported original geom contact parameter " + key)
+        return result
+    try:
+        integers = {key: int(geom.get(key, default)) for key, default in
+                    (("contype", "1"), ("conaffinity", "1"), ("condim", "3"), ("priority", "0"))}
+    except ValueError as exc:
+        raise SceneError("invalid original integer contact setting") from exc
+    return dict(integers, friction=values("friction", "1 0.005 0.0001", 3),
+                solref=values("solref", "0.02 1", 2), solimp=values("solimp", "0.9 0.95 0.001 0.5 2", 5),
+                solmix=values("solmix", "1", 1)[0], margin=values("margin", "0", 1)[0], gap=values("gap", "0", 1)[0])
+
+
+def _mixed_contact_values(first, second):
+    """MuJoCo 3.2.5 positive-format dynamic mixing, before our sole change."""
+    if first["solref"] != [0.02, 1.] or second["solref"] != [0.02, 1.]:
+        raise SceneError("compliance v2 must branch from the declared default solref 0.02 1")
+    if first["priority"] != second["priority"]:
+        preferred = first if first["priority"] > second["priority"] else second
+        condim, friction, solimp = preferred["condim"], preferred["friction"], preferred["solimp"]
+    else:
+        if first["solmix"] <= 0 or second["solmix"] <= 0:
+            raise SceneError("unsupported zero/negative source solmix")
+        weight = first["solmix"] / (first["solmix"] + second["solmix"])
+        condim = max(first["condim"], second["condim"])
+        friction = [max(a, b) for a, b in zip(first["friction"], second["friction"])]
+        solimp = [weight * a + (1. - weight) * b for a, b in zip(first["solimp"], second["solimp"])]
+    return {"condim": condim, "friction": [friction[0], friction[0], friction[1], friction[2], friction[2]],
+            "solref": [0.02, 1.], "solreffriction": [0., 0.], "solimp": list(solimp),
+            "margin": max(first["margin"], second["margin"]), "gap": max(first["gap"], second["gap"])}
+
+
+def _apply_contact_model(root, settings):
+    """Add only declared, already-enabled right-hand/green pair overrides.
+
+    Explicit pairs bypass MuJoCo's ordinary mask/exclude filters. Accordingly
+    this builder rejects unknown inheritance, exclusions, or source pairs and
+    selects only the original mask-compatible separate free-object bodies.
+    """
+    if settings is None:
+        return None
+    if not isinstance(settings, dict) or set(settings) != {"backend", "time_constant_s", "damping_ratio"}:
+        raise SceneError("contact_model requires backend, time_constant_s and damping_ratio")
+    backend, time_constant, ratio = settings["backend"], settings["time_constant_s"], settings["damping_ratio"]
+    if (backend not in ("source_default_v1", "right_hand_green_compliance_v2")
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                   for value in (time_constant, ratio)) or time_constant <= 0 or ratio != 1.):
+        raise SceneError("unsupported contact model or noncritical/nonfinite solver reference")
+    option = root.find("option")
+    timestep = float(option.get("timestep", "0.002")) if option is not None else .002
+    if backend == "source_default_v1":
+        if time_constant != .02:
+            raise SceneError("source_default_v1 preserves solref 0.02 1")
+        return {"backend": backend, "solref": [.02, 1.], "explicit_pairs": [],
+                "scope": "original dynamic geom mixing; XML unchanged"}
+    if not math.isfinite(timestep) or timestep <= 0 or time_constant < 3. * timestep:
+        raise SceneError("compliance candidate time constant must be at least three physics timesteps")
+    if root.find("default") is not None:
+        raise SceneError("compliance candidate cannot infer inherited default contact classes")
+    contact = root.find("contact")
+    if contact is not None and contact.findall("pair"):
+        raise SceneError("compliance candidate requires no pre-existing explicit source pairs")
+    green = root.find(".//body[@name='green_cube']")
+    if green is None or green.find("freejoint") is None:
+        raise SceneError("compliance candidate requires the original independent green free body")
+    cube = green.find("geom[@name='green_cube_geom']")
+    if cube is None:
+        raise SceneError("green collision geom is absent")
+    cube_values = _contact_values(cube)
+    finger_bodies = ["right_hand_thumb_{}_link".format(i) for i in range(3)] + [
+        "right_hand_{}_{}_link".format(finger, i) for finger in ("index", "middle") for i in range(2)]
+    selected, named = [], []
+    for body_name in finger_bodies + ["right_wrist_yaw_link"]:
+        body = root.find(".//body[@name='{}']".format(body_name))
+        if body is None:
+            raise SceneError("compliance source finger/palm body is absent: " + body_name)
+        if contact is not None:
+            for exclusion in contact.findall("exclude"):
+                if {exclusion.get("body1"), exclusion.get("body2")} == {body_name, "green_cube"}:
+                    raise SceneError("explicit compliance pair cannot bypass an original body exclusion")
+        for index, geom in enumerate(body.findall("geom")):
+            if body_name == "right_wrist_yaw_link" and geom.get("name") != "right_palm_contact_pad":
+                continue
+            values = _contact_values(geom)
+            compatible = bool(values["contype"] & cube_values["conaffinity"] or cube_values["contype"] & values["conaffinity"])
+            if not compatible:
+                continue
+            if geom.get("name") is None:
+                alias = body_name + "_compliance_source_geom_{}".format(index)
+                if root.find(".//geom[@name='{}']".format(alias)) is not None:
+                    raise SceneError("candidate geom alias conflicts with source name")
+                geom.set("name", alias)
+                named.append(alias)
+            selected.append((body_name, geom, values))
+    if len(selected) != 15 or len(named) != 7:
+        raise SceneError("compliance scope must preserve the original seven mesh/capsule links plus palm pad")
+    if contact is None:
+        contact = ET.SubElement(root, "contact")
+    records = []
+    for body_name, geom, values in selected:
+        original = _mixed_contact_values(values, cube_values)
+        candidate = dict(original, solref=[float(time_constant), float(ratio)])
+        pair_name = "right_green_compliance_" + geom.get("name")
+        attributes = {"name": pair_name, "geom1": geom.get("name"), "geom2": cube.get("name")}
+        for key, value in candidate.items():
+            attributes[key] = " ".join(format(item, ".17g") for item in value) if isinstance(value, list) else format(value, ".17g")
+        ET.SubElement(contact, "pair", **attributes)
+        records.append({"name": pair_name, "hand_body": body_name, "geom1": geom.get("name"), "geom2": cube.get("name"),
+                        "original_hand_geom_parameters": values, "original_green_geom_parameters": cube_values,
+                        "original_dynamic_contact_parameters": original, "compiled_expected_parameters": candidate,
+                        "original_dynamic_mask_compatible": True,
+                        "body_filter_scope": "different non-welded trees: free green body versus articulated right hand; no direct-body exclusion"})
+    return {"backend": backend, "solref": [float(time_constant), float(ratio)], "physics_timestep_s": timestep,
+            "time_constant_in_physics_steps": time_constant / timestep,
+            "explicit_pairs": records, "pair_count": len(records), "new_names_for_original_unnamed_active_geoms": named,
+            "scope": "right seven original active finger mesh/capsule geoms and palm pad versus original green geom only",
+            "only_changed_contact_parameter": "solref time constant", "cube_table_contact_unchanged": True,
+            "geometry_masks_friction_mass_actuators_pd_unchanged": True,
+            "uncalibrated_simulation_hypothesis": True,
+            "calibration_scope": "candidate numerical compliance; no hardware material/contact calibration",
+            "default_solref": [.02, 1.],
+            "reference_sources": ["https://github.com/google-deepmind/mujoco/blob/3.2.5/doc/modeling.rst#contact-parameters",
+                                  "https://github.com/google-deepmind/mujoco/blob/3.2.5/src/engine/engine_collision_driver.c"]}
+
+
 def build_scene(source: Path, destination: Path, positions: Mapping[str, Sequence[float]], *,
                 run_dir: Path, preserve_source_camera: bool = False,
-                red_triangle_mesh_collision: bool = False, include_blue_box: bool = True):
+                red_triangle_mesh_collision: bool = False, include_blue_box: bool = True,
+                contact_model=None):
     """Create a new run-local XML and return its explicit geometry manifest.
 
     The source is never rewritten. A green-only positions dictionary creates
@@ -482,6 +618,7 @@ def build_scene(source: Path, destination: Path, positions: Mapping[str, Sequenc
         if name in normalized:
             add_free_object(scene, equality, name, normalized[name], red_triangle_mesh_collision=red_triangle_mesh_collision)
     assert_fixed_scene(root)
+    contact_manifest = _apply_contact_model(root, contact_model)
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=False)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("xb") as stream:
@@ -491,7 +628,7 @@ def build_scene(source: Path, destination: Path, positions: Mapping[str, Sequenc
         "yellow_rod": {"visual": "cylinder", "collision": "box_approximation"},
         "green_cube": {"visual": "box", "collision": "same_box"},
     }
-    return {
+    manifest = {
         "schema_version": 1, "scene_protocol": "g1_strict_scene_force_transfer_v1",
         "source": str(source), "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "scene": str(destination), "scene_sha256": hashlib.sha256(xml_bytes).hexdigest(),
@@ -510,3 +647,8 @@ def build_scene(source: Path, destination: Path, positions: Mapping[str, Sequenc
         "changes_from_legacy": ["legacy joint force bounds explicitly transferred to actuators", "single-object scene permitted"],
         "requires_teacher_revalidation": True,
     }
+    if contact_manifest is not None:
+        from ..contracts import scene_protocol_for_contact_model
+        manifest["scene_protocol"] = scene_protocol_for_contact_model(contact_model)
+        manifest["contact_model"] = contact_manifest
+    return manifest
