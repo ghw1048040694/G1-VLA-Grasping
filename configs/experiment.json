@@ -826,8 +826,8 @@
     "asset_manifest_path": ".runtime/rebuild/rl_assets/official_v1/asset_manifest.json",
     "asset_manifest_sha256": "96b7cad957cf0c76cfc91687b5effbd449f959b4dd1bc8b496512970161f4566",
     "seed_state_sha256": "b4b6ed59d18624b5bf45eda9153bc4b86f31eceebbaa30be98d66dee00e75470",
-    "checkpoint_path": null,
-    "checkpoint_sha256": null,
+    "checkpoint_path": ".runtime/rebuild/runs/G1-REBUILD-20261016-rl-train-03/native/checkpoints/checkpoint_update_0078_final.pt",
+    "checkpoint_sha256": "0c130aa93c88c1f6710940e4cb509c7a649d670e0c6a3cd3f89abbe705de4fef",
     "action_joint_names": [
       "right_shoulder_pitch_joint",
       "right_shoulder_roll_joint",
