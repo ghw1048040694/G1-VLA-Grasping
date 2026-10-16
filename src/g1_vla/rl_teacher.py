@@ -202,7 +202,8 @@ def _package_eval_videos(output, run_dir):
                         "first_source_frame": first, "last_source_frame_exclusive": last,
                         "decoded_frames": int(clip_stream["nb_read_frames"]),
                         "encoded_fps": clip_stream["r_frame_rate"], "sha256": file_hash(clip),
-                        "bytes": clip.stat().st_size, "raw_RGB_pixels_unchanged": True})
+                        "bytes": clip.stat().st_size, "raw_RGB_source_frames_unmodified": True,
+                        "encoding": "lossy H.264 CRF20; unmodified camera PNG source, no overlays"})
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             row["error"] = str(exc)
         videos.append(row)
@@ -211,19 +212,24 @@ def _package_eval_videos(output, run_dir):
     return videos
 
 
-def _diagnostic_video_delivery(videos, native):
+def _diagnostic_video_delivery(videos, native, expected_profiles=None):
     """Require every declared physical profile's actual complete RGB clip."""
+    if expected_profiles is None:
+        from .rl_probe_protocol import RL_PROBE_DEFAULTS
+        expected_profiles = RL_PROBE_DEFAULTS["profiles"]
     if native.get("video_evidence_complete") is not True or len(videos) != 1:
         return False
     video = videos[0]
     profiles = native.get("profiles", [])
     clips = video.get("profile_clips", [])
-    if video.get("encoded") is not True or len(clips) != 4 or len(profiles) != 4:
+    if (video.get("encoded") is not True or not expected_profiles or
+            len(clips) != len(expected_profiles) or len(profiles) != len(expected_profiles) or
+            video.get("encoded_fps") != "500/33"):
         return False
     previous = 0
-    for clip, profile in zip(clips, profiles):
+    for clip, profile, expected in zip(clips, profiles, expected_profiles):
         first, last = profile["first_video_frame"], profile["last_video_frame_exclusive"]
-        if (clip.get("profile") != profile["profile"]["name"] or
+        if (profile["profile"] != expected or clip.get("profile") != expected["name"] or
                 clip.get("first_source_frame") != first or clip.get("last_source_frame_exclusive") != last or
                 first != previous or last-first != profile["control_steps"] or
                 clip.get("decoded_frames") != last-first or clip.get("encoded_fps") != "500/33"):
@@ -310,7 +316,12 @@ def run_rl_teacher_stage(stage, config, run_dir):
         "original_mujoco_teacher_modified": False, "old_ACT_test_accessed": False,
         "scope": config["rl_teacher"]["scope"]}
     if stage == "rl-diagnose":
-        result["video_evidence_complete"] = _diagnostic_video_delivery(videos, native)
+        from .rl_probe_protocol import validate_probe_settings
+        declared = validate_probe_settings(config["rl_diagnostics"])
+        result["video_evidence_complete"] = _diagnostic_video_delivery(videos, native, declared["profiles"])
+        result["declared_profile_plan"] = declared["profile_plan"]
+        result["four_way_comparison_complete"] = (declared["profile_plan"] == "four_way_v1" and
+                                                   result["video_evidence_complete"])
         result["source_identical_trained_eval"] = False
         result["passed"] = result["passed"] and result["video_evidence_complete"]
     write_new_json(run_dir / "reports/rl_teacher.json", result)

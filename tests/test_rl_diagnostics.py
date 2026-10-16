@@ -12,14 +12,14 @@ RSL = TORCH and importlib.util.find_spec("rsl_rl") is not None and importlib.uti
 class DiagnosticVideoDeliveryTests(unittest.TestCase):
     def test_missing_or_partial_profile_clips_cannot_pass_delivery(self):
         from g1_vla.rl_teacher import _diagnostic_video_delivery
-        profiles = [{"profile": {"name": name}, "control_steps": 91,
+        profiles = [{"profile": profile, "control_steps": 91,
                      "first_video_frame": 91*i, "last_video_frame_exclusive": 91*(i+1)}
-                    for i, name in enumerate(("a", "b", "c", "d"))]
+                    for i, profile in enumerate(RL_PROBE_DEFAULTS["profiles"])]
         clips = [{"profile": p["profile"]["name"], "first_source_frame": p["first_video_frame"],
                   "last_source_frame_exclusive": p["last_video_frame_exclusive"],
                   "decoded_frames": 91, "encoded_fps": "500/33"} for p in profiles]
         native = {"video_evidence_complete": True, "profiles": profiles}
-        videos = [{"encoded": True, "decoded_frames": 364, "profile_clips": clips}]
+        videos = [{"encoded": True, "decoded_frames": 364, "encoded_fps": "500/33", "profile_clips": clips}]
         self.assertTrue(_diagnostic_video_delivery(videos, native))
         broken = copy.deepcopy(videos)
         broken[0]["profile_clips"].pop()
@@ -28,6 +28,23 @@ class DiagnosticVideoDeliveryTests(unittest.TestCase):
         broken[0]["profile_clips"][2]["decoded_frames"] = 90
         self.assertFalse(_diagnostic_video_delivery(broken, native))
         self.assertFalse(_diagnostic_video_delivery(videos, {**native, "video_evidence_complete": False}))
+
+    def test_single_profile_must_match_external_declaration_and_cannot_forge_four_way(self):
+        from g1_vla.rl_teacher import _diagnostic_video_delivery
+        expected = [copy.deepcopy(RL_PROBE_DEFAULTS["profiles"][3])]
+        native = {"video_evidence_complete": True, "profiles": [{"profile": expected[0],
+            "first_video_frame": 0, "last_video_frame_exclusive": 91, "control_steps": 91}]}
+        videos = [{"encoded": True, "decoded_frames": 91, "encoded_fps": "500/33", "profile_clips": [{
+            "profile": expected[0]["name"], "first_source_frame": 0, "last_source_frame_exclusive": 91,
+            "decoded_frames": 91, "encoded_fps": "500/33"}]}]
+        self.assertTrue(_diagnostic_video_delivery(videos, native, expected))
+        self.assertFalse(_diagnostic_video_delivery(videos, native))
+        broken = copy.deepcopy(native)
+        broken["profiles"][0]["profile"]["control_guard_version"] = "legacy_scalar_v1"
+        self.assertFalse(_diagnostic_video_delivery(videos, broken, expected))
+        broken_video = copy.deepcopy(videos)
+        broken_video[0]["encoded_fps"] = "30/1"
+        self.assertFalse(_diagnostic_video_delivery(broken_video, native, expected))
 
 
 @unittest.skipUnless(TORCH, "real torch is required for control math")
@@ -48,6 +65,76 @@ class DiagnosticControlTests(unittest.TestCase):
             "episode_id": torch.zeros(2, dtype=torch.long), "preload_contact_ready": torch.zeros(2, dtype=torch.bool)}
         self.state["target_action_rad"][:, 7:] = torch.tensor(self.seed)
         self.state["q_action_rad"][:, 7:] = torch.tensor(self.seed)
+
+    def staged_controller(self):
+        from g1_vla.rl_diagnostics import GuidedClosure
+        cfg = copy.deepcopy(self.cfg)
+        cfg.update(profile_plan="geometry_pose_only_v2", guided_target_lead_max_rad=.006)
+        goals = [[.8, -.2, -.1, .5, .3, .3, .3], [.8, -.4, -.1, .5, .3, .3, .3],
+                 [.8, -.4, -.2, .5, .3, .3, .3], [.7, -.4, -.2, .5, .3, .3, .3],
+                 cfg["guided_hand_target_rad"]]
+        frames = [{"name": "source", "target_rad": self.seed}] + [
+            {"name": "stage"+str(i), "duration_s": .066, "target_rad": q} for i, q in enumerate(goals)]
+        candidate = {"geometry_evidence": {"source_detail": {"stage_keyframes": frames}}}
+        return GuidedClosure(self.t, cfg, self.seed, self.state, candidate), goals
+
+    def test_staged_closure_requires_measured_arrival_and_safe_force_not_elapsed_time(self):
+        controller, goals = self.staged_controller()
+        for _ in range(6):
+            _, e = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+            self.assertTrue((e["closure_stage_index"] == 0).all())
+            self.assertFalse(e["stage_advance_after_this_request"].any())
+            self.assertLessEqual(float((e["guided_target_hand_rad"]-self.state["q_action_rad"][:, 7:]).abs().max()), .0060001)
+        self.state["q_action_rad"][:, 7:] = self.t.tensor(goals[0])
+        self.state["group_normal_force_n"][:] = 2.
+        _, e = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertFalse(e["stage_advance_after_this_request"].any())
+        self.state["group_normal_force_n"][:] = 0.
+        _, e = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertTrue(e["stage_advance_after_this_request"].all())
+
+    def test_preload_cannot_bypass_staged_path_and_episode_reset_restarts_path(self):
+        controller, goals = self.staged_controller()
+        self.state["preload_contact_ready"][:] = True
+        for _ in range(4):
+            _, e = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertTrue((e["probe_offset_m"] == 0).all())
+        for goal in goals:
+            self.state["q_action_rad"][:, 7:] = self.t.tensor(goal)
+            _, e = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        for _ in range(3):
+            _, e = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertTrue((e["probe_offset_m"] > 0).all())
+        self.state["episode_id"][0] += 1
+        self.state["q_action_rad"][0, 7:] = self.t.tensor(self.seed)
+        _, e = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertEqual(int(e["closure_stage_index"][0]), 0)
+        self.assertEqual(float(e["probe_offset_m"][0]), 0.)
+
+    def test_staged_candidate_cannot_change_reset_seed_or_native_limits(self):
+        from g1_vla.rl_diagnostics import GuidedClosure
+        controller, _ = self.staged_controller()
+        # The source check uses actual reset q, independently of file validation.
+        cfg = copy.deepcopy(self.cfg)
+        cfg.update(profile_plan="geometry_pose_only_v2", guided_target_lead_max_rad=.006)
+        frames = [{"name": "source", "target_rad": [0.]*7}] + [
+            {"name": "stage", "duration_s": .066, "target_rad": self.cfg["guided_hand_target_rad"]}] * 5
+        with self.assertRaisesRegex(ValueError, "actual reset seed"):
+            GuidedClosure(self.t, cfg, self.seed, self.state,
+                          {"geometry_evidence": {"source_detail": {"stage_keyframes": frames}}})
+
+    def test_geometry_pose_servo_integrates_target_and_pauses_closure_when_palm_droops(self):
+        controller, goals = self.staged_controller()
+        self.state["target_action_rad"][:, :7] = .04
+        self.state["palm_position_world_m"][:, 0] = -.001
+        action, evidence = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertGreater(float(action[0, 0]), 0.)
+        self.assertEqual(evidence["arm_target_reference"], "previous_applied_bounded_target")
+        self.state["q_action_rad"][:, 7:] = self.t.tensor(goals[0])
+        self.state["palm_position_world_m"][:, 2] = -.016
+        _, evidence = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertTrue(evidence["closure_paused_for_palm_tracking"].all())
+        self.assertFalse(evidence["stage_advance_after_this_request"].any())
 
     def test_hand_intervention_preserves_actor_arm_and_closes_declared_directions(self):
         from g1_vla.rl_diagnostics import GuidedClosure

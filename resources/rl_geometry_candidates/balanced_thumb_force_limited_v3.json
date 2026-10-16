@@ -1,0 +1,396 @@
+{
+  "schema_version": 1,
+  "candidate_id": "g1_native_fixed_wrist_balanced_thumb_force_goal_v3",
+  "asset_sha256": "d23b9bbc8b59cf20fa1983f55874f855a76e038b9e22eae39542e62be5b4ba3d",
+  "oldseed_sha256": "b4b6ed59d18624b5bf45eda9153bc4b86f31eceebbaa30be98d66dee00e75470",
+  "hand_joint_order": [
+    "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
+    "right_hand_index_0_joint",
+    "right_hand_index_1_joint",
+    "right_hand_middle_0_joint",
+    "right_hand_middle_1_joint"
+  ],
+  "target_rad": [
+    0.99,
+    -0.5,
+    -0.01,
+    0.835,
+    1.2266666666666668,
+    0.3433333333333333,
+    1.31
+  ],
+  "known_geometric_overlaps": [
+    {
+      "body_a": "right_hand_camera_base_link",
+      "body_b": "right_hand_palm_link",
+      "geometry": {
+        "distance_m": 5.928593550334434e-17,
+        "hand_point_world_m": [
+          0.2840045922164803,
+          0.047218411633684426,
+          0.8632801263325017
+        ],
+        "other_point_world_m": [
+          0.28400459221648033,
+          0.047218411633684405,
+          0.8632801263325017
+        ],
+        "normal_world": null,
+        "common_interior_ball_radius_m": 0.00837674524899124
+      },
+      "native_filter_status": "unmeasured"
+    },
+    {
+      "body_a": "right_hand_camera_base_link",
+      "body_b": "right_hand_thumb_0_link",
+      "geometry": {
+        "distance_m": 9.25581864295132e-16,
+        "hand_point_world_m": [
+          0.28674182823340816,
+          0.040018507780124,
+          0.8582263170386244
+        ],
+        "other_point_world_m": [
+          0.2867418282334074,
+          0.04001850778012355,
+          0.8582263170386246
+        ],
+        "normal_world": null,
+        "common_interior_ball_radius_m": 0.001579744161445868
+      },
+      "native_filter_status": "unmeasured"
+    }
+  ],
+  "admission_limitations": [
+    "Candidate-only, not physics qualified or selfcollision-free",
+    "Force goal intentionally intersects Cube geometrically and must never be written as reset state; approach through declared staged waypoints and measuredq smalllead/force relief",
+    "camera-palm and camera-thumb0 authored hull intersections remain; no native filter/reaction-force verification, no disabling selfcollision",
+    "LP common-interior ball is not penetration depth or force; all actual1.5N/3mm/no-positive-gap/manifold/opposition/2mm/100sample gates unchanged",
+    "Near-contact single GJK normal is not all-loaded native manifold certification; all8offsets/trajectories and dynamics remain unqualified"
+  ],
+  "geometry_evidence": {
+    "protocol": "offline_native_usd_grasp_geometry_v1",
+    "qualification": "candidate_only_not_physics_qualified",
+    "units": "m_rad",
+    "hand_joint_limits_rad": [
+      [
+        -1.0471975511965976,
+        1.0471975511965976
+      ],
+      [
+        -1.0471975511965976,
+        0.6108651716189881
+      ],
+      [
+        -1.745329118836275,
+        0.0
+      ],
+      [
+        0.0,
+        1.5707963267948966
+      ],
+      [
+        0.0,
+        1.745329118836275
+      ],
+      [
+        0.0,
+        1.5707963267948966
+      ],
+      [
+        0.0,
+        1.745329118836275
+      ]
+    ],
+    "finger_surface_evidence": {
+      "thumb": {
+        "contact_body": "right_hand_thumb_2_link",
+        "minimum_distance_to_cube_m": 7.239352532563474e-15,
+        "closest_point_world_m3": [
+          0.3250002668828083,
+          0.03000037600209587,
+          0.7934964354076555
+        ],
+        "cube_closest_point_world_m3": [
+          0.3250002668828051,
+          0.03000037600209001,
+          0.7934964354076527
+        ],
+        "closing_direction_world3": [
+          0.7247260966124172,
+          0.6890370707452728,
+          -5.263400589479502e-06
+        ],
+        "method": "Final authored ConvexHull GJK intersection witnesses (not unique external skin points); closing direction from last disjoint2um-gap surface pair along bounded overtravel. No native loaded-normal claim."
+      },
+      "index": {
+        "contact_body": "right_hand_index_1_link",
+        "minimum_distance_to_cube_m": 2.6258124134569333e-14,
+        "closest_point_world_m3": [
+          0.3277438168402582,
+          0.08000030672301964,
+          0.7802144463379663
+        ],
+        "cube_closest_point_world_m3": [
+          0.32774381684025944,
+          0.08000030672304584,
+          0.7802144463379651
+        ],
+        "closing_direction_world3": [
+          -1.19182374401826e-06,
+          -0.9999999999869388,
+          4.970132608147689e-06
+        ],
+        "method": "Final authored ConvexHull GJK intersection witnesses (not unique external skin points); closing direction from last disjoint2um-gap surface pair along bounded overtravel. No native loaded-normal claim."
+      },
+      "middle": {
+        "contact_body": "right_hand_middle_1_link",
+        "minimum_distance_to_cube_m": 5.184807644658975e-14,
+        "closest_point_world_m3": [
+          0.3750003054958534,
+          0.06426009375070524,
+          0.7926261380026449
+        ],
+        "cube_closest_point_world_m3": [
+          0.37500030549590524,
+          0.06426009375070538,
+          0.7926261380026451
+        ],
+        "closing_direction_world3": [
+          -0.9999999994609666,
+          1.1907474653692136e-06,
+          -3.281232472445047e-05
+        ],
+        "method": "Final authored ConvexHull GJK intersection witnesses (not unique external skin points); closing direction from last disjoint2um-gap surface pair along bounded overtravel. No native loaded-normal claim."
+      }
+    },
+    "source_detail": {
+      "palm_reference": "oldseed official_native_fk_reference unchanged",
+      "palm_offset_xyz_world_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "palm_offset_rpy_world_rad": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "no_object_state_change": true,
+      "precontact_waypoint_rad": [
+        1.0,
+        -0.5,
+        -0.01,
+        0.825,
+        1.2166666666666668,
+        0.3333333333333333,
+        1.3
+      ],
+      "bounded_force_goal_rad": [
+        0.99,
+        -0.5,
+        -0.01,
+        0.835,
+        1.2266666666666668,
+        0.3433333333333333,
+        1.31
+      ],
+      "stage_keyframes": [
+        {
+          "name": "source",
+          "target_rad": [
+            1.044999216953894,
+            -0.5631379848506369,
+            -0.001882270792060498,
+            0.5228475662574678,
+            1.1837266197069805,
+            0.26603581444523117,
+            1.1131477039115334
+          ]
+        },
+        {
+          "name": "index_middle_precontact_thumb_hold",
+          "target_rad": [
+            1.044999216953894,
+            -0.5631379848506369,
+            -0.001882270792060498,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "duration_s": 1.5
+        },
+        {
+          "name": "thumb1_relieve_before_reorientation",
+          "target_rad": [
+            1.044999216953894,
+            -0.5,
+            -0.001882270792060498,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "duration_s": 0.35
+        },
+        {
+          "name": "thumb2_small_curl_after_relief",
+          "target_rad": [
+            1.044999216953894,
+            -0.5,
+            -0.01,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "duration_s": 0.2
+        },
+        {
+          "name": "balanced_thumb_precontact",
+          "target_rad": [
+            1.0,
+            -0.5,
+            -0.01,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "duration_s": 0.4
+        },
+        {
+          "name": "force_limited_overtravel_not_reset_pose",
+          "target_rad": [
+            0.99,
+            -0.5,
+            -0.01,
+            0.835,
+            1.2266666666666668,
+            0.3433333333333333,
+            1.31
+          ],
+          "duration_s": 0.4
+        }
+      ],
+      "authored_hulls_file": "/Users/gggghw/Documents/ChatGPT/VLA\u5f00\u53d1/artifacts/g1-rebuild-20261016/stage16/official_hand_authored_convex_hulls_v1.json",
+      "authored_hulls_sha256": "5b5e0737f959d6fc50b1c3cc589213d3d4a162c0a7ea9625bbf792f0788e18d1",
+      "path_geometry_file": "/Users/gggghw/Documents/ChatGPT/VLA\u5f00\u53d1/artifacts/g1-rebuild-20261016/stage16/balanced_thumb_waypoint_overtravel_geometry_v2.json",
+      "path_geometry_sha256": "3e2d4132a0ee6fe11c4b44d5d5d3c16f7a01206c81a4909482b2efdd77cdaf77",
+      "minimum_table_clearance_all_sampled_path_m": 0.010058986395978686,
+      "near_contact_onset_evidence": {
+        "thumb": {
+          "fraction_to_overtravel_at_last2um_separation": 0.24322707951068878,
+          "hand_rad": [
+            0.9975677292048931,
+            -0.5,
+            -0.01,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "surface_pair": {
+            "distance_m": 2.000000089985426e-06,
+            "hand_point_world_m": [
+              0.3249988199784098,
+              0.029999002919681002,
+              0.7945008319586964
+            ],
+            "other_point_world_m": [
+              0.32500026943066823,
+              0.030000380993884496,
+              0.7945008319481696
+            ],
+            "normal_world": [
+              -0.7247260966124172,
+              -0.6890370707452728,
+              5.263400589479502e-06
+            ]
+          },
+          "meaning": "Last disjoint authored-hull normal near2um gap; predicts contact onset, not final native loaded manifold normal"
+        },
+        "index": {
+          "fraction_to_overtravel_at_last2um_separation": 0.3022105023264885,
+          "hand_rad": [
+            1.0,
+            -0.5,
+            -0.01,
+            0.8280221050232649,
+            1.2196887716899316,
+            0.3333333333333333,
+            1.3
+          ],
+          "surface_pair": {
+            "distance_m": 2.0000011292220832e-06,
+            "hand_point_world_m": [
+              0.3268435925716177,
+              0.08000230797542805,
+              0.780250391086533
+            ],
+            "other_point_world_m": [
+              0.32684359256923406,
+              0.08000030797429886,
+              0.7802503910964733
+            ],
+            "normal_world": [
+              1.19182374401826e-06,
+              0.9999999999869388,
+              -4.970132608147689e-06
+            ]
+          },
+          "meaning": "Last disjoint authored-hull normal near2um gap; predicts contact onset, not final native loaded manifold normal"
+        },
+        "middle": {
+          "fraction_to_overtravel_at_last2um_separation": 0.27580470591783524,
+          "hand_rad": [
+            1.0,
+            -0.5,
+            -0.01,
+            0.825,
+            1.2166666666666668,
+            0.3360913803925117,
+            1.3027580470591784
+          ],
+          "surface_pair": {
+            "distance_m": 2.0000023901134837e-06,
+            "hand_point_world_m": [
+              0.37500232669837946,
+              0.06624730331217146,
+              0.8000500684167536
+            ],
+            "other_point_world_m": [
+              0.3750003266959904,
+              0.06624730331455296,
+              0.8000500683511289
+            ],
+            "normal_world": [
+              0.9999999994609666,
+              -1.1907474653692136e-06,
+              3.281232472445047e-05
+            ]
+          },
+          "meaning": "Last disjoint authored-hull normal near2um gap; predicts contact onset, not final native loaded manifold normal"
+        }
+      },
+      "near_contact_onset_thumb_normal_dots": [
+        -0.6890379345082028,
+        -0.7247252755799157
+      ],
+      "final_cube_common_interior_ball_radius_m": {
+        "thumb": 6.302960192954226e-05,
+        "index": 0.00020581339058562027,
+        "middle": 0.0002764524010975176
+      },
+      "old_simultaneous_thumb_path_rejected": "v1 stage2 linear thumb0/1 ramp had interior overlaps before returning to positive finalgap; v2 opens thumb1 first, tinycurlsecond, then approaches thumb0",
+      "physics_qualification": "none; noApp/noSim; planned .006rad targetlead, force not bounded; real force/penetration/contact/support gates unchanged",
+      "planned_target_lead_max_rad": 0.006,
+      "planned_segment_tracking_tolerance_rad": 0.01,
+      "segment_time_semantics": "Nominal planned smoothstep durations, not executed: each segment waits for all measuredq-target errors<=.01rad before progression; original6s episode limit unchanged. No timing or physical tracking qualification.",
+      "candidate_v2_source_sha256": "e68f7eac2b622dfa304d9b859b0762e6506547c8ac9b7b1a306d6aa64287a686"
+    }
+  }
+}

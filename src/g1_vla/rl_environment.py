@@ -130,6 +130,240 @@ def _probe_payload(torch, value):
     return value
 
 
+class NativeJointLoadDiagnostics:
+    """Read-only native load telemetry, separate from support or motor torque.
+
+    Construct only for control_probe. No sensor, actuator or stage is changed.
+    Getter failures retain None plus a reason; reset-stale rows are excluded.
+    """
+
+    PROTOCOL = "native_projected_incoming_joint_load_control_boundary_v1"
+
+    def __init__(self, torch, as_tensor, view, joint_names, body_names, num_envs):
+        self.torch, self.as_tensor, self.view = torch, as_tensor, view
+        self.num_envs = num_envs
+        self.joint_names, self.body_names = list(joint_names), list(body_names)
+        self.binding_error = None
+        try:
+            native_joints = list(view.shared_metatype.dof_names)
+            native_bodies = list(view.shared_metatype.link_names)
+            if (view.count != num_envs or native_joints != self.joint_names or
+                    native_bodies != self.body_names):
+                raise ValueError("native articulation count/name order differs from robot binding")
+            binding = {"verified": True, "joint_names": native_joints,
+                       "body_names": native_bodies, "native_count": int(view.count)}
+        except Exception as exc:
+            self.binding_error = type(exc).__name__ + ": " + str(exc)
+            binding = {"verified": False, "unavailable_reason": self.binding_error,
+                       "expected_joint_names": self.joint_names, "expected_body_names": self.body_names}
+        self.binding = binding
+        self.readback = _probe_payload(torch, {
+            "protocol": self.PROTOCOL, "binding": binding,
+            "native_drive_max_force_nm": self._read("get_dof_max_forces", (num_envs, len(joint_names))),
+            "native_friction_properties": self._read("get_dof_friction_properties", (num_envs, len(joint_names), 3)),
+            "friction_last_dimension": ["static_friction_effort_nm", "dynamic_friction_effort_nm",
+                                        "viscous_friction_coefficient_nm_s_rad"],
+            "readback_count": 1,
+            "semantics": "native property readback, not measured drive torque; all43 DOFs are revolute"})
+
+    def _read(self, method, expected_shape, env_ids=None):
+        try:
+            if self.binding_error is not None:
+                raise ValueError(self.binding_error)
+            value = self.as_tensor(getattr(self.view, method)())
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(method + " unexpected native shape: " + str(tuple(value.shape)))
+            if env_ids is not None:
+                value = value.index_select(0, env_ids.to(value.device))
+            if not value.is_floating_point() or not bool(self.torch.isfinite(value).all()):
+                raise ValueError(method + " nonfinite or nonfloating native values")
+            return {"available": True, "values": value.detach().clone(), "unavailable_reason": None}
+        except Exception as exc:
+            return {"available": False, "values": None,
+                    "unavailable_reason": type(exc).__name__ + ": " + str(exc)}
+
+    def snapshot(self, native_step, episode_ids, episode_controls, *, phase):
+        # A reset writes state without solving physics. Never pair the previous
+        # episode's native load with the newly reset q at the same native step.
+        eligible = self.torch.nonzero(episode_controls > 0, as_tuple=False).flatten()
+        invalid = self.torch.nonzero(episode_controls <= 0, as_tuple=False).flatten()
+        result = {"protocol": self.PROTOCOL, "native_physics_step_count": int(native_step),
+                  "sample_phase": phase, "env_ids": eligible.detach().cpu().tolist(),
+                  "episode_ids": episode_ids.index_select(0, eligible).detach().clone(),
+                  "invalid_for_current_episode_env_ids": invalid.detach().cpu().tolist(),
+                  "reset_stale_reason": "no completed physics/control transition since episode reset",
+                  "binding_names_reference": "control_profile_boundary.native_joint_load_readback.binding",
+                  "projected_joint_force_semantics": "native incoming wrench projected along DOF motion; Nm for revolute DOFs; not isolated drive torque or isolated constraint torque",
+                  "incoming_joint_wrench_semantics": "native total active+passive incoming joint wrench, child joint frame; body_names order; first3 N, last3 Nm",
+                  "measurement_cadence": "one sample per requested control boundary; does not certify every2ms transient"}
+        if eligible.numel():
+            projected = self._read("get_dof_projected_joint_forces",
+                                   (self.num_envs, len(self.joint_names)), eligible)
+            incoming = self._read("get_link_incoming_joint_force",
+                                  (self.num_envs, len(self.body_names), 6), eligible)
+        else:
+            projected = {"available": False, "values": None,
+                         "unavailable_reason": "no environment has post-reset physics in this boundary"}
+            incoming = dict(projected)
+        result.update(projected_joint_force_nm=projected, incoming_joint_wrench_child=incoming,
+                      available=projected["available"] and incoming["available"])
+        return result
+
+
+class NativeSelfPairDiagnostics:
+    """One read-only batched view for declared thumb0/1-camera pairs only.
+
+    API/report-threshold preconditions are observed, never activated or set.
+    Normal data cannot identify tangential friction or certify load support.
+    """
+
+    PROTOCOL = "native_thumb01_camera_self_pair_control_boundary_v1"
+
+    def __init__(self, torch, as_tensor, simulation_view, stage, pairs, num_envs, physics_dt):
+        self.torch, self.as_tensor = torch, as_tensor
+        self.num_envs, self.dt = num_envs, float(physics_dt)
+        self.view, self.binding_error = None, None
+        self._cache_key, self._cache = None, None
+        self._last_counted_step = None
+        self._positive_post_control_samples = [0]*len(pairs)
+        self.pairs = [dict(row, sensor_index=i) for i, row in enumerate(pairs)]
+        self.readback = {"protocol": self.PROTOCOL, "available": False,
+                         "pairs": self.pairs, "preexisting_contact_reports": [],
+                         "raw_point_capacity_global": 32*len(pairs),
+                         "friction_measured": False, "physics_or_reporting_writes": 0}
+        try:
+            if len(pairs) != 2*num_envs or not math.isclose(self.dt, .002, abs_tol=1e-12, rel_tol=0):
+                raise ValueError("self-pair view requires2 thumb bodies per env and actual2ms dt")
+            sensors = [row["sensor_path"] for row in pairs]
+            filters = [[row["filter_path"]] for row in pairs]
+            if len(set(sensors)) != len(sensors):
+                raise ValueError("self-pair sensor paths must be unique")
+            for env_id in range(num_envs):
+                rows = [row for row in pairs if row["env_id"] == env_id]
+                if {row["sensor_body"] for row in rows} != {"right_hand_thumb_0_link", "right_hand_thumb_1_link"} or len(rows) != 2:
+                    raise ValueError("missing or duplicate declared thumb pair in environment")
+                for row in rows:
+                    if (row["sensor_path"].rsplit("/", 1)[-1] != row["sensor_body"] or
+                            row["filter_path"].rsplit("/", 1)[-1] != "right_hand_camera_base_link" or
+                            row["sensor_path"].rsplit("/", 1)[0] != row["filter_path"].rsplit("/", 1)[0] or
+                            ("/env_"+str(env_id)+"/") not in row["sensor_path"]):
+                        raise ValueError("self-pair paths must bind named bodies within the same environment")
+            for path in dict.fromkeys(sensors+[row[0] for row in filters]):
+                prim = stage.GetPrimAtPath(path)
+                if not prim.IsValid() or "PhysicsRigidBodyAPI" not in prim.GetAppliedSchemas():
+                    raise ValueError("missing declared rigid body: "+path)
+                if "PhysxContactReportAPI" not in prim.GetAppliedSchemas():
+                    raise ValueError("preexisting contact reporter absent: "+path)
+                attr = prim.GetAttribute("physxContactReport:threshold")
+                threshold = attr.Get() if attr.IsValid() else None
+                finite_threshold = threshold is not None and math.isfinite(float(threshold))
+                self.readback["preexisting_contact_reports"].append({"path": path,
+                    "threshold_n": float(threshold) if finite_threshold else None,
+                    "threshold_valid": finite_threshold})
+                if not finite_threshold or float(threshold) != 0.0:
+                    raise ValueError("preexisting report threshold cannot certify weak contact: "+path)
+            view = simulation_view.create_rigid_contact_view(
+                sensors, filter_patterns=filters, max_contact_data_count=32*len(pairs))
+            actual_sensors, actual_filters = list(view.sensor_paths), list(view.filter_paths)
+            self.readback.update(native_sensor_paths=actual_sensors, native_filter_paths=actual_filters,
+                                 native_sensor_count=int(view.sensor_count), native_filter_count=int(view.filter_count))
+            # Installed API exposes routing paths; unsupported layouts are
+            # explicitly unavailable rather than guessing a cross-env pairing.
+            normalized_filters = [[p] if isinstance(p, str) else list(p) for p in actual_filters]
+            if (view.sensor_count != len(pairs) or view.filter_count != 1 or
+                    actual_sensors != sensors or normalized_filters != filters):
+                raise ValueError("native self-pair count/path/filter routing mismatch")
+            self.view = view
+            self.readback.update(available=True, unavailable_reason=None)
+        except Exception as exc:
+            self.binding_error = type(exc).__name__+": "+str(exc)
+            self.readback.update(available=False, unavailable_reason=self.binding_error)
+
+    def summary(self):
+        seen = [i for i, count in enumerate(self._positive_post_control_samples) if count]
+        return {**self.readback, "positive_witness_post_control_samples": list(self._positive_post_control_samples),
+                "positive_witness_seen_sensor_indices": seen,
+                "self_pair_reporting_status": "positive_witness_observed" if seen else "no_positive_witness_yet",
+                "absence_of_selfcollision_certified": False,
+                "cadence": "control boundaries only; not every2ms transient"}
+
+    def snapshot(self, native_step, episode_ids, episode_controls, *, phase):
+        torch = self.torch
+        ids, controls = episode_ids.detach().cpu().tolist(), episode_controls.detach().cpu().tolist()
+        key = (int(native_step), tuple(ids), tuple(controls))
+        if key != self._cache_key:
+            valid = [i for i, row in enumerate(self.pairs) if controls[row["env_id"]] > 0]
+            result = {"protocol": self.PROTOCOL, "native_physics_step_count": int(native_step),
+                      "sensor_indices": valid, "episode_ids": [ids[self.pairs[i]["env_id"]] for i in valid],
+                      "reset_stale_excluded_sensor_indices": [i for i in range(len(self.pairs)) if i not in valid],
+                      "binding_reference": "control_profile_boundary.native_self_pair_readback.pairs",
+                      "available": False, "values": None, "positive_witness_sensor_indices": [],
+                      "measurement_dt_s": self.dt, "friction_measured": False}
+            try:
+                if self.view is None:
+                    raise ValueError(self.binding_error or "native pair view unavailable")
+                if not valid:
+                    raise ValueError("no post-reset physics for any declared pair")
+                net = self.as_tensor(self.view.get_net_contact_forces(dt=self.dt)).detach().clone()
+                matrix = self.as_tensor(self.view.get_contact_force_matrix(dt=self.dt)).detach().clone()
+                raw = tuple(self.as_tensor(x).detach().clone() for x in self.view.get_contact_data(dt=self.dt))
+                if len(raw) != 6:
+                    raise ValueError("native contact data must return forces,points,normals,separation,COUNTS,STARTS")
+                force, point, normal, separation, counts, starts = raw
+                sensors, capacity = len(self.pairs), int(self.view.max_contact_data_count)
+                force, separation = force.reshape(-1), separation.reshape(-1)
+                if (tuple(net.shape) != (sensors, 3) or tuple(matrix.shape) != (sensors, 1, 3) or
+                        tuple(counts.shape) != (sensors, 1) or tuple(starts.shape) != (sensors, 1) or
+                        force.numel() != capacity or separation.numel() != capacity or
+                        tuple(point.shape) != (capacity, 3) or tuple(normal.shape) != (capacity, 3)):
+                    raise ValueError("unexpected native self-pair tensor shape")
+                integer_types = (torch.int32, torch.int64, torch.uint32)
+                if counts.dtype not in integer_types or starts.dtype not in integer_types:
+                    raise ValueError("native counts/starts must be int32/int64/uint32 integer tensors")
+                # Installed tensor API allocates both buffers as uint32.
+                # Convert before reductions/index arithmetic; never accept floats.
+                counts, starts = counts.to(dtype=torch.int64), starts.to(dtype=torch.int64)
+                if int(counts.sum().item()) >= capacity:
+                    raise ValueError("self-pair raw buffer saturated; completeness unavailable")
+                counts, starts, bucket, indices, _ = _ragged_contact_indices(torch, counts, starts, capacity)
+                selected = torch.tensor(valid, device=matrix.device, dtype=torch.int64)
+                valid_mask = torch.zeros(sensors, dtype=torch.bool, device=bucket.device)
+                valid_mask[selected] = True
+                keep = valid_mask[bucket]
+                active = (force[indices][keep], point[indices][keep], normal[indices][keep], separation[indices][keep])
+                if not all(bool(torch.isfinite(x).all()) for x in (net[selected], matrix[selected], *active)):
+                    raise ValueError("nonfinite active native self-pair data")
+                reconstructed = torch.zeros(sensors, 3, device=matrix.device, dtype=matrix.dtype)
+                reconstructed.index_add_(0, bucket, force[indices, None]*normal[indices])
+                if not torch.allclose(reconstructed[selected], matrix[selected, 0], atol=1e-5, rtol=1e-4):
+                    raise ValueError("raw signed Fn*normal does not reconstruct native selected-pair matrix")
+                witness = (force[indices].abs() > 0) & (separation[indices] <= 0) & keep
+                witness_sensors = sorted(set(bucket[witness].detach().cpu().tolist()))
+                result.update(available=True, unavailable_reason=None, positive_witness_sensor_indices=witness_sensors,
+                    values={"normal_net_world_n": net[selected], "pair_normal_force_world_n": matrix[selected],
+                            "other_partner_normal_residual_world_n": net[selected]-matrix[selected, 0],
+                            "counts": counts[selected], "starts_native_buffer": starts[selected],
+                            "raw_sensor_indices": bucket[keep], "raw_native_indices": indices[keep],
+                            "signed_normal_force_n": force[indices][keep], "point_world_m": point[indices][keep],
+                            "normal_world": normal[indices][keep], "separation_m": separation[indices][keep]},
+                    raw_ledger_note="compact active-point ledger: use raw_sensor_indices/raw_native_indices, not native starts to slice compact arrays",
+                    normal_force_semantics="native force on thumb sensor, world frame; net includes all partners, selected matrix only same-env camera; signed Fn and canonical normal preserved",
+                    raw_matrix_reconstruction={"passed": True, "atol_n": 1e-5, "rtol": 1e-4,
+                                               "scope": "observation consistency only; no physical success gate changed"})
+            except Exception as exc:
+                result.update(available=False, values=None, unavailable_reason=type(exc).__name__+": "+str(exc))
+            self._cache_key, self._cache = key, result
+        row = {**self._cache, "sample_phase": phase}
+        if phase == "post_physics_pre_reset" and int(native_step) != self._last_counted_step:
+            if row["available"]:
+                for i in row["positive_witness_sensor_indices"]:
+                    self._positive_post_control_samples[i] += 1
+            self._last_counted_step = int(native_step)
+        row["positive_witness_seen_sensor_indices"] = [i for i, n in enumerate(self._positive_post_control_samples) if n]
+        row["absence_of_selfcollision_certified"] = False
+        return row
+
+
 def preload_contact_ready(torch, metrics, num_envs, device):
     """Contact prerequisites for a guarded probe; this is not load support."""
     ready = torch.ones(num_envs, dtype=torch.bool, device=device)
@@ -835,6 +1069,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     if path.is_file() and path.suffix.lower() in (".usd", ".usda", ".usdc", ".json"):
                         self._compiled_files.append({"path": str(path.relative_to(cache_dir)),
                                                      "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+            if self._control_probe_enabled:
+                self._native_joint_load_diagnostic = NativeJointLoadDiagnostics(
+                    torch, tensor, self.robot.root_view, self.robot.joint_names,
+                    self.robot.body_names, self.num_envs)
+                from isaaclab_physx.physics import PhysxManager
+                self._native_self_pair_diagnostic = NativeSelfPairDiagnostics(
+                    torch, tensor, PhysxManager.get_physics_sim_view(), get_current_stage(),
+                    self._native_self_pair_paths, self.num_envs, self.physics_dt)
             if output:
                 output.mkdir(parents=True, exist_ok=True)
                 if self._control_probe_enabled:
@@ -975,6 +1217,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 if text.startswith("/World/envs/env_0/Robot/") and prim.HasAPI(UsdPhysics.RigidBodyAPI):
                     all_body_entries.append((prim.GetName(), text.replace("/env_0/", "/env_.*/"), True))
             all_body_paths = sensor_body_path_map(all_body_entries, [entry[0] for entry in all_body_entries])
+            if self._control_probe_enabled:
+                self._native_self_pair_paths = [
+                    {"env_id": env_id, "sensor_body": body,
+                     "sensor_path": all_body_paths[body].replace("/env_.*/", "/env_"+str(env_id)+"/"),
+                     "filter_path": all_body_paths["right_hand_camera_base_link"].replace("/env_.*/", "/env_"+str(env_id)+"/")}
+                    for env_id in range(self.num_envs)
+                    for body in ("right_hand_thumb_0_link", "right_hand_thumb_1_link")]
             self._cube_filter_body_names, self._cube_other_filter_indices = cube_contact_partner_layout(all_body_paths, sensor_body_names)
             self._hand_sensors = []
             for body in sensor_body_names if self._contact_crosscheck["enabled"] else ():
@@ -1078,6 +1327,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "event": "control_command", "command_id": self._control_command_id,
                     "native_physics_step_count": int(self.sim.get_physics_step_count()),
                     "episode_id": self._episode_ids, "episode_control_steps": self.episode_length_buf,
+                    "native_joint_load_measurement": self._control_probe_joint_load("pre_command"),
+                    "native_self_pair_measurement": self._control_probe_self_pair("pre_command"),
                     "raw_action": actions, "clipped_action": self._actions,
                     "previous_target_action_rad": previous, "measured_q_action_rad": current,
                     "measured_qd_action_rad_s": tensor(self.robot.data.joint_vel)[:, self._action_ids],
@@ -1511,6 +1762,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "cube_quaternion_xyzw": tensor(self.cube.data.root_quat_w).detach().clone(),
                     "metrics": {name: value.detach().clone() for name, value in self._last_metrics.items()},
                     "unsafe_latched": self._unsafe.detach().clone(),
+                    "native_joint_load_measurement": self._control_probe_joint_load("post_physics_pre_reset"),
+                    "native_self_pair_measurement": self._control_probe_self_pair("post_physics_pre_reset"),
                     "main_lift_authorized": False, "pre_reset": True}
             if self._standalone_video:
                 self._capture_evaluation_frame()
@@ -1787,13 +2040,27 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                    "next_frame_index": self._video_status["frames"],
                    "next_command_id": self._control_command_id+1,
                    "joint_names": list(self.robot.joint_names), "action_joint_names": list(ACTION_JOINT_NAMES),
-                   "action_joint_ids": list(self._action_ids), "main_lift_authorized": False}
+                   "action_joint_ids": list(self._action_ids), "main_lift_authorized": False,
+                   "native_joint_load_readback": self._native_joint_load_diagnostic.readback,
+                   "native_self_pair_readback": self._native_self_pair_diagnostic.summary()}
             self._write_control_probe(row)
             self._write_evaluation_row(row)
             if self._video_manifest:
                 self._video_manifest.write(json.dumps({**row, "profile_name": selected["name"]})+"\n")
                 self._video_manifest.flush()
             return dict(selected)
+
+        def _control_probe_joint_load(self, phase):
+            if not self._control_probe_enabled:
+                raise RLEnvironmentError("joint-load diagnostics require control_probe")
+            return self._native_joint_load_diagnostic.snapshot(
+                self.sim.get_physics_step_count(), self._episode_ids, self.episode_length_buf, phase=phase)
+
+        def _control_probe_self_pair(self, phase):
+            if not self._control_probe_enabled:
+                raise RLEnvironmentError("self-pair diagnostics require control_probe")
+            return self._native_self_pair_diagnostic.snapshot(
+                self.sim.get_physics_step_count(), self._episode_ids, self.episode_length_buf, phase=phase)
 
         def control_diagnostic_state(self):
             """Return measured tensors; calling this never advances or writes physics."""
@@ -1844,7 +2111,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                           all_joint_names=list(self.robot.joint_names),
                           tip_link_order=["thumb_2", "middle_1", "index_1"],
                           control_probe_profile=dict(self._control_probe_profile),
-                          native_physics_step_count=int(self.sim.get_physics_step_count()))
+                          native_physics_step_count=int(self.sim.get_physics_step_count()),
+                          native_joint_load_measurement=self._control_probe_joint_load("current_episode_control_state"),
+                          native_self_pair_measurement=self._control_probe_self_pair("current_episode_control_state"))
             return result
 
         def record_control_probe_transition(self):
@@ -2032,6 +2301,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._control_probe_enabled:
                 audit["policy_contract"]["control_guard_version"] = self._control_probe_profile["control_guard_version"]
                 audit["control_probe_profile"] = dict(self._control_probe_profile)
+                audit["diagnostic_native_joint_load_readback"] = self._native_joint_load_diagnostic.readback
+                audit["diagnostic_native_self_pair_readback"] = self._native_self_pair_diagnostic.summary()
                 audit["diagnostic_legacy_postcheck"] = "exact residuals recorded; source-pinned roundoff-only allowance, meaningful box/height violations latch unsafe"
             return audit
 
@@ -2058,6 +2329,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     **({"control_probe_profile": dict(self._control_probe_profile),
                         "control_command_count": self._control_command_id,
                         "control_transition_count": self._control_transition_recorded,
+                        "native_self_pair_diagnostic": self._native_self_pair_diagnostic.summary(),
                         "control_guard_correction_count": self._control_guard_correction_count,
                         "control_guard_unsafe_count": self._control_guard_unsafe_count,
                         "shield_count_semantics": "legacy applied scalar<1; projected actual target correction nonzero"}

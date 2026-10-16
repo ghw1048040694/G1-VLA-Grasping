@@ -30,9 +30,19 @@ _PROFILES = [
     {"name": "guided_hand_actor_arm", "action_source": "guided_hand_actor_arm", "control_guard_version": "box_halfspace_projected_v2"},
     {"name": "guided_hand_pose_hold", "action_source": "guided_hand_pose_hold", "control_guard_version": "box_halfspace_projected_v2"},
 ]
+_PLANS = {"four_way_v1": ("g1_control_physics_diagnostics_v1", _PROFILES),
+          "geometry_pose_only_v2": ("g1_control_physics_diagnostics_v2", [_PROFILES[3]])}
+_HAND_JOINT_ORDER = ["right_hand_" + x + "_joint" for x in
+    ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1", "middle_0", "middle_1")]
+
 RL_PROBE_DEFAULTS = {
     "enabled": False,
     "backend": "g1_control_physics_diagnostics_v1",
+    "profile_plan": "four_way_v1",
+    "candidate_path": None,
+    "candidate_sha256": "",
+    "candidate_id": "",
+    "guided_target_lead_max_rad": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -87,15 +97,36 @@ def validate_probe_settings(value):
     result.update(copy.deepcopy(value))
     if type(result["enabled"]) is not bool or result["training_allowed"] is not False:
         raise ValueError("Diagnostics enabled must be boolean and training_allowed must be false")
-    for key, expected in (("backend", "g1_control_physics_diagnostics_v1"),
-                          ("num_envs", 8), ("episodes_per_env", 4), ("max_control_steps", 364),
+    plan = result["profile_plan"]
+    if not isinstance(plan, str) or plan not in _PLANS:
+        raise ValueError("Unknown declared diagnostic profile_plan")
+    backend, profiles = _PLANS[plan]
+    if result["backend"] != backend:
+        raise ValueError("Diagnostic backend must match the declared profile_plan")
+    if "profiles" not in value:
+        result["profiles"] = copy.deepcopy(profiles)
+    for key, expected in (("num_envs", 8), ("episodes_per_env", 4), ("max_control_steps", 364),
                           ("optimizer_steps", 0), ("guided_preload_controls", 3),
                           ("guided_probe_height_m", .0025), ("guided_probe_speed_m_s", .002),
                           ("guided_force_relief_step_rad", .005)):
         if result[key] != expected or (type(expected) is int and type(result[key]) is not int):
             raise ValueError("Diagnostic protocol pins " + key)
-    if result["profiles"] != _PROFILES:
-        raise ValueError("Diagnostics require the four declared action/guard profiles in order")
+    if result["profiles"] != profiles:
+        raise ValueError("Diagnostics require exactly the declared profile_plan action/guard profiles in order")
+    lead = result["guided_target_lead_max_rad"]
+    if ((plan == "four_way_v1" and lead is not None) or
+            (plan == "geometry_pose_only_v2" and (type(lead) not in (int, float) or lead != .006))):
+        raise ValueError("Diagnostic plan pins guided_target_lead_max_rad: None forv1, .006 forv2")
+    if plan == "four_way_v1":
+        if (result["candidate_path"] is not None or
+                any(result[key] != "" for key in ("candidate_sha256", "candidate_id"))):
+            raise ValueError("Legacy four_way_v1 cannot silently select a new candidate")
+    else:
+        path = result["candidate_path"]
+        if (not isinstance(path, str) or not path or ".." in path.replace("\\", "/").split("/") or
+                not _is_sha(result["candidate_sha256"]) or
+                not isinstance(result["candidate_id"], str) or not result["candidate_id"].strip()):
+            raise ValueError("geometry_pose_only_v2 requires explicit candidate path/SHA256/ID")
     for key, limit in (("max_wall_time_s", 3600), ("guided_closure_ramp_s", 6)):
         number = result[key]
         if type(number) not in (int, float) or not math.isfinite(number) or not 0 < number <= limit:
@@ -186,6 +217,124 @@ def _current_source_identity():
     return _canonical({str(path.relative_to(root)): _file_hash(path) for path in sorted(root.rglob("*.py"))})
 
 
+
+def _finite_vector(value, length, description):
+    if (not isinstance(value, list) or len(value) != length or
+            any(type(x) not in (int, float) or not math.isfinite(x) for x in value)):
+        raise ValueError(description + " requires finite numbers of the declared dimension")
+    return [float(x) for x in value]
+
+
+def _verify_geometry_candidate(config, settings, policy, reference):
+    """Verify pinned offline evidence; never certify physical contact/support."""
+    if settings["profile_plan"] == "four_way_v1":
+        return None, None
+    path, candidate = _read_pinned(config, settings, "candidate_path", "candidate_sha256")
+    keys = {"schema_version", "candidate_id", "asset_sha256", "oldseed_sha256",
+            "hand_joint_order", "target_rad", "geometry_evidence",
+            "known_geometric_overlaps", "admission_limitations"}
+    if (set(candidate) != keys or type(candidate["schema_version"]) is not int or
+            candidate["schema_version"] != 1 or candidate["candidate_id"] != settings["candidate_id"] or
+            candidate["asset_sha256"] != policy["asset_sha256"] or
+            candidate["oldseed_sha256"] != policy["seed_state_sha256"] or
+            candidate["hand_joint_order"] != _HAND_JOINT_ORDER):
+        raise ValueError("Geometry candidate schema/ID/asset/oldseed/joint order mismatch")
+    if (not isinstance(candidate["known_geometric_overlaps"], list) or
+            not isinstance(candidate["admission_limitations"], list) or not candidate["admission_limitations"]):
+        raise ValueError("Candidate known geometric overlaps and explicit admission limitations must be lists")
+    target = _finite_vector(candidate["target_rad"], 7, "Candidate target_rad")
+    if target != settings["guided_hand_target_rad"]:
+        raise ValueError("Geometry candidate target must exactly equal guided_hand_target_rad")
+    evidence = candidate["geometry_evidence"]
+    expected = {"protocol", "qualification", "units", "hand_joint_limits_rad",
+                "finger_surface_evidence", "source_detail"}
+    if (not isinstance(evidence, dict) or set(evidence) != expected or
+            evidence["protocol"] != "offline_native_usd_grasp_geometry_v1" or
+            evidence["qualification"] != "candidate_only_not_physics_qualified" or
+            evidence["units"] != "m_rad" or not isinstance(evidence["source_detail"], dict) or
+            not evidence["source_detail"]):
+        raise ValueError("Geometry candidate requires declared non-physical offline geometry evidence")
+    # The file is trusted as a pinned audit artifact, not a substitute for the
+    # native body's hard-limit/loaded-contact checks at physical execution.
+    limits = evidence["hand_joint_limits_rad"]
+    if not isinstance(limits, list) or len(limits) != 7:
+        raise ValueError("Candidate geometry requires seven native joint bounds")
+    schema = policy["native_joint_axis_frame_unit_schema"]
+    for i, row in enumerate(limits):
+        low, high = _finite_vector(row, 2, "Candidate native joint bounds")
+        if not low <= target[i] <= high:
+            raise ValueError("Candidate target is outside declared native joint bounds")
+        native = schema.get(_HAND_JOINT_ORDER[i], {})
+        expected_low, expected_high = native.get("lower_limit_degrees"), native.get("upper_limit_degrees")
+        if (type(expected_low) not in (int, float) or type(expected_high) not in (int, float) or
+                not math.isclose(low, math.radians(expected_low), rel_tol=0, abs_tol=1e-7) or
+                not math.isclose(high, math.radians(expected_high), rel_tol=0, abs_tol=1e-7)):
+            raise ValueError("Candidate bounds do not match the pinned native USD joint schema")
+    rows = evidence["finger_surface_evidence"]
+    if not isinstance(rows, dict) or set(rows) != {"thumb", "index", "middle"}:
+        raise ValueError("Candidate needs thumb/index/middle surface evidence")
+    for finger, distal in zip(("thumb", "index", "middle"), ("thumb_2", "index_1", "middle_1")):
+        row = rows[finger]
+        row_keys = {"contact_body", "minimum_distance_to_cube_m", "closest_point_world_m3",
+                    "cube_closest_point_world_m3", "closing_direction_world3", "method"}
+        if (not isinstance(row, dict) or set(row) != row_keys or
+                row["contact_body"] != "right_hand_" + distal + "_link" or
+                not isinstance(row["method"], str) or not row["method"].strip()):
+            raise ValueError("Candidate finger/body/method geometry evidence mismatch")
+        distance = row["minimum_distance_to_cube_m"]
+        if type(distance) not in (int, float) or not math.isfinite(distance) or distance < 0:
+            raise ValueError("Candidate surface distance must be finite nonnegative metres")
+        point = _finite_vector(row["closest_point_world_m3"], 3, "Candidate finger closest point")
+        cube_point = _finite_vector(row["cube_closest_point_world_m3"], 3, "Candidate cube closest point")
+        _finite_vector(row["closing_direction_world3"], 3, "Candidate closing direction")
+        if not math.isclose(math.dist(point, cube_point), distance, rel_tol=0, abs_tol=1e-6):
+            raise ValueError("Candidate surface points and minimum distance are inconsistent")
+    detail = evidence["source_detail"]
+    if (detail.get("no_object_state_change") is not True or
+            _finite_vector(detail.get("palm_offset_xyz_world_m"), 3, "Candidate palm XYZ offset") != [0., 0., 0.] or
+            _finite_vector(detail.get("palm_offset_rpy_world_rad"), 3, "Candidate palm RPY offset") != [0., 0., 0.]):
+        raise ValueError("Candidate must retain object state and zero static palm-pose offset")
+    stages = detail.get("stage_keyframes")
+    if not isinstance(stages, list) or len(stages) != 6:
+        raise ValueError("Candidate must declare exactly six staged keyframes")
+    names, duration = set(), 0.
+    targets = []
+    for index, frame in enumerate(stages):
+        keys = {"name", "target_rad"} if index == 0 else {"name", "target_rad", "duration_s"}
+        if (not isinstance(frame, dict) or set(frame) != keys or not isinstance(frame["name"], str) or
+                not frame["name"].strip() or frame["name"] in names):
+            raise ValueError("Candidate staged keyframe name/schema is invalid")
+        names.add(frame["name"])
+        q = _finite_vector(frame["target_rad"], 7, "Candidate staged target")
+        if any(not low <= angle <= high for angle, (low, high) in zip(q, limits)):
+            raise ValueError("Candidate staged target violates native joint bounds")
+        targets.append(q)
+        if index:
+            seconds = frame["duration_s"]
+            if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+                raise ValueError("Candidate staged durations must be finite positive seconds")
+            duration += seconds
+    source = reference.get("initial_state", {}).get("joint_positions_rad", {})
+    source_hand = [source.get(name) for name in _HAND_JOINT_ORDER]
+    source_hand = _finite_vector(source_hand, 7, "Pinned oldseed hand state")
+    if (stages[0]["name"] != "source" or
+            any(abs(a-b) > 1e-4 for a, b in zip(targets[0], source_hand)) or
+            targets[-1] != target or duration > 6.):
+        raise ValueError("Candidate staged source/final/horizon must match oldseed/target/original6s")
+    try:
+        _canonical(candidate)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Candidate offline geometry evidence must be finite JSON") from exc
+    return path, {"candidate_id": candidate["candidate_id"], "candidate_sha256": settings["candidate_sha256"],
+        "candidate_path": str(path), "schema_and_provenance_verified": True,
+        "geometry_recomputed_by_protocol": False, "physical_qualification": False,
+        "evidence_protocol": evidence["protocol"],
+        "known_geometric_overlaps": copy.deepcopy(candidate["known_geometric_overlaps"]),
+        "admission_limitations": copy.deepcopy(candidate["admission_limitations"]),
+        "self_collision_free_claimed": False, "stage_keyframes": copy.deepcopy(stages),
+        "declared_stage_duration_s": duration, "dynamic_feasibility_verified": False}
+
+
 def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
     """Verify old provenance and, when supplied, the new diagnostic contract.
 
@@ -217,6 +366,7 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
             policy.get("control_period_s") != .066 or len(policy.get("action_joint_names", [])) != 14 or
             len(set(policy.get("action_joint_names", []))) != 14):
         raise ValueError("Source actor observation/action/cadence ABI is invalid")
+    candidate_path, candidate = _verify_geometry_candidate(config, settings, policy, reference)
     semantic_sha = _semantic_training_identity(config)
     if semantic_sha != settings["reference_training_config_sha256"]:
         raise ValueError("Source-policy config/control/expert/asset semantics changed; a diagnostic guard is the only allowed change")
@@ -250,16 +400,21 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
         "current_contract_verified": current_verified,
         "ready_for_physical_probe": settings["enabled"] and metadata_verified and current_verified,
         "source_identical_trained_eval": False, "optimizer_steps": 0, "training_allowed": False,
-        "diagnostic_backend": settings["backend"], "reference_release_sha256": manifest["sha256"],
+        "diagnostic_backend": settings["backend"], "profile_plan": settings["profile_plan"],
+        "declared_profile_names": [row["name"] for row in settings["profiles"]],
+        "four_way_comparison_complete": False,
+        "four_way_comparison_declared": settings["profile_plan"] == "four_way_v1",
+        "candidate_reference": candidate, "reference_release_sha256": manifest["sha256"],
         "reference_source_tree_sha256": source_sha, "reference_training_config_sha256": semantic_sha,
         "reference_policy_contract_sha256": settings["reference_policy_contract_sha256"],
         "reference_checkpoint_sha256": settings["reference_checkpoint_sha256"],
         "current_source_tree_sha256": current_sha, "control_guard_version": guard,
-        "reference_files": [str(manifest_path), str(audit_path), str(checkpoint)],
+        "reference_files": [str(manifest_path), str(audit_path), str(checkpoint)] +
+            ([str(candidate_path)] if candidate_path is not None else []),
         "scope": "frozen actor counterfactual control diagnostics; no new training or original20 acceptance"}
 
 
 def reference_snapshot_files(config):
-    """Return only the three byte-verified source-policy provenance files."""
+    """Return old source-policy provenance plus an explicit v2 candidate file."""
     result = verify_probe_reference(config)
     return list(dict.fromkeys(Path(value) for value in result["reference_files"]))

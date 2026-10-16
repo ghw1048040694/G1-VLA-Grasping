@@ -955,7 +955,7 @@
   },
   "rl_diagnostics": {
     "enabled": true,
-    "backend": "g1_control_physics_diagnostics_v1",
+    "backend": "g1_control_physics_diagnostics_v2",
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -964,34 +964,19 @@
     "training_allowed": false,
     "profiles": [
       {
-        "name": "policy_legacy",
-        "action_source": "frozen_actor",
-        "control_guard_version": "legacy_scalar_v1"
-      },
-      {
-        "name": "policy_projected",
-        "action_source": "frozen_actor",
-        "control_guard_version": "box_halfspace_projected_v2"
-      },
-      {
-        "name": "guided_hand_actor_arm",
-        "action_source": "guided_hand_actor_arm",
-        "control_guard_version": "box_halfspace_projected_v2"
-      },
-      {
         "name": "guided_hand_pose_hold",
         "action_source": "guided_hand_pose_hold",
         "control_guard_version": "box_halfspace_projected_v2"
       }
     ],
     "guided_hand_target_rad": [
-      0.9642170984263198,
-      -0.5631168367763796,
-      -0.0018782195447069785,
-      0.60284897343053,
-      1.3437310354916296,
-      0.30603291059919696,
-      1.1931503252043172
+      0.99,
+      -0.5,
+      -0.01,
+      0.835,
+      1.2266666666666668,
+      0.3433333333333333,
+      1.31
     ],
     "guided_closure_ramp_s": 2.0,
     "guided_preload_controls": 3,
@@ -1007,6 +992,11 @@
     "reference_release_sha256": "9f1d51ff2156d4167ea2e069eab3a4333d37daa6466e0b3e52b68435a47e0c8c",
     "reference_source_tree_sha256": "6708889a39383ef82f084ac2ffb12809f3ef81ad666fd1ba4361e7fc868ef100",
     "reference_training_config_sha256": "673a383cd2491b611d51c8d5cbd06bbda4dda334e735c4b2f6e66b2bf282516b",
-    "reference_policy_contract_sha256": "c2c60bef1a2afb22d6a6d704542e9beb42c2d6b9fe4af6449d66f14699ce0d0b"
+    "reference_policy_contract_sha256": "c2c60bef1a2afb22d6a6d704542e9beb42c2d6b9fe4af6449d66f14699ce0d0b",
+    "profile_plan": "geometry_pose_only_v2",
+    "candidate_path": "resources/rl_geometry_candidates/balanced_thumb_force_limited_v3.json",
+    "candidate_sha256": "09ee1ae234ab143076c514273d1105b1ee3a939cb7c349a5e3a40901a765e81f",
+    "candidate_id": "g1_native_fixed_wrist_balanced_thumb_force_goal_v3",
+    "guided_target_lead_max_rad": 0.006
   }
 }

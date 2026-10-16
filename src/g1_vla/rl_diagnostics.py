@@ -23,10 +23,12 @@ from pathlib import Path
 from .rl_probe_protocol import validate_probe_settings, verify_probe_reference
 
 
-DIAGNOSTIC_VERSION = "g1_frozen_actor_opposing_closure_control_v1"
+DIAGNOSTIC_VERSION = "g1_frozen_actor_opposing_closure_control_v2"
 POSE_SERVO = {"position_gain_per_s": 4.0, "orientation_gain_per_s": 2.0,
               "dls_regularizer": 0.02, "position_speed_max_m_s": 0.01,
               "angular_speed_max_rad_s": 0.1,
+              "geometry_path_tracking_position_m": .003,
+              "geometry_path_tracking_orientation_rad": .05,
               "reference": "actual source reset palm pose; only a gated 2.5mm probe may ascend"}
 
 
@@ -85,7 +87,7 @@ def _orientation_error(torch, reference, current):
 class GuidedClosure:
     """A declared diagnostic intervention, not an RL policy or demonstration."""
 
-    def __init__(self, torch, settings, initial_hand, state):
+    def __init__(self, torch, settings, initial_hand, state, candidate=None):
         self.torch = torch
         self.settings = settings
         q = state["q_action_rad"]
@@ -99,6 +101,61 @@ class GuidedClosure:
         self.rotation = state["palm_quaternion_xyzw"].clone()
         self.ready_count = torch.zeros_like(self.ids)
         self.probe = torch.zeros_like(q[:, 0])
+        self.staged = settings.get("profile_plan") == "geometry_pose_only_v2"
+        if self.staged:
+            if candidate is None:
+                raise ValueError("Staged closure requires its verified geometry candidate")
+            frames = candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+            source = torch.as_tensor(frames[0]["target_rad"], dtype=q.dtype, device=q.device)
+            if (not bool(torch.allclose(self.seed_hand, source[None].expand_as(self.seed_hand), atol=1e-4, rtol=0)) or
+                    not bool(torch.allclose(state["q_action_rad"][:, 7:], self.seed_hand, atol=1e-4, rtol=0))):
+                raise ValueError("Staged geometry path source differs from actual reset seed")
+            self.stage_goals = torch.as_tensor([x["target_rad"] for x in frames[1:]], dtype=q.dtype, device=q.device)
+            self.stage_durations = torch.as_tensor([x["duration_s"] for x in frames[1:]], dtype=q.dtype, device=q.device)
+            if (self.stage_goals.shape != (5, 7) or self.stage_durations.shape != (5,) or
+                    not bool(torch.isfinite(self.stage_goals).all()) or
+                    not bool(torch.isfinite(self.stage_durations).all()) or
+                    not bool((self.stage_durations > 0).all()) or
+                    not bool(torch.equal(self.stage_goals[-1], self.goal_hand[0]))):
+                raise ValueError("Staged geometry path dimensions/durations/final target are invalid")
+            if bool(((self.stage_goals[None] < limits[:, None, :, 0]) |
+                     (self.stage_goals[None] > limits[:, None, :, 1])).any()):
+                raise ValueError("Staged geometry path violates native hand limits")
+            self.stage_names = [x["name"] for x in frames[1:]]
+            self.stage_index = torch.zeros_like(self.ids)
+            self.stage_elapsed = torch.zeros_like(q[:, 0])
+            self.stage_start = self.seed_hand.clone()
+
+    def _staged_target(self, state, changed, dt, force_limit, tracking):
+        torch = self.torch
+        if bool(changed.any()) and not bool(torch.allclose(
+                state["q_action_rad"][changed, 7:], self.seed_hand[changed], atol=1e-4, rtol=0)):
+            raise ValueError("Staged episode reset differs from the measured source hand")
+        self.stage_index[changed] = 0
+        self.stage_elapsed[changed] = 0
+        self.stage_start[changed] = self.seed_hand[changed]
+        index = self.stage_index.clone()
+        goal = self.stage_goals[index]
+        duration = self.stage_durations[index]
+        self.stage_elapsed += torch.where(tracking, dt, 0.)
+        fraction = (self.stage_elapsed / duration).clamp(0, 1)
+        smooth = fraction.square() * (3 - 2 * fraction)
+        desired = self.stage_start + (goal - self.stage_start) * smooth[:, None]
+        error = (state["q_action_rad"][:, 7:] - goal).abs().amax(-1)
+        arrived = ((fraction >= 1) & (error <= .01) & tracking &
+                   ~(state["group_normal_force_n"] > force_limit).any(-1))
+        final = index == len(self.stage_names)-1
+        advance = arrived & ~final
+        # Time alone never advances a stage: use measured joints before reset.
+        self.stage_start[advance] = goal[advance]
+        self.stage_index[advance] += 1
+        self.stage_elapsed[advance] = 0
+        evidence = {"closure_stage_index": index, "closure_stage_fraction": fraction,
+            "closure_stage_names": self.stage_names, "stage_goal_hand_rad": goal,
+            "stage_measured_error_max_rad": error, "stage_arrival_tolerance_rad": .01,
+            "closure_paused_for_palm_tracking": ~tracking,
+            "stage_advance_after_this_request": advance, "closure_path_complete": arrived & final}
+        return desired, fraction, evidence
 
     def actions(self, actor_actions, state, action_source, dt, force_limit):
         torch, cfg = self.torch, self.settings
@@ -108,10 +165,21 @@ class GuidedClosure:
         self.rotation[changed] = state["palm_quaternion_xyzw"][changed]
         self.ready_count[changed] = 0
         self.probe[changed] = 0
-        fraction = ((state["episode_control_steps"].to(actor_actions.dtype) + 1) * dt /
-                    cfg["guided_closure_ramp_s"]).clamp(0, 1)
-        smooth = fraction.square() * (3 - 2 * fraction)
-        desired_hand = self.seed_hand + (self.goal_hand - self.seed_hand) * smooth[:, None]
+        stage_evidence = {}
+        if self.staged:
+            position_error = torch.linalg.vector_norm(self.palm-state["palm_position_world_m"], dim=-1)
+            orientation_error = torch.linalg.vector_norm(_orientation_error(
+                torch, self.rotation, state["palm_quaternion_xyzw"]), dim=-1)
+            tracking = ((position_error <= POSE_SERVO["geometry_path_tracking_position_m"]) &
+                        (orientation_error <= POSE_SERVO["geometry_path_tracking_orientation_rad"]))
+            desired_hand, fraction, stage_evidence = self._staged_target(state, changed, dt, force_limit, tracking)
+            stage_evidence.update(actual_palm_reference_position_error_m=position_error,
+                                  actual_palm_reference_orientation_error_rad=orientation_error)
+        else:
+            fraction = ((state["episode_control_steps"].to(actor_actions.dtype) + 1) * dt /
+                        cfg["guided_closure_ramp_s"]).clamp(0, 1)
+            smooth = fraction.square() * (3 - 2 * fraction)
+            desired_hand = self.seed_hand + (self.goal_hand - self.seed_hand) * smooth[:, None]
         targets = state["target_action_rad"]
         per_step = state["per_step_action_rad"]
         direction = torch.sign(self.goal_hand - self.seed_hand)
@@ -123,12 +191,23 @@ class GuidedClosure:
         relieved = torch.where(direction > 0, torch.maximum(relieved, self.seed_hand),
                     torch.where(direction < 0, torch.minimum(relieved, self.seed_hand), targets[:, 7:]))
         desired_hand = torch.where(relief, relieved, desired_hand)
+        planned_hand = desired_hand.clone()
+        lead = cfg.get("guided_target_lead_max_rad")
+        if lead is not None:
+            measured_hand = state["q_action_rad"][:, 7:]
+            desired_hand = torch.maximum(torch.minimum(desired_hand, measured_hand + lead), measured_hand - lead)
         result = actor_actions.clone()
         result[:, 7:] = ((desired_hand - targets[:, 7:]) / per_step[..., 7:]).clamp(-1, 1)
         evidence = {"action_source": action_source, "guided_target_hand_rad": desired_hand,
-                    "force_relief_by_group": overloaded, "closure_fraction": fraction}
+                    "planned_hand_before_tracking_lead_rad": planned_hand,
+                    "guided_target_lead_max_rad": lead,
+                    "guided_request_lead_is_not_applied_target_bound": True,
+                    "tracking_lead_is_not_a_force_bound": True,
+                    "force_relief_by_group": overloaded, "closure_fraction": fraction, **stage_evidence}
         if action_source == "guided_hand_pose_hold":
             ready = state["preload_contact_ready"].bool()
+            if self.staged:
+                ready = ready & stage_evidence["closure_path_complete"]
             self.ready_count = torch.where(ready, self.ready_count + 1, torch.zeros_like(self.ready_count))
             permit = self.ready_count >= cfg["guided_preload_controls"]
             self.probe = torch.where(permit, (self.probe + cfg["guided_probe_speed_m_s"] * dt).clamp(
@@ -151,12 +230,17 @@ class GuidedClosure:
             regular = torch.eye(6, dtype=jac.dtype, device=jac.device)[None] * POSE_SERVO["dls_regularizer"]**2
             velocity = (jac.transpose(1, 2) @ torch.linalg.solve(
                 jac @ jac.transpose(1, 2) + regular, rhs[:, :, None])).squeeze(-1)
-            desired_arm = state["q_action_rad"][:, :7] + velocity * dt
+            # The historical v1 resets the PD target about measured q each
+            # control. v2 integrates the previous applied bounded target so a
+            # static gravity deflection does not erase corrective position error.
+            anchor = targets[:, :7] if self.staged else state["q_action_rad"][:, :7]
+            desired_arm = anchor + velocity * dt
             result[:, :7] = ((desired_arm - targets[:, :7]) / per_step[..., :7]).clamp(-1, 1)
             evidence.update(palm_pose_reference_world_m=goal, palm_rotation_reference_xyzw=self.rotation,
                 preload_contact_ready=ready, preload_control_boundary_count=self.ready_count,
                 probe_offset_m=self.probe, probe_advance_permitted=permit,
                 upward_probe_request_clamped=pause_upward, requested_linear_velocity_world_m_s=linear,
+                arm_target_reference="previous_applied_bounded_target" if self.staged else "measured_q_legacy_v1",
                 preload_is_not_support_qualification=True, servo=dict(POSE_SERVO))
         return result, evidence
 
@@ -177,9 +261,23 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     reference = verify_probe_reference(cfg, checkpoint_infos=saved_infos, current_audit=audit)
     if not reference["ready_for_physical_probe"]:
         raise ValueError("Frozen actor diagnostic bridge did not admit physical execution")
+    if settings.get("profile_plan") == "geometry_pose_only_v2":
+        load = audit.get("diagnostic_native_joint_load_readback", {})
+        pair = audit.get("diagnostic_native_self_pair_readback", {})
+        if (load.get("binding", {}).get("verified") is not True or
+                load.get("native_drive_max_force_nm", {}).get("available") is not True or
+                load.get("native_friction_properties", {}).get("available") is not True or
+                pair.get("available") is not True):
+            raise RuntimeError("Geometry retest requires available native load/readback and explicit self-pair routing before physics")
     before = module_state_sha256(actor, torch)
     initial_hand = [audit["initial_state"]["joint_positions_rad"][name] for name in RIGHT_HAND]
-    guided = GuidedClosure(torch, settings, initial_hand, native.control_diagnostic_state())
+    candidate = None
+    if settings.get("profile_plan") == "geometry_pose_only_v2":
+        payload = Path(settings["candidate_path"]).read_bytes()
+        if hashlib.sha256(payload).hexdigest() != settings["candidate_sha256"]:
+            raise ValueError("Geometry candidate changed after native reference verification")
+        candidate = json.loads(payload)
+    guided = GuidedClosure(torch, settings, initial_hand, native.control_diagnostic_state(), candidate)
     quota = EvaluationQuota(settings["num_envs"], settings["num_envs"] * settings["episodes_per_env"])
     steps = 0
     environment._g1_last_step_audit = _json_safe(native.step_audit())
@@ -239,6 +337,9 @@ def run_native_diagnostics(config, run_dir):
     result = {"diagnostic_version": DIAGNOSTIC_VERSION, "stage": "rl-diagnose", "passed": False,
               "status": "starting", "training_started": False, "optimizer_steps": 0,
               "source_identical_trained_eval": False, "profiles": [],
+              "declared_profile_plan": settings["profile_plan"],
+              "planned_profiles": copy.deepcopy(settings["profiles"]),
+              "four_way_comparison_complete": False,
               "reward_used_as_success": False, "original_focus_or_20_acceptance": False,
               "started_utc": datetime.now(timezone.utc).isoformat(), "settings": settings}
     streams = _new_streams(run_dir)
@@ -290,7 +391,8 @@ def run_native_diagnostics(config, run_dir):
                     "quota_complete": summary["target_completed"], "optimizer_steps": 0}), flush=True)
                 if not summary["target_completed"]:
                     raise RuntimeError("Diagnostic fixed per-offset quota was incomplete")
-        result.update(passed=True, status="completed")
+        result.update(passed=True, status="completed", all_declared_profiles_complete=True,
+                      four_way_comparison_complete=settings["profile_plan"] == "four_way_v1")
     except BaseException as exc:
         result.update(status="failed", failure={"type": type(exc).__name__, "message": str(exc),
                                                   "traceback": traceback.format_exc()})

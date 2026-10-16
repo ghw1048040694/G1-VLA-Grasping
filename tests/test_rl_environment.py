@@ -359,6 +359,8 @@ class ControllerDiagnosticTensorTest(unittest.TestCase):
             sim=SimpleNamespace(get_physics_step_count=lambda: 3003), _targets=q.clone(),
             _last_metrics={"example": metric}, _unsafe=t.tensor([False]), _local_success=t.tensor([False]),
             _standalone_video=False, max_episode_length=91, _control_transition_recorded=0)
+        fake._control_probe_joint_load = lambda phase: {"available": False, "sample_phase": phase}
+        fake._control_probe_self_pair = lambda phase: {"available": False, "sample_phase": phase}
         terminated, truncated = self.method("_get_dones")(fake)
         self.assertFalse(terminated.any())
         self.assertTrue(truncated.all())
@@ -392,6 +394,8 @@ class ControllerDiagnosticTensorTest(unittest.TestCase):
             episode_length_buf=t.tensor([0]), _episode_ids=t.tensor([8]), _grip_locked=t.tensor([False]),
             _unsafe=t.tensor([False]), _probe_overshoot=t.tensor([False]), _control_probe_profile={"name": "test"},
             sim=SimpleNamespace(get_physics_step_count=lambda: 3003))
+        fake._control_probe_joint_load = lambda phase: {"available": False, "sample_phase": phase}
+        fake._control_probe_self_pair = lambda phase: {"available": False, "sample_phase": phase}
         method = self.method("control_diagnostic_state", quat_apply=lambda q, offset: offset,
             quat_mul=lambda first, second: first, offset_point_jacobian=offset_point_jacobian,
             preload_contact_ready=preload_contact_ready, ACTION_JOINT_NAMES=ACTION_JOINT_NAMES,
@@ -607,6 +611,265 @@ class SparseContactReductionTest(unittest.TestCase):
         hand["point_normal"][0, 4, 1] = hand["point_normal"][0, 2, 0]
         hand["point_loaded"][0, 4, 1] = True
         self.assertEqual(_summarize_hand_contacts(torch, hand)["opposition"][0].item(), 1)
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "native load telemetry math requires real Torch")
+class NativeJointLoadDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        from g1_vla.rl_environment import NativeJointLoadDiagnostics
+        self.t = torch
+        self.cls = NativeJointLoadDiagnostics
+        self.joints = ["joint"+str(i) for i in range(43)]
+        self.bodies = ["body"+str(i) for i in range(55)]
+        class View:
+            count = 2
+            shared_metatype = SimpleNamespace(dof_names=self.joints, link_names=self.bodies)
+            def __init__(inner):
+                inner.calls = {}
+                inner.projected = torch.arange(86, dtype=torch.float32).reshape(2, 43)
+                inner.incoming = torch.arange(660, dtype=torch.float32).reshape(2, 55, 6)
+            def call(inner, name, value):
+                inner.calls[name] = inner.calls.get(name, 0)+1
+                return value
+            def get_dof_max_forces(inner):
+                return inner.call("max", torch.full((2, 43), 1.4))
+            def get_dof_friction_properties(inner):
+                return inner.call("friction", torch.tensor([0., 0., .02]).expand(2, 43, 3))
+            def get_dof_projected_joint_forces(inner):
+                return inner.call("projected", inner.projected)
+            def get_link_incoming_joint_force(inner):
+                return inner.call("incoming", inner.incoming)
+        self.view = View()
+        self.diag = self.cls(torch, lambda x: x, self.view, self.joints, self.bodies, 2)
+
+    def snapshot(self, controls=(1, 1)):
+        return self.diag.snapshot(33, self.t.tensor([7, 8]), self.t.tensor(controls), phase="post_physics_pre_reset")
+
+    def test_native_property_readback_once_with_exact_binding_and_friction_order(self):
+        self.snapshot(); self.snapshot()
+        self.assertEqual(self.view.calls["max"], 1)
+        self.assertEqual(self.view.calls["friction"], 1)
+        self.assertEqual(self.diag.readback["binding"]["joint_names"], self.joints)
+        self.assertEqual(self.diag.readback["friction_last_dimension"],
+            ["static_friction_effort_nm", "dynamic_friction_effort_nm", "viscous_friction_coefficient_nm_s_rad"])
+
+    def test_reset_stale_rows_are_excluded_not_zeroed(self):
+        row = self.snapshot((0, 4))
+        self.assertEqual(row["env_ids"], [1])
+        self.assertEqual(row["invalid_for_current_episode_env_ids"], [0])
+        self.assertTrue(self.t.equal(row["projected_joint_force_nm"]["values"], self.view.projected[1:]))
+        self.assertEqual(row["incoming_joint_wrench_child"]["values"].shape, (1, 55, 6))
+
+    def test_all_reset_boundary_is_unavailable_without_native_reads(self):
+        row = self.snapshot((0, 0))
+        self.assertFalse(row["available"])
+        self.assertIsNone(row["projected_joint_force_nm"]["values"])
+        self.assertNotIn("projected", self.view.calls)
+        self.assertNotIn("incoming", self.view.calls)
+
+    def test_getter_failure_and_nonfinite_channels_export_none(self):
+        def missing(): raise RuntimeError("native channel unsupported")
+        self.view.get_dof_projected_joint_forces = missing
+        self.view.incoming[0, 1, 2] = float("nan")
+        row = self.snapshot()
+        self.assertFalse(row["available"])
+        self.assertIsNone(row["projected_joint_force_nm"]["values"])
+        self.assertIn("unsupported", row["projected_joint_force_nm"]["unavailable_reason"])
+        self.assertIsNone(row["incoming_joint_wrench_child"]["values"])
+        self.assertIn("nonfinite", row["incoming_joint_wrench_child"]["unavailable_reason"])
+
+    def test_shape_failure_and_native_buffer_reuse_are_not_silenced(self):
+        row = self.snapshot()
+        copied = row["projected_joint_force_nm"]["values"].clone()
+        self.view.projected.fill_(-123.)
+        self.assertTrue(self.t.equal(row["projected_joint_force_nm"]["values"], copied))
+        self.view.incoming = self.t.zeros(2, 54, 6)
+        bad = self.snapshot()["incoming_joint_wrench_child"]
+        self.assertFalse(bad["available"])
+        self.assertIsNone(bad["values"])
+        self.assertIn("shape", bad["unavailable_reason"])
+
+    def test_binding_mismatch_cannot_assign_loads_to_declared_names(self):
+        self.view.shared_metatype = SimpleNamespace(dof_names=self.joints[::-1], link_names=self.bodies)
+        diag = self.cls(self.t, lambda x: x, self.view, self.joints, self.bodies, 2)
+        row = diag.snapshot(33, self.t.tensor([7, 8]), self.t.tensor([1, 1]), phase="test")
+        self.assertFalse(diag.readback["binding"]["verified"])
+        self.assertFalse(row["available"])
+        self.assertIsNone(row["projected_joint_force_nm"]["values"])
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "native self-pair helper requires real Torch")
+class NativeSelfPairDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        from g1_vla.rl_environment import NativeSelfPairDiagnostics
+        self.t = torch
+        self.cls = NativeSelfPairDiagnostics
+        self.pairs = [{"env_id": e, "sensor_body": b,
+            "sensor_path": "/World/envs/env_"+str(e)+"/Robot/"+b,
+            "filter_path": "/World/envs/env_"+str(e)+"/Robot/right_hand_camera_base_link"}
+            for e in range(2) for b in ("right_hand_thumb_0_link", "right_hand_thumb_1_link")]
+        class Attr:
+            def __init__(inner, value): inner.value = value
+            def IsValid(inner): return inner.value is not None
+            def Get(inner): return inner.value
+        class Prim:
+            def IsValid(inner): return True
+            def GetAppliedSchemas(inner): return ["PhysicsRigidBodyAPI", "PhysxContactReportAPI"]
+            def GetAttribute(inner, name): return Attr(0.)
+        self.stage = SimpleNamespace(GetPrimAtPath=lambda path: Prim())
+        class View:
+            sensor_count, filter_count, max_contact_data_count = 4, 1, 128
+            sensor_paths = [r["sensor_path"] for r in self.pairs]
+            filter_paths = [[r["filter_path"]] for r in self.pairs]
+            def __init__(inner):
+                inner.calls = 0
+                inner.net = torch.zeros(4, 3)
+                inner.matrix = torch.zeros(4, 1, 3)
+                inner.force, inner.sep = torch.zeros(128), torch.zeros(128)
+                inner.point, inner.normal = torch.zeros(128, 3), torch.zeros(128, 3)
+                inner.counts, inner.starts = torch.zeros(4, 1, dtype=torch.int32), torch.zeros(4, 1, dtype=torch.int32)
+            def get_net_contact_forces(inner, dt): self.assertEqual(dt, .002); return inner.net
+            def get_contact_force_matrix(inner, dt): return inner.matrix
+            def get_contact_data(inner, dt):
+                inner.calls += 1
+                return inner.force, inner.point, inner.normal, inner.sep, inner.counts, inner.starts
+        self.view = View()
+        self.create_calls = []
+        def create(sensors, *, filter_patterns, max_contact_data_count):
+            self.create_calls.append((sensors, filter_patterns, max_contact_data_count))
+            return self.view
+        self.sim = SimpleNamespace(create_rigid_contact_view=create)
+        self.diag = self.cls(torch, lambda x: x, self.sim, self.stage, self.pairs, 2, .002)
+
+    def snapshot(self, controls=(1, 1), phase="post_physics_pre_reset", step=33):
+        return self.diag.snapshot(step, self.t.tensor([7, 8]), self.t.tensor(controls), phase=phase)
+
+    def add_contact(self, sensor=0):
+        self.view.counts[sensor, 0] = 1
+        self.view.force[0], self.view.normal[0, 0], self.view.sep[0] = 2., 1., -.0001
+        self.view.matrix[sensor, 0, 0], self.view.net[sensor, 0] = 2., 3.
+
+    def test_exact_batched_routing_and_no_positive_witness_is_not_absence(self):
+        self.assertEqual(len(self.create_calls), 1)
+        self.assertEqual(self.create_calls[0][0], [r["sensor_path"] for r in self.pairs])
+        self.assertEqual(self.create_calls[0][1], [[r["filter_path"]] for r in self.pairs])
+        row = self.snapshot()
+        self.assertTrue(row["available"])
+        self.assertEqual(row["positive_witness_sensor_indices"], [])
+        self.assertFalse(row["absence_of_selfcollision_certified"])
+        self.assertEqual(self.diag.summary()["self_pair_reporting_status"], "no_positive_witness_yet")
+
+    def test_raw_mapping_positive_witness_and_other_partner_residual(self):
+        self.add_contact()
+        row = self.snapshot()
+        self.assertEqual(row["positive_witness_sensor_indices"], [0])
+        self.assertEqual(row["values"]["raw_sensor_indices"].tolist(), [0])
+        self.assertAlmostEqual(float(row["values"]["other_partner_normal_residual_world_n"][0, 0]), 1.)
+        self.assertEqual(self.diag.summary()["positive_witness_post_control_samples"], [1, 0, 0, 0])
+        self.snapshot(phase="pre_command")
+        self.snapshot()
+        self.assertEqual(self.view.calls, 1)
+        self.assertEqual(self.diag.summary()["positive_witness_post_control_samples"], [1, 0, 0, 0])
+        self.view.force.fill_(-9.)
+        self.assertEqual(row["values"]["signed_normal_force_n"].tolist(), [2.])
+
+    def test_reset_stale_pairs_are_excluded_and_allreset_does_not_read(self):
+        self.add_contact(sensor=0)
+        row = self.snapshot(controls=(0, 1))
+        self.assertEqual(row["sensor_indices"], [2, 3])
+        self.assertEqual(row["positive_witness_sensor_indices"], [])
+        self.assertEqual(row["values"]["raw_sensor_indices"].numel(), 0)
+        calls = self.view.calls
+        cold = self.snapshot(controls=(0, 0))
+        self.assertFalse(cold["available"])
+        self.assertIsNone(cold["values"])
+        self.assertEqual(self.view.calls, calls)
+
+    def test_missing_report_or_censored_threshold_does_not_create_or_set(self):
+        for apis, threshold in ((["PhysicsRigidBodyAPI"], 0.),
+                                (["PhysicsRigidBodyAPI", "PhysxContactReportAPI"], 1.),
+                                (["PhysicsRigidBodyAPI", "PhysxContactReportAPI"], float("nan"))):
+            attr = SimpleNamespace(IsValid=lambda: True, Get=lambda: threshold)
+            prim = SimpleNamespace(IsValid=lambda: True, GetAppliedSchemas=lambda: apis, GetAttribute=lambda _: attr)
+            stage = SimpleNamespace(GetPrimAtPath=lambda _: prim)
+            calls = len(self.create_calls)
+            diag = self.cls(self.t, lambda x: x, self.sim, stage, self.pairs, 2, .002)
+            self.assertFalse(diag.readback["available"])
+            json.dumps(diag.summary(), allow_nan=False)
+            self.assertEqual(len(self.create_calls), calls)
+            self.assertIsNone(diag.snapshot(33, self.t.tensor([7,8]), self.t.tensor([1,1]), phase="test")["values"])
+
+    def test_binding_mismatch_and_raw_overflow_are_missing_not_zero(self):
+        self.view.filter_paths = self.view.filter_paths[::-1]
+        bad = self.cls(self.t, lambda x: x, self.sim, self.stage, self.pairs, 2, .002)
+        self.assertFalse(bad.readback["available"])
+        self.view.counts[0, 0] = 128
+        row = self.snapshot()
+        self.assertFalse(row["available"])
+        self.assertIsNone(row["values"])
+        self.assertIn("saturated", row["unavailable_reason"])
+
+    def test_nonfinite_active_or_bad_reconstruction_never_creates_witness(self):
+        self.add_contact()
+        self.view.matrix[0, 0, 0] = 4.
+        row = self.snapshot()
+        self.assertFalse(row["available"])
+        self.assertEqual(row["positive_witness_sensor_indices"], [])
+        self.view.matrix[0, 0, 0] = 2.
+        self.view.force[0] = float("nan")
+        row = self.snapshot(step=66)
+        self.assertFalse(row["available"])
+        self.assertIn("nonfinite", row["unavailable_reason"])
+
+
+    def test_exact8env_16_unique_sensors_share_one_batched_view(self):
+        pairs = [{"env_id": e, "sensor_body": b,
+            "sensor_path": "/World/envs/env_"+str(e)+"/Robot/"+b,
+            "filter_path": "/World/envs/env_"+str(e)+"/Robot/right_hand_camera_base_link"}
+            for e in range(8) for b in ("right_hand_thumb_0_link", "right_hand_thumb_1_link")]
+        self.view.sensor_count, self.view.max_contact_data_count = 16, 512
+        self.view.sensor_paths = [r["sensor_path"] for r in pairs]
+        self.view.filter_paths = [[r["filter_path"]] for r in pairs]
+        calls = len(self.create_calls)
+        diag = self.cls(self.t, lambda x: x, self.sim, self.stage, pairs, 8, .002)
+        self.assertTrue(diag.readback["available"])
+        self.assertEqual(len(self.create_calls)-calls, 1)
+        self.assertEqual(len(set(self.create_calls[-1][0])), 16)
+        self.assertEqual(self.create_calls[-1][2], 512)
+
+    def test_nonfinite_reset_stale_rows_do_not_poison_valid_episode_pairs(self):
+        self.add_contact(sensor=0)
+        self.view.force[0] = float("nan")
+        self.view.matrix[0, 0, 0] = float("nan")
+        self.view.net[0, 0] = float("nan")
+        row = self.snapshot(controls=(0, 1))
+        self.assertTrue(row["available"])
+        self.assertEqual(row["sensor_indices"], [2, 3])
+        self.assertEqual(row["values"]["raw_native_indices"].numel(), 0)
+
+
+    def test_native_uint32_indices_and_column_force_layout(self):
+        self.add_contact()
+        self.view.counts = self.t.tensor([[1], [0], [0], [0]], dtype=self.t.uint32)
+        self.view.starts = self.t.tensor([[0], [4294967295], [4294967295], [4294967295]], dtype=self.t.uint32)
+        self.view.force = self.view.force[:, None]
+        self.view.sep = self.view.sep[:, None]
+        row = self.snapshot()
+        self.assertTrue(row["available"], row.get("unavailable_reason"))
+        self.assertEqual(row["positive_witness_sensor_indices"], [0])
+        self.assertEqual(row["values"]["counts"].dtype, self.t.int64)
+        self.assertEqual(row["values"]["starts_native_buffer"].dtype, self.t.int64)
+        self.assertEqual(row["values"]["signed_normal_force_n"].tolist(), [2.])
+
+    def test_float_indices_are_rejected_even_with_integer_values(self):
+        self.add_contact()
+        self.view.counts = self.view.counts.float()
+        row = self.snapshot()
+        self.assertFalse(row["available"])
+        self.assertIsNone(row["values"])
+        self.assertIn("integer", row["unavailable_reason"])
 
 
 if __name__ == "__main__":

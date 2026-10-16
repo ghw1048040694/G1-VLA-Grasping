@@ -848,7 +848,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _PATH_FIELDS = {
-    "rl_diagnostics": ("reference_manifest_path", "reference_environment_audit_path", "reference_checkpoint_path"),
+    "rl_diagnostics": ("reference_manifest_path", "reference_environment_audit_path", "reference_checkpoint_path", "candidate_path"),
     "rl_teacher": ("asset_path", "seed_state_path", "asset_manifest_path", "checkpoint_path"),
     "scene": ("asset_path",), "action": ("joint_metadata_path",),
     "data": ("registry_path", "build_dir"),

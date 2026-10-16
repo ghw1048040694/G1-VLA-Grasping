@@ -3,6 +3,7 @@
 import copy
 from contextlib import contextmanager
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -212,6 +213,206 @@ class ProbeReferenceTests(unittest.TestCase):
             current["policy_contract_sha256"] = "f" * 64
             with self.assertRaisesRegex(ValueError, "digest"):
                 probe.verify_probe_reference(config, infos, current)
+
+
+
+def geometry_fixture(config, infos, current, pins):
+    """Synthetic offline audit evidence, never real geometry qualification."""
+    policy = infos["policy_contract"]
+    for name in probe._HAND_JOINT_ORDER:
+        policy["native_joint_axis_frame_unit_schema"][name] = {
+            "lower_limit_degrees": -90., "upper_limit_degrees": 90.}
+    policy_sha = probe._canonical(policy)
+    audit = Path(config["rl_diagnostics"]["reference_environment_audit_path"])
+    audit.write_text(json.dumps({"policy_contract": policy, "policy_contract_sha256": policy_sha,
+        "initial_state": {"joint_positions_rad": {name: 0. for name in probe._HAND_JOINT_ORDER}}}))
+    pins["reference_policy_contract_sha256"] = policy_sha
+    pins["reference_environment_audit_sha256"] = probe._file_hash(audit)
+    config["rl_diagnostics"].update(pins)
+    infos["policy_contract_sha256"] = policy_sha
+    actual = copy.deepcopy(policy)
+    actual["control_guard_version"] = "box_halfspace_projected_v2"
+    current.update(policy_contract=actual, policy_contract_sha256=probe._canonical(actual))
+    evidence = {"protocol": "offline_native_usd_grasp_geometry_v1",
+        "qualification": "candidate_only_not_physics_qualified", "units": "m_rad",
+        "hand_joint_limits_rad": [[-math.pi/2, math.pi/2] for _ in range(7)],
+        "source_detail": {"method": "synthetic unit fixture only"},
+        "finger_surface_evidence": {}}
+    for finger, distal in (("thumb", "thumb_2"), ("index", "index_1"), ("middle", "middle_1")):
+        evidence["finger_surface_evidence"][finger] = {
+            "contact_body": "right_hand_" + distal + "_link",
+            "minimum_distance_to_cube_m": .0001, "closest_point_world_m3": [0., 0., 0.],
+            "cube_closest_point_world_m3": [.0001, 0., 0.], "closing_direction_world3": [0., 1., 0.],
+            "method": "synthetic separated closest surfaces"}
+    evidence["source_detail"].update(no_object_state_change=True, palm_offset_xyz_world_m=[0.]*3,
+        palm_offset_rpy_world_rad=[0.]*3, stage_keyframes=[{"name": "source", "target_rad": [0.]*7}] +
+        [{"name": "stage"+str(i), "target_rad": [0.]*7, "duration_s": .4} for i in range(5)])
+    candidate = {"schema_version": 1, "candidate_id": "synthetic_candidate_001",
+        "asset_sha256": policy["asset_sha256"], "oldseed_sha256": policy["seed_state_sha256"],
+        "hand_joint_order": list(probe._HAND_JOINT_ORDER), "target_rad": [0.] * 7,
+        "geometry_evidence": evidence,
+        "known_geometric_overlaps": [{"pair": ["camera", "thumb0"], "scope": "authored hull overlap only"}],
+        "admission_limitations": ["Synthetic candidate only; no real contact qualification"]}
+    path = audit.parent / "candidate.json"
+    settings = config["rl_diagnostics"]
+    settings.update(backend="g1_control_physics_diagnostics_v2", profile_plan="geometry_pose_only_v2",
+                    candidate_id=candidate["candidate_id"], candidate_path=str(path), guided_target_lead_max_rad=.006)
+    def save():
+        path.write_text(json.dumps(candidate))
+        settings["candidate_sha256"] = probe._file_hash(path)
+    save()
+    return candidate, path, save
+
+
+class GeometryPlanTests(unittest.TestCase):
+    def test_v1_implicit_plan_remains_four_way_and_v2_is_an_explicit_single_plan(self):
+        first = probe.validate_probe_settings({})
+        self.assertEqual(first["profile_plan"], "four_way_v1")
+        self.assertEqual(len(first["profiles"]), 4)
+        with self.assertRaisesRegex(ValueError, "backend"):
+            probe.validate_probe_settings({"profile_plan": "geometry_pose_only_v2"})
+        with self.assertRaises(ValueError):
+            probe.validate_probe_settings({"profile_plan": "unknown_subset"})
+        with fixture() as (config, infos, current, _, pins):
+            geometry_fixture(config, infos, current, pins)
+            cfg = probe.validate_probe_settings(config["rl_diagnostics"])
+            self.assertEqual(cfg["profiles"], [first["profiles"][3]])
+            for replacement in ([], first["profiles"], [first["profiles"][2]]):
+                with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                    probe.validate_probe_settings({**config["rl_diagnostics"], "profiles": replacement})
+
+    def test_v2_snapshot_adds_only_verified_candidate_and_never_forges_four_way_or_physics(self):
+        with fixture() as (config, infos, current, _, pins):
+            _, path, _ = geometry_fixture(config, infos, current, pins)
+            pre = probe.verify_probe_reference(config)
+            self.assertFalse(pre["ready_for_physical_probe"])
+            result = probe.verify_probe_reference(config, infos, current)
+            self.assertTrue(result["ready_for_physical_probe"])
+            self.assertFalse(result["four_way_comparison_declared"])
+            self.assertFalse(result["four_way_comparison_complete"])
+            self.assertFalse(result["source_identical_trained_eval"])
+            self.assertEqual(result["declared_profile_names"], ["guided_hand_pose_hold"])
+            self.assertFalse(result["candidate_reference"]["geometry_recomputed_by_protocol"])
+            self.assertFalse(result["candidate_reference"]["physical_qualification"])
+            self.assertFalse(result["candidate_reference"]["self_collision_free_claimed"])
+            self.assertTrue(result["candidate_reference"]["known_geometric_overlaps"])
+            files = probe.reference_snapshot_files(config)
+            self.assertEqual(len(files), 4)
+            self.assertEqual(files[-1], path.resolve())
+
+    def test_candidate_pin_is_rechecked_after_preflight_for_every_native_bridge(self):
+        with fixture() as (config, infos, current, _, pins):
+            _, path, _ = geometry_fixture(config, infos, current, pins)
+            probe.verify_probe_reference(config)
+            path.write_text(path.read_text() + " ")
+            with self.assertRaisesRegex(ValueError, "candidate_sha256"):
+                probe.verify_probe_reference(config, infos, current)
+
+    def test_candidate_identity_and_exact_seven_joint_target_are_checked_even_with_new_hash(self):
+        for key in ("candidate_id", "asset_sha256", "oldseed_sha256", "hand_joint_order", "target_rad", "schema_version"):
+            with self.subTest(key=key), fixture() as (config, infos, current, _, pins):
+                candidate, _, save = geometry_fixture(config, infos, current, pins)
+                if key == "hand_joint_order": candidate[key].reverse()
+                elif key == "target_rad": candidate[key][0] = .1
+                elif key == "schema_version": candidate[key] = True
+                else: candidate[key] = "other"
+                save()
+                with self.assertRaises(ValueError): probe.verify_probe_reference(config, infos, current)
+
+    def test_offline_geometry_evidence_is_not_an_unchecked_boolean(self):
+        for change in ("missing", "qualification", "finite", "method", "points", "bounds", "body"):
+            with self.subTest(change=change), fixture() as (config, infos, current, _, pins):
+                candidate, _, save = geometry_fixture(config, infos, current, pins)
+                e = candidate["geometry_evidence"]
+                if change == "missing": candidate["geometry_evidence"] = {"verified": True}
+                elif change == "qualification": e["qualification"] = "physically_qualified"
+                elif change == "finite": e["source_detail"]["unknown"] = float("nan")
+                elif change == "method": e["finger_surface_evidence"]["thumb"]["method"] = ""
+                elif change == "points": e["finger_surface_evidence"]["thumb"]["cube_closest_point_world_m3"][0] = 1.
+                elif change == "bounds": e["hand_joint_limits_rad"][0] = [-100., 100.]
+                else: e["finger_surface_evidence"]["thumb"]["contact_body"] = "palm"
+                save()
+                with self.assertRaises(ValueError): probe.verify_probe_reference(config, infos, current)
+
+    def test_candidate_stages_pin_seed_targets_bounds_horizon_and_no_object_or_palm_changes(self):
+        for change in ("source", "last", "bound", "count", "duration", "total", "object", "palm", "duplicate"):
+            with self.subTest(change=change), fixture() as (config, infos, current, _, pins):
+                candidate, _, save = geometry_fixture(config, infos, current, pins)
+                d = candidate["geometry_evidence"]["source_detail"]
+                stages = d["stage_keyframes"]
+                if change == "source": stages[0]["target_rad"][0] += .0002
+                elif change == "last": stages[-1]["target_rad"][0] += .0002
+                elif change == "bound": stages[2]["target_rad"][0] = 9.
+                elif change == "count": stages.pop()
+                elif change == "duration": stages[2]["duration_s"] = 0.
+                elif change == "total": stages[2]["duration_s"] = 9.
+                elif change == "object": d["no_object_state_change"] = False
+                elif change == "palm": d["palm_offset_xyz_world_m"][0] = .0001
+                else: stages[2]["name"] = stages[1]["name"]
+                save()
+                with self.assertRaises(ValueError): probe.verify_probe_reference(config)
+
+    def test_v2_cannot_select_legacy_guard_or_change_source_config_contract(self):
+        with fixture() as (config, infos, current, _, pins):
+            geometry_fixture(config, infos, current, pins)
+            current["policy_contract"]["control_guard_version"] = "legacy_scalar_v1"
+            current["policy_contract_sha256"] = probe._canonical(current["policy_contract"])
+            with self.assertRaisesRegex(ValueError, "control_guard_version"):
+                probe.verify_probe_reference(config, infos, current)
+            config["control"]["max_anchor_delta_rad"] = 1.
+            with self.assertRaisesRegex(ValueError, "semantics changed"):
+                probe.verify_probe_reference(config)
+
+    def test_candidate_symlink_and_unknown_json_fields_are_rejected(self):
+        with fixture() as (config, infos, current, _, pins):
+            candidate, path, save = geometry_fixture(config, infos, current, pins)
+            candidate["unrecognized"] = "not approved"
+            save()
+            with self.assertRaises(ValueError): probe.verify_probe_reference(config)
+            candidate.pop("unrecognized"); save()
+            link = path.with_name("candidate_link.json"); link.symlink_to(path)
+            config["rl_diagnostics"]["candidate_path"] = str(link)
+            with self.assertRaisesRegex(ValueError, "regular"):
+                probe.verify_probe_reference(config)
+
+    def test_lead_is_explicit_bounded_and_v1_unchanged(self):
+        with self.assertRaises(ValueError):
+            probe.validate_probe_settings({"guided_target_lead_max_rad": .003})
+        with fixture() as (config, infos, current, _, pins):
+            geometry_fixture(config, infos, current, pins)
+            for lead in (None, .003, .007, float("nan"), True):
+                with self.subTest(lead=lead), self.assertRaises(ValueError):
+                    probe.validate_probe_settings({**config["rl_diagnostics"], "guided_target_lead_max_rad": lead})
+
+    def test_v1_load_config_path_resolution_roundtrips_to_reference_verification(self):
+        from g1_vla import config as project_config
+        template = Path(__file__).resolve().parents[1] / "configs/experiment.json"
+        raw = json.loads(template.read_text())
+        raw.pop("rl_diagnostics", None)
+        with fixture() as (config, infos, current, _, pins):
+            root = Path(config["paths"]["root"])
+            raw["paths"]["root"] = str(root)
+            config_path = root / "full_config.json"
+            config_path.write_text(json.dumps(raw))
+            # Include root's forthcoming pathresolver field without editing it.
+            path_fields = copy.deepcopy(project_config._PATH_FIELDS)
+            path_fields["rl_diagnostics"] += ("candidate_path",)
+            with mock.patch.object(project_config, "_PATH_FIELDS", path_fields), \
+                    mock.patch.object(project_config, "RL_PROBE_DEFAULTS", {**probe.RL_PROBE_DEFAULTS, **pins}):
+                loaded = project_config.load_config(config_path)
+            self.assertIsNone(loaded["rl_diagnostics"]["candidate_path"])
+            probe.validate_probe_settings(loaded["rl_diagnostics"])
+            # Preserve resolved defaults, then restore this fixture's pinned
+            # reference identities and explicit guided target for admission.
+            resolved = loaded["rl_diagnostics"]
+            resolved.update(config["rl_diagnostics"])
+            config["rl_diagnostics"] = resolved
+            self.assertTrue(probe.verify_probe_reference(config, infos, current)["ready_for_physical_probe"])
+
+    def test_v1_never_ignores_a_new_geometry_candidate(self):
+        for key in ("candidate_path", "candidate_sha256", "candidate_id"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                probe.validate_probe_settings({key: "unexpected"})
 
 
 if __name__ == "__main__":
