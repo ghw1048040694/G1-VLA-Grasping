@@ -18,6 +18,7 @@ from .contracts import canonical_sha256, read_joint_order
 
 ENVIRONMENT_VERSION = "g1_physx_official_precontact_rl_v2"
 CONTACT_COLLECTION_VERSION = "cube_partner_once_v3"
+SUPPORT_GATE_VERSION = "physx_complete_partner_manifold_actual_contact_v4"
 CONTACT_CROSSCHECK = {"num_envs": 1, "physics_samples": 33, "minimum_nonzero_contact_samples": 1,
                       "force_atol_n": 1e-5, "force_rtol": 1e-4,
                       "position_atol_m": 1e-6, "normal_atol": 1e-5}
@@ -342,19 +343,26 @@ def _reduce_friction_pairs(torch, forces, points, counts, starts):
     selected_force, selected_points = forces[indices], points[indices]
     if not bool(torch.isfinite(torch.cat((selected_force.flatten(), selected_points.flatten()))).all()):
         raise FloatingPointError("nonfinite native friction force/position")
+    if bool(counts.sum() >= forces.shape[0]):
+        raise RLEnvironmentError("saturated friction buffer cannot certify complete patch data")
     result = torch.zeros(counts.numel(), 3, dtype=forces.dtype, device=forces.device)
     result.index_add_(0, bucket, selected_force)
+    nonzero_patch_count = torch.zeros(counts.numel(), dtype=torch.int64, device=forces.device)
+    nonzero_patch_count.scatter_add_(0, bucket, selected_force.ne(0).any(-1).long())
     return result.reshape(*counts.shape, 3), {"bucket": bucket, "indices": indices,
                                              "force": selected_force, "point": selected_points,
-                                             "counts": counts, "starts": starts}
+                                             "counts": counts, "starts": starts,
+                                             "nonzero_patch_count": nonzero_patch_count.reshape(counts.shape)}
 
 
 def _reduce_contact_pairs(torch, *, normal, friction, net_normal, force, points, normals,
-                          separation, counts, starts, hand_indices, force_threshold, hand_inverse=None):
+                          separation, counts, starts, hand_indices, force_threshold, hand_inverse=None,
+                          object_up_world=None, friction_nonzero_patch_count=None):
     """One sparse GPU reduction for every Cube partner, plus all eight hands.
 
-    The result's hand vectors/normals act on the hand; Cube raw positions,
-    separations, scalar normal forces and counts retain their native values.
+    Aggregate hand vectors act on the hand. Native point normals are shared
+    canonical directions between reversed views, while their signed scalar
+    forces reverse. Cube raw positions, separations and counts stay unchanged.
     No view ordering is assumed: hand_indices explicitly maps named bodies.
     """
     num_envs, width = counts.shape
@@ -365,16 +373,30 @@ def _reduce_contact_pairs(torch, *, normal, friction, net_normal, force, points,
                                    (normal, friction, net_normal, raw_force, raw_normals, raw_separation, raw_points)))
     if not bool(torch.isfinite(finite_values).all()):
         raise FloatingPointError("nonfinite native cube partner contact stream")
+    if bool((counts.sum() >= force.numel()) | (counts.sum(-1) >= 256).any()):
+        raise RLEnvironmentError("saturated normal contact buffer cannot certify a complete partner manifold")
     fn = torch.zeros(num_envs*width, dtype=normal.dtype, device=normal.device)
     depth, vertical = torch.zeros_like(fn), torch.zeros_like(fn)
     physically_loaded = torch.zeros(num_envs*width, dtype=torch.int64, device=normal.device)
+    positive_gap = torch.zeros_like(physically_loaded)
+    positive_gap_force = torch.zeros_like(physically_loaded)
     fn.scatter_add_(0, bucket, raw_force.abs())
     depth.scatter_reduce_(0, bucket, (-raw_separation).clamp_min(0), reduce="amax", include_self=True)
-    loaded = raw_force.abs() > force_threshold
-    vertical.scatter_reduce_(0, bucket, torch.where(loaded, raw_normals[:, 2].abs(), 0), reduce="amax", include_self=True)
-    physically_loaded.scatter_add_(0, bucket, ((raw_force.abs() > 0) & (raw_separation <= 0)).long())
-    fn, depth, vertical, physically_loaded = (value.reshape(num_envs, width)
-                                            for value in (fn, depth, vertical, physically_loaded))
+    physical_point = (raw_force.abs() > 0) & (raw_separation <= 0)
+    loaded = (raw_force.abs() > force_threshold) & physical_point
+    owners = torch.div(bucket, width, rounding_mode="floor")
+    side_up = raw_normals[:, 2].abs()
+    if object_up_world is not None:
+        if not bool(torch.isfinite(object_up_world).all()):
+            raise FloatingPointError("nonfinite actual cube up direction")
+        side_up = torch.maximum(side_up, (raw_normals*object_up_world[owners]).sum(-1).abs())
+    vertical.scatter_reduce_(0, bucket, torch.where(physical_point, side_up, 0), reduce="amax", include_self=True)
+    physically_loaded.scatter_add_(0, bucket, physical_point.long())
+    positive_gap.scatter_add_(0, bucket, (raw_separation > 0).long())
+    positive_gap_force.scatter_add_(0, bucket, ((raw_force.abs() > 0) & (raw_separation > 0)).long())
+    fn, depth, vertical, physically_loaded, positive_gap, positive_gap_force = (
+        value.reshape(num_envs, width) for value in
+        (fn, depth, vertical, physically_loaded, positive_gap, positive_gap_force))
     if not hasattr(hand_indices, "device") and len(set(hand_indices)) != 8:
         raise RLEnvironmentError("eight distinct named hand partners are required")
     hand_indices = torch.as_tensor(hand_indices, device=normal.device, dtype=torch.int64)
@@ -388,7 +410,7 @@ def _reduce_contact_pairs(torch, *, normal, friction, net_normal, force, points,
         inverse[hand_indices] = torch.arange(8, device=normal.device)
     hand_id = inverse[bucket % width]
     selected = hand_id >= 0
-    owner = torch.div(bucket[selected], width, rounding_mode="floor")
+    owner = owners[selected]
     hand_id, hand_local = hand_id[selected], local[selected]
     padded_normal = torch.zeros(num_envs, 8, 32, 3, device=normal.device, dtype=normal.dtype)
     padded_point = torch.zeros_like(padded_normal)
@@ -396,10 +418,10 @@ def _reduce_contact_pairs(torch, *, normal, friction, net_normal, force, points,
     padded_force = torch.zeros_like(padded_separation)
     padded_valid = torch.zeros_like(padded_separation, dtype=torch.bool)
     padded_loaded = torch.zeros_like(padded_valid)
-    padded_normal[owner, hand_id, hand_local] = -raw_normals[selected]
+    padded_normal[owner, hand_id, hand_local] = raw_normals[selected]
     padded_point[owner, hand_id, hand_local] = raw_points[selected]
     padded_separation[owner, hand_id, hand_local] = raw_separation[selected]
-    padded_force[owner, hand_id, hand_local] = raw_force[selected]
+    padded_force[owner, hand_id, hand_local] = -raw_force[selected]
     padded_valid[owner, hand_id, hand_local] = True
     padded_loaded[owner, hand_id, hand_local] = loaded[selected]
     hand = {"normal": -normal[:, hand_indices], "friction": -friction[:, hand_indices],
@@ -407,6 +429,13 @@ def _reduce_contact_pairs(torch, *, normal, friction, net_normal, force, points,
             "physical_loaded_count": physically_loaded[:, hand_indices],
             "point_normal": padded_normal, "point_loaded": padded_loaded, "point_valid": padded_valid,
             "point": padded_point, "separation": padded_separation, "point_force": padded_force}
+    if friction_nonzero_patch_count is None:
+        if bool(friction.ne(0).any()):
+            raise RLEnvironmentError("nonzero friction needs explicit raw patch counts for manifold certification")
+        friction_nonzero_patch_count = torch.zeros_like(counts)
+    hand.update(raw_point_count=counts[:, hand_indices], positive_gap_point_count=positive_gap[:, hand_indices],
+                positive_gap_force_count=positive_gap_force[:, hand_indices],
+                friction_nonzero_patch_count=friction_nonzero_patch_count[:, hand_indices])
     return {"normal": normal, "friction": friction, "fn": fn, "depth": depth,
             "physical_loaded_count": physically_loaded, "hand": hand,
             "unfiltered_normal_residual_n": torch.linalg.vector_norm(net_normal-normal.sum(dim=1), dim=-1),
@@ -418,6 +447,13 @@ def _summarize_hand_contacts(torch, hand):
     """Apply the unchanged per-finger/group and raw distal-normal definitions."""
     fn = hand["fn"]
     groups = torch.stack((fn[:, :3].sum(dim=1), fn[:, 3:5].sum(dim=1), fn[:, 5:7].sum(dim=1)), dim=-1)
+    physical = hand["physical_loaded_count"]
+    group_physical = torch.stack((physical[:, :3].sum(dim=1), physical[:, 3:5].sum(dim=1),
+                                  physical[:, 5:7].sum(dim=1)), dim=-1)
+    no_positive_gap_load = (hand["positive_gap_force_count"] == 0).all(-1)
+    friction_active = hand["friction_nonzero_patch_count"] > 0
+    friction_manifold = ((~friction_active) | ((hand["raw_point_count"] > 0) &
+                                              (hand["positive_gap_point_count"] == 0))).all(-1)
     distal_normal, distal_loaded = hand["point_normal"][:, (2, 4, 6)], hand["point_loaded"][:, (2, 4, 6)]
     dots = torch.einsum("nki,ngli->ngkl", distal_normal[:, 0], distal_normal[:, 1:])
     valid = distal_loaded[:, 0, None, :, None] & distal_loaded[:, 1:, None, :]
@@ -425,8 +461,9 @@ def _summarize_hand_contacts(torch, hand):
     opposition = torch.where(valid.any(dim=(-1, -2)), values, torch.ones_like(values)).amax(dim=-1)
     return {"normal_sum": -hand["normal"].sum(dim=1),
             "total_sum": -(hand["normal"]+hand["friction"]).sum(dim=1),
-            "groups": groups, "depth": hand["depth"].amax(dim=1),
-            "normal_vertical": torch.where(fn > 0.02, hand["vertical"], 0).amax(dim=1),
+            "groups": groups, "group_physical_loaded_count": group_physical, "depth": hand["depth"].amax(dim=1),
+            "no_positive_gap_hand_load": no_positive_gap_load, "friction_manifold_certified": friction_manifold,
+            "normal_vertical": hand["vertical"].amax(dim=1),
             "opposition": opposition}
 
 
@@ -889,10 +926,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self.robot.set_joint_position_target_index(target=self._targets)
             self._pending_physics_sample = True
 
-        def _contact_values(self, sensor, filter_index=0):
+        def _contact_values(self, sensor, object_up_world, filter_index=0):
             data = sensor.data
             normal = tensor(data.force_matrix_w).reshape(self.num_envs, -1, 3)[:, filter_index]
             friction = tensor(data.friction_forces_w).reshape(self.num_envs, -1, 3)[:, filter_index]
+            friction_force, friction_points, friction_counts, friction_starts = sensor.contact_view.get_friction_data(dt=self.physics_dt)
+            _, friction_raw = _reduce_friction_pairs(
+                torch, tensor(friction_force).reshape(-1, 3), tensor(friction_points).reshape(-1, 3),
+                tensor(friction_counts).reshape(self.num_envs, -1), tensor(friction_starts).reshape(self.num_envs, -1))
             force, points, normals, separation, counts, starts = sensor.contact_view.get_contact_data(dt=self.physics_dt)
             force, normals, separation = tensor(force).flatten(), tensor(normals).reshape(-1, 3), tensor(separation).flatten()
             counts, starts = tensor(counts).long().reshape(self.num_envs, -1), tensor(starts).long().reshape(self.num_envs, -1)
@@ -924,16 +965,22 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             padded_force = torch.zeros_like(padded_separation)
             padded_valid = torch.zeros(self.num_envs, 32, dtype=torch.bool, device=self.device)
             padded_loaded = torch.zeros(self.num_envs, 32, dtype=torch.bool, device=self.device)
+            positive_gap = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+            positive_gap_force = torch.zeros_like(positive_gap)
             if len(indices):
                 fn.scatter_add_(0, owners, torch.abs(force[indices]))
                 depth.scatter_reduce_(0, owners, torch.clamp(-separation[indices], min=0), reduce="amax", include_self=True)
-                loaded = torch.abs(force[indices]) > settings["group_force_min_n"]
+                loaded = (torch.abs(force[indices]) > settings["group_force_min_n"]) & (separation[indices] <= 0)
                 # Physical external loading uses the source active-contact
                 # definition, separate from the 20 mN finger-side threshold.
                 physically_loaded = (torch.abs(force[indices]) > 0) & (separation[indices] <= 0)
-                vertical.scatter_reduce_(0, owners, torch.where(loaded, torch.abs(normals[indices, 2]), 0.0),
+                side_up = torch.maximum(normals[indices, 2].abs(),
+                                        (normals[indices]*object_up_world[owners]).sum(-1).abs())
+                vertical.scatter_reduce_(0, owners, torch.where(physically_loaded, side_up, 0.0),
                                           reduce="amax", include_self=True)
                 loaded_count.scatter_add_(0, owners, physically_loaded.long())
+                positive_gap.scatter_add_(0, owners, (separation[indices] > 0).long())
+                positive_gap_force.scatter_add_(0, owners, ((force[indices].abs() > 0) & (separation[indices] > 0)).long())
                 local_ids = torch.arange(len(owners), device=self.device)-repeated_offsets
                 padded_normal[owners, local_ids] = normals[indices]
                 padded_point[owners, local_ids] = tensor(points).reshape(-1, 3)[indices]
@@ -957,9 +1004,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "vertical": vertical, "physical_loaded_count": loaded_count,
                     "point_normal": padded_normal, "point_loaded": padded_loaded,
                     "point": padded_point, "separation": padded_separation,
-                    "point_force": padded_force, "point_valid": padded_valid}
+                    "point_force": padded_force, "point_valid": padded_valid,
+                    "raw_point_count": counts, "positive_gap_point_count": positive_gap,
+                    "positive_gap_force_count": positive_gap_force,
+                    "friction_nonzero_patch_count": friction_raw["nonzero_patch_count"][:, filter_index]}
 
-        def _cube_contact_values(self):
+        def _cube_contact_values(self, object_up_world):
             """Read one native view; never trigger ContactSensor.data updates."""
             sensor = self._cube_sensor
             view = sensor.contact_view
@@ -982,6 +1032,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                           force=force, points=points, normals=normals, separation=separation,
                                           counts=counts, starts=starts, hand_indices=self._cube_hand_index_tensor,
                                           hand_inverse=self._cube_hand_inverse,
+                                          object_up_world=object_up_world,
+                                          friction_nonzero_patch_count=friction_raw["nonzero_patch_count"],
                                           force_threshold=settings["group_force_min_n"])
             fn, depth, loaded, raw = result["fn"], result["depth"], result["physical_loaded_count"], result["raw"]
             if self._record:
@@ -1019,7 +1071,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "unfiltered_normal_residual_n": result["unfiltered_normal_residual_n"],
                     "hand": result["hand"]}
 
-        def _crosscheck_hand_views(self, hand):
+        def _crosscheck_hand_views(self, hand, object_up_world):
             audit = self._contact_crosscheck
             if not audit["enabled"] or audit["completed_physics_samples"] >= audit["required_physics_samples"]:
                 return None
@@ -1027,7 +1079,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if not audit["started"] and not has_contact:
                 return None
             audit["started"] = True
-            references = [self._contact_values(sensor) for sensor in self._hand_sensors]
+            references = [self._contact_values(sensor, object_up_world) for sensor in self._hand_sensors]
             reference = {name: torch.stack([item[name] for item in references], dim=1) for name in hand}
             self._crosscheck_current_raw = (hand, reference)
             comparison = _compare_hand_contacts(torch, hand, reference)
@@ -1103,16 +1155,24 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                           (tensor(self.robot.data.joint_pos) <= self._limits[..., 1] + joint_tolerance)).all(dim=-1)
             total_sum = torch.zeros(self.num_envs, 3, device=self.device)
             groups = torch.zeros(self.num_envs, 3, device=self.device)
+            group_physical = torch.zeros(self.num_envs, 3, dtype=torch.int64, device=self.device)
             depth = torch.zeros(self.num_envs, device=self.device)
             normal_vertical = torch.zeros_like(depth)
             opposition = torch.ones(self.num_envs, device=self.device)
+            no_positive_gap_load = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            friction_manifold = torch.zeros_like(no_positive_gap_load)
             reference_summary = None
             contact_available = self._force_unavailable is None
             try:
-                cube_contacts = self._cube_contact_values()
+                x, y, z, w = rotation.unbind(-1)
+                object_up_world = torch.stack((2*(x*z+w*y), 2*(y*z-w*x), 1-2*(x*x+y*y)), dim=-1)
+                cube_contacts = self._cube_contact_values(object_up_world)
                 summary = _summarize_hand_contacts(torch, cube_contacts["hand"])
-                reference_summary = self._crosscheck_hand_views(cube_contacts["hand"])
+                reference_summary = self._crosscheck_hand_views(cube_contacts["hand"], object_up_world)
                 total_sum, groups = summary["total_sum"], summary["groups"]
+                group_physical = summary["group_physical_loaded_count"]
+                no_positive_gap_load = summary["no_positive_gap_hand_load"]
+                friction_manifold = summary["friction_manifold_certified"]
                 depth, normal_vertical = summary["depth"], summary["normal_vertical"]
                 opposition = summary["opposition"]
                 table_fn, table_loaded_count = cube_contacts["table_fn"], cube_contacts["table_loaded_count"]
@@ -1128,7 +1188,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 other_force = torch.full_like(depth, float("inf"))
                 table_loaded_count = torch.ones(self.num_envs, dtype=torch.int64, device=self.device)
                 other_loaded_count = torch.ones_like(table_loaded_count)
-            loaded = (groups > settings["group_force_min_n"]).all(dim=-1)
+            loaded = (groups > settings["group_force_min_n"]).all(dim=-1) & (group_physical > 0).all(dim=-1)
+            loaded &= no_positive_gap_load & friction_manifold
             new_lock = loaded & ~self._grip_locked
             self._grip_reference[new_lock] = relative[new_lock]
             self._grip_rotation[new_lock] = relative_rotation[new_lock]
@@ -1154,7 +1215,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 ref_groups = reference_summary["groups"]
                 ref_depth = torch.maximum(reference_summary["depth"], cube_contacts["maximum_penetration_m"])
                 ref_upward = reference_summary["total_sum"][:, 2]
-                ref_loaded = (ref_groups > settings["group_force_min_n"]).all(dim=-1)
+                ref_physical = reference_summary["group_physical_loaded_count"]
+                ref_loaded = (ref_groups > settings["group_force_min_n"]).all(dim=-1) & (ref_physical > 0).all(dim=-1)
+                ref_loaded &= reference_summary["no_positive_gap_hand_load"] & reference_summary["friction_manifold_certified"]
                 ref_safe = ref_loaded & (ref_groups <= settings["group_force_max_n"]).all(dim=-1)
                 ref_safe &= (ref_depth <= settings["max_penetration_m"])
                 ref_safe &= reference_summary["normal_vertical"] <= settings["max_abs_normal_z"]
@@ -1168,6 +1231,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 ref_support &= self._grip_locked & (drift <= settings["grip_drift_m"])
                 self._check_crosscheck_gates(
                     {"group_loaded": groups > settings["group_force_min_n"],
+                     "no_positive_gap_hand_load": no_positive_gap_load, "friction_manifold_certified": friction_manifold,
+                     "group_physically_loaded": group_physical > 0,
                      "group_force_safe": groups <= settings["group_force_max_n"],
                      "penetration_safe": depth <= settings["max_penetration_m"],
                      "side_normals_safe": normal_vertical <= settings["max_abs_normal_z"],
@@ -1175,6 +1240,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                      "upward_load_min": upward >= 0.8*weight, "upward_load_max": upward <= 1.2*weight,
                      "loaded": loaded, "contact_safe": contact_safe, "support": support},
                     {"group_loaded": ref_groups > settings["group_force_min_n"],
+                     "no_positive_gap_hand_load": reference_summary["no_positive_gap_hand_load"],
+                     "friction_manifold_certified": reference_summary["friction_manifold_certified"],
+                     "group_physically_loaded": ref_physical > 0,
                      "group_force_safe": ref_groups <= settings["group_force_max_n"],
                      "penetration_safe": ref_depth <= settings["max_penetration_m"],
                      "side_normals_safe": reference_summary["normal_vertical"] <= settings["max_abs_normal_z"],
@@ -1202,6 +1270,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                   "no_loaded_table_contact": table_loaded_count == 0,
                                   "no_other_loaded_external_contact": other_loaded_count == 0,
                                   "group_normal_force_n": groups, "maximum_penetration_m": depth,
+                                  "group_physical_loaded_contact_count": group_physical,
+                                  "required_groups_physically_loaded": (group_physical > 0).all(dim=-1),
+                                  "no_positive_gap_hand_load": no_positive_gap_load,
+                                  "friction_partner_manifold_certified": friction_manifold,
                                   "maximum_abs_normal_z": normal_vertical, "opposition_dot": opposition,
                                   "finite": finite, "joint_safe": joint_safe, "contact_safe": contact_safe,
                                   "support_current": support, "support_qualified": self._support_qualified,
@@ -1397,6 +1469,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     failure.append("continuous_support_not_qualified")
                 if not episode["local_success"]:
                     failure.append("local_support_window_not_qualified")
+                if not metrics.get("no_positive_gap_hand_load", False):
+                    failure.append("positive_gap_hand_normal_load_or_measurement_unavailable")
+                if not metrics.get("friction_partner_manifold_certified", False):
+                    failure.append("friction_partner_normal_manifold_uncertified")
                 self._outcomes.append({"env_id": index, "episode_id": int(episode["episode_id"]),
                                        "seed": int(self._evaluation_seed if self._eval_mode else train_seed),
                                        "rollout_domain": "physx_precontact_validation" if self._eval_mode else "physx_precontact_training",
@@ -1570,6 +1646,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             return {"environment_version": ENVIRONMENT_VERSION, "settings": dict(settings),
                     "policy_contract": {"environment_version": ENVIRONMENT_VERSION,
                                         "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
+                                        "support_gate_version": SUPPORT_GATE_VERSION,
+                                        "actual_side_contact_definition": "distal opposition uses abs(raw signed Fn)>20mN AND separation<=0; side-normal limit checks max(abs(world-z),abs(cube-local-z)) for every physical Fn>0,separation<=0 point including weaker points; every thumb/index/middle requires a physical loaded point; positive gaps cannot provide opposition or grip lock",
+                                        "aggregate_force_scope": "full forces retained for shaping; qualification and first grip lock forbid every hand nonzero Fn at positive gap; every partner with any nonzero raw friction patch requires a nonempty complete normal manifold with all separations<=0 including zero-Fn points; failure is current qualification false, not sticky API failure; no patch-to-point separation equivalence or MuJoCo efc claim",
+                                        "raw_contact_orientation": "reversed view preserves canonical point normals and negates signed scalar force; aggregate normal/friction vectors negate; Cube raw ledger unchanged",
                                         "cube_raw_contact_capacity_per_env": 256,
                                         "reference_hand_raw_contact_capacity_per_body_per_env": 32,
                                         "contact_measurement_capacity_change": "Cube raw buffer expanded from historical 32 to 256 points per env; measurement capacity only, not a physics setting",

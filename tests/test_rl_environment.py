@@ -260,12 +260,31 @@ class SparseContactReductionTest(unittest.TestCase):
         self.assertEqual(hand["physical_loaded_count"][1, 0].item(), 1)
         self.assertFalse(hand["point_loaded"][1, 0].any())
         self.assertTrue(torch.equal(hand["normal"], -values["normal"][:, values["hand_indices"]]))
-        self.assertEqual(hand["point_normal"][0, 2, 0].tolist(), [-1, 0, 0])
+        self.assertEqual(hand["point_normal"][0, 2, 0].tolist(), [1, 0, 0])
+        self.assertAlmostEqual(hand["point_force"][0, 2, 0].item(), -values["force"][7].item())
         self.assertEqual(hand["point"][0, 2, 0].tolist(), values["points"][7].tolist())
         summary = _summarize_hand_contacts(torch, hand)
         self.assertTrue(torch.allclose(summary["groups"][0], torch.tensor([.1, .2, .3])))
         self.assertEqual(summary["opposition"][0].item(), -1)
         self.assertEqual(summary["opposition"][1].item(), 1)
+
+    def test_reversed_view_keeps_canonical_normals_and_reverses_signed_scalar(self):
+        torch = self.torch
+        values = self.make_contacts()
+        # Recorded native evidence: the Cube and hand share the point normal,
+        # but their scalar forces have opposite signs, including signed zero.
+        values["force"][7] = -.7766782
+        values["normals"][7] = torch.tensor((-.702233, -.711947, -.000703))
+        values["normal"][0, values["hand_indices"][2]] = values["force"][7]*values["normals"][7]
+        values["net_normal"] = values["normal"].sum(1)
+        result = _reduce_contact_pairs(torch, **values)
+        hand = result["hand"]
+        self.assertTrue(torch.equal(hand["point_normal"][0, 2, 0], values["normals"][7]))
+        self.assertAlmostEqual(hand["point_force"][0, 2, 0].item(), .7766782, places=6)
+        reconstructed = (hand["point_force"][..., None]*hand["point_normal"]).sum(2)
+        self.assertTrue(torch.allclose(reconstructed, hand["normal"]))
+        cube_point = result["raw"]["bucket"] == values["hand_indices"][2]
+        self.assertEqual(result["raw"]["force"][cube_point].item(), values["force"][7].item())
 
     def test_friction_counts_and_starts_keep_distinct_semantics_and_copy_alias(self):
         torch = self.torch
@@ -287,6 +306,94 @@ class SparseContactReductionTest(unittest.TestCase):
             _reduce_contact_pairs(torch, **values)
         values = self.make_contacts()
         values["starts"][0, 0] = 32
+        with self.assertRaises(RLEnvironmentError):
+            _reduce_contact_pairs(torch, **values)
+
+    def test_positive_gap_with_large_solver_force_cannot_qualify_as_side_contact(self):
+        torch = self.torch
+        values = self.make_contacts()
+        for slot in (7, 2, 27):
+            values["force"][slot] = .85
+            values["separation"][slot] = .000058
+        hand = _reduce_contact_pairs(torch, **values)["hand"]
+        summary = _summarize_hand_contacts(torch, hand)
+        self.assertTrue((summary["groups"][0] > .02).all())
+        self.assertEqual(summary["group_physical_loaded_count"][0].tolist(), [0, 0, 0])
+        self.assertFalse(hand["point_loaded"][0].any())
+        self.assertEqual(summary["opposition"][0].item(), 1)
+        # Touching exactly at zero gap is a physical contact; a positive gap
+        # is excluded even when PhysX reports a nonzero solver impulse.
+        values["separation"][[7, 2, 27]] = 0
+        summary = _summarize_hand_contacts(torch, _reduce_contact_pairs(torch, **values)["hand"])
+        self.assertEqual(summary["group_physical_loaded_count"][0].tolist(), [1, 1, 1])
+        self.assertEqual(summary["opposition"][0].item(), -1)
+
+    def test_side_normal_limit_includes_physical_points_below_distal_threshold(self):
+        torch = self.torch
+        result = _reduce_contact_pairs(torch, **self.make_contacts())
+        # Env 1 has only 10mN on a near-vertical actual thumb contact.
+        self.assertFalse(result["hand"]["point_loaded"][1].any())
+        self.assertEqual(_summarize_hand_contacts(torch, result["hand"])["normal_vertical"][1].item(), 1)
+
+    def test_side_normal_checks_current_cube_frame_as_well_as_world_frame(self):
+        torch = self.torch
+        values = self.make_contacts()
+        # A horizontal world normal can point through the top of a tilted cube.
+        values["object_up_world"] = torch.tensor([[1., 0, 0], [0, 0, 1.]])
+        summary = _summarize_hand_contacts(torch, _reduce_contact_pairs(torch, **values)["hand"])
+        self.assertEqual(summary["normal_vertical"][0].item(), 1)
+
+    def test_actual_low_force_plus_large_positive_gap_load_is_not_certified(self):
+        torch = self.torch
+        values = self.make_contacts()
+        partner = values["hand_indices"][2]
+        values["counts"][0, partner] = 2
+        values["force"][7], values["force"][8] = .03, .85
+        values["separation"][8], values["normals"][8] = .000058, values["normals"][7]
+        hand = _reduce_contact_pairs(torch, **values)["hand"]
+        summary = _summarize_hand_contacts(torch, hand)
+        self.assertTrue((summary["group_physical_loaded_count"][0] > 0).all())
+        self.assertEqual(summary["opposition"][0].item(), -1)
+        self.assertFalse(summary["no_positive_gap_hand_load"][0])
+
+    def test_friction_partner_needs_nonempty_fully_nonpositive_normal_manifold(self):
+        torch = self.torch
+        values = self.make_contacts()
+        partner = values["hand_indices"][2]
+        patches = torch.zeros_like(values["counts"])
+        patches[0, partner] = 1
+        values["friction_nonzero_patch_count"] = patches
+        summary = _summarize_hand_contacts(torch, _reduce_contact_pairs(torch, **values)["hand"])
+        self.assertTrue(summary["friction_manifold_certified"][0])
+        # Even a zero-Fn positive-gap point prevents certifying a partner
+        # carrying friction; the API provides no separate patch separation.
+        values["counts"][0, partner] = 2
+        values["force"][8], values["separation"][8] = 0, .000058
+        summary = _summarize_hand_contacts(torch, _reduce_contact_pairs(torch, **values)["hand"])
+        self.assertTrue(summary["no_positive_gap_hand_load"][0])
+        self.assertFalse(summary["friction_manifold_certified"][0])
+        values["counts"][0, partner] = 0
+        summary = _summarize_hand_contacts(torch, _reduce_contact_pairs(torch, **values)["hand"])
+        self.assertFalse(summary["friction_manifold_certified"][0])
+
+    def test_cancelling_friction_patches_remain_nonzero_for_certification(self):
+        torch = self.torch
+        forces = torch.tensor([[1., 0, 0], [-1., 0, 0], [0, 0, 0]])
+        aggregate, raw = _reduce_friction_pairs(torch, forces, torch.zeros_like(forces),
+                                               torch.tensor([[2]]), torch.tensor([[0]]))
+        self.assertFalse(aggregate.ne(0).any())
+        self.assertEqual(raw["nonzero_patch_count"].item(), 2)
+
+    def test_saturated_buffers_cannot_certify_complete_manifolds(self):
+        torch = self.torch
+        forces = torch.ones(2, 3)
+        with self.assertRaises(RLEnvironmentError):
+            _reduce_friction_pairs(torch, forces, forces, torch.tensor([[2]]), torch.tensor([[0]]))
+        values = self.make_contacts()
+        values["force"] = values["force"][:28]
+        values["counts"][0, 0] = 28
+        values["starts"][0, 0] = 0
+        values["force"].nan_to_num_(0)
         with self.assertRaises(RLEnvironmentError):
             _reduce_contact_pairs(torch, **values)
 
