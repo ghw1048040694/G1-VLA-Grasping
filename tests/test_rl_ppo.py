@@ -485,7 +485,7 @@ class TorchOptimizerTests(unittest.TestCase):
         after = rl_ppo.parameter_snapshot(module, self.torch)
         self.assertGreater(rl_ppo.parameter_change(before, after, self.torch)["l2"], 0)
 
-    def evaluation_fixture(self, directory, mutate=False):
+    def evaluation_fixture(self, directory, mutate=False, stateful=False):
         torch = self.torch
 
         class Actor(torch.nn.Module):
@@ -516,11 +516,14 @@ class TorchOptimizerTests(unittest.TestCase):
                 self.rows = []
                 self.actions = []
                 self.eval = False
+                self.support_count = torch.zeros(2, dtype=torch.int64)
 
             def set_evaluation_mode(self, enabled, seed=None):
                 self.eval = enabled
 
             def reset(self):
+                if stateful:
+                    self.support_count.zero_()
                 self.resets += 2
 
             def state_hold_actions(self):
@@ -529,9 +532,16 @@ class TorchOptimizerTests(unittest.TestCase):
                 return torch.full((2, 1), 0.25)
 
             def get_observations(self):
-                return Observation(policy=torch.ones(2, 2))
+                policy = ((self.support_count.float() + 1)[:, None].expand(-1, 2)
+                          if stateful else torch.ones(2, 2))
+                return Observation(policy=policy)
 
             def step(self, actions):
+                if stateful:
+                    # Match the simulator's persistent torch.where rebinding;
+                    # the next reset mutates this tensor outside the rollout.
+                    self.support_count = torch.where(torch.ones(2, dtype=torch.bool),
+                        self.support_count + 1, torch.zeros_like(self.support_count))
                 self.actions.append(actions.clone())
                 self.samples += 33
                 self.resets += 2
@@ -556,6 +566,58 @@ class TorchOptimizerTests(unittest.TestCase):
         settings["evaluation"].update(episodes=4, num_envs=2, max_control_steps=10)
         streams = rl_ppo._new_streams(Path(directory))
         return environment, runner, settings, streams
+
+    def test_two_stateful_evaluations_reset_then_real_backward_and_optimizer(self):
+        torch = self.torch
+        with tempfile.TemporaryDirectory() as directory:
+            env, runner, settings, streams = self.evaluation_fixture(directory, stateful=True)
+            guard = None
+            try:
+                for index in range(2):
+                    report = rl_ppo._collect_evaluation(env, runner, settings, streams,
+                        rl_ppo.Deadline(60), torch, update=0, phase=f"stateful_eval_{index}", state_hold=index == 0)
+                    self.assertTrue(report["target_completed"])
+                    self.assertFalse(torch.is_inference(env.support_count))
+                    env.reset()  # Must remain legal outside any no-grad block.
+                runner.alg.actor.train()
+                runner.alg.critic.train()
+                runner.alg.optimizer = torch.optim.Adam(
+                    list(runner.alg.actor.parameters()) + list(runner.alg.critic.parameters()), lr=0.001)
+                guard = rl_ppo.OptimizerAudit(runner.alg, torch, rl_ppo.Deadline(60))
+                actor_before = rl_ppo.parameter_snapshot(runner.alg.actor, torch)
+                critic_before = rl_ppo.parameter_snapshot(runner.alg.critic, torch)
+                observation = env.get_observations()
+                loss = runner.alg.actor(observation).square().mean() + runner.alg.critic(observation["policy"]).square().mean()
+                self.assertTrue(loss.requires_grad)
+                loss.backward()
+                runner.alg.optimizer.step()
+                self.assertEqual(guard.optimizer_steps, 1)
+                self.assertGreater(rl_ppo.parameter_change(actor_before,
+                    rl_ppo.parameter_snapshot(runner.alg.actor, torch), torch)["changed_elements"], 0)
+                self.assertGreater(rl_ppo.parameter_change(critic_before,
+                    rl_ppo.parameter_snapshot(runner.alg.critic, torch), torch)["changed_elements"], 0)
+            finally:
+                if guard is not None:
+                    guard.close()
+                for stream in streams.values():
+                    stream.close()
+
+    def test_old_inference_context_reproduces_persistent_state_reset_failure(self):
+        torch = self.torch
+        with tempfile.TemporaryDirectory() as directory:
+            env, runner, settings, streams = self.evaluation_fixture(directory, stateful=True)
+            try:
+                # Exercise the real evaluation loop with its former context,
+                # rather than asserting source text or synthesizing an error.
+                with mock.patch.object(torch, "no_grad", torch.inference_mode):
+                    rl_ppo._collect_evaluation(env, runner, settings, streams,
+                        rl_ppo.Deadline(60), torch, update=0, phase="old_inference_context")
+                self.assertTrue(torch.is_inference(env.support_count))
+                with self.assertRaisesRegex(RuntimeError, "[Ii]nplace update to inference tensor"):
+                    env.reset()
+            finally:
+                for stream in streams.values():
+                    stream.close()
 
     def test_evaluation_uses_measured_state_hold_requests_and_freezes_normalizer(self):
         with tempfile.TemporaryDirectory() as directory:

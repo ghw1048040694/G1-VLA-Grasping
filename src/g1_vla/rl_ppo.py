@@ -25,7 +25,7 @@ from typing import Any
 
 
 NATIVE_STAGES = frozenset(("rl-audit", "rl-smoke", "rl-train", "rl-eval"))
-RUNNER_VERSION = "g1_rsl5_bounded_ppo_capacity512_v2"
+RUNNER_VERSION = "g1_rsl5_bounded_ppo_capacity512_nograd_v3"
 MAX_PARALLEL_ENVS = 512
 MAX_TRAINING_TRANSITIONS = 6_553_600
 MAX_OPTIMIZER_STEPS = 6_400
@@ -674,7 +674,7 @@ def _collect_evaluation(environment: Any, runner: Any, settings: dict, streams: 
         quota = EvaluationQuota(scored_envs, target)
         exhausted = False
         max_steps = int(settings["evaluation"]["max_control_steps"])
-        with torch.inference_mode():
+        with torch.no_grad():
             while not quota.complete and steps < max_steps:
                 try:
                     deadline.check()
@@ -817,7 +817,7 @@ def _train_impl(environment: Any, settings: dict, run_dir: Path, streams: dict,
             critic_before = parameter_snapshot(runner.alg.critic, torch)
             optimizer_before = guard.optimizer_steps
             started = time.monotonic()
-            with torch.inference_mode():
+            with torch.no_grad():
                 for _ in range(int(settings["ppo"]["rollout_steps"])):
                     deadline.check()
                     actions = runner.alg.act(obs)
@@ -912,7 +912,7 @@ def _smoke(environment: Any, settings: dict, streams: dict, deadline: Deadline,
     if memory_profile is not None:
         memory_profile.update(control_steps=0, environment_transitions=0, initial_step_audit=initial,
                               planned_control_steps=steps)
-    with torch.inference_mode():
+    with torch.no_grad():
         for step in range(steps):
             deadline.check()
             if step < steps // 2:
