@@ -23,6 +23,7 @@ from g1_vla.rl_environment import (
     migration_pose_errors,
     policy_velocity_limits,
     resolve_settings,
+    sensor_body_path_map,
     wxyz_to_xyzw,
 )
 from g1_vla.control import LOWER_BODY_JOINT_NAMES
@@ -91,6 +92,16 @@ class PhysicalGeometryTest(unittest.TestCase):
 
 
 class ProtocolInputsTest(unittest.TestCase):
+    def test_same_named_collision_mesh_cannot_replace_rigid_sensor_body(self):
+        name = "right_hand_thumb_0_link"
+        body = "/Robot/"+name
+        mesh = body+"/collisions/"+name
+        self.assertEqual(sensor_body_path_map([(name, body, True), (name, mesh, False)], [name]), {name: body})
+        with self.assertRaises(RLEnvironmentError):
+            sensor_body_path_map([(name, mesh, False)], [name])
+        with self.assertRaises(RLEnvironmentError):
+            sensor_body_path_map([(name, body, True), (name, body+"_duplicate", True)], [name])
+
     def test_imported_world_fix_is_preserved_and_missing_disabled_or_duplicate_fix_rejected(self):
         fixed = {"path": "/Robot/fix_base_joint", "body0": [], "body1": ["/Robot/Geometry/pelvis"], "enabled": True}
         self.assertEqual(audit_fixed_root_joints([fixed])["world_fixed_joint_count"], 1)

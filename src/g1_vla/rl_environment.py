@@ -288,6 +288,20 @@ def audit_fixed_root_joints(joints):
     return {"world_fixed_joint_count": 1, "fixed_joint": fixed}
 
 
+def sensor_body_path_map(entries, required_names):
+    """Resolve rigid bodies without allowing same-named render meshes to win."""
+    result = {}
+    for name, path, is_rigid_body in entries:
+        if name in required_names and is_rigid_body:
+            if name in result:
+                raise RLEnvironmentError("duplicate rigid sensor body identity: " + name)
+            result[name] = path
+    missing = set(required_names)-set(result)
+    if missing:
+        raise RLEnvironmentError("asset lacks rigid sensor bodies: " + repr(sorted(missing)))
+    return result
+
+
 def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_mode=False, output_dir=None):
     """Build the state-only local grasp curriculum after Isaac AppLauncher.
 
@@ -569,7 +583,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 if not str(prim.GetPath()).startswith("/World/envs/env_0/Robot/") or not prim.HasAPI(UsdPhysics.CollisionAPI):
                     continue
                 ancestor = prim
-                while ancestor.IsValid() and ancestor.GetName() not in sensor_body_names:
+                while ancestor.IsValid() and not (ancestor.GetName() in sensor_body_names and ancestor.HasAPI(UsdPhysics.RigidBodyAPI)):
                     ancestor = ancestor.GetParent()
                 if ancestor.IsValid():
                     material_path = "/World/RLPalmContactMaterial" if ancestor.GetName() == palm_contact_body else "/World/RLHandContactMaterial"
@@ -578,14 +592,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                                     "body": ancestor.GetName(), "material": material_path})
             if {item["body"] for item in self._material_bindings} != set(sensor_body_names):
                 raise RLEnvironmentError("explicit physics material binding failed for one or more original right-hand bodies")
-            paths = {}
+            path_entries = []
             for prim in stage.Traverse():
                 text = str(prim.GetPath())
                 if text.startswith("/World/envs/env_0/Robot/") and prim.GetName() in sensor_body_names:
-                    paths[prim.GetName()] = text.replace("/env_0/", "/env_.*/")
-            missing = set(sensor_body_names) - set(paths)
-            if missing:
-                raise RLEnvironmentError("converted robot lacks sensor body paths: " + repr(sorted(missing)))
+                    path_entries.append((prim.GetName(), text.replace("/env_0/", "/env_.*/"),
+                                         prim.HasAPI(UsdPhysics.RigidBodyAPI)))
+            paths = sensor_body_path_map(path_entries, sensor_body_names)
             self._hand_sensors = []
             for body in sensor_body_names:
                 sensor = ContactSensor(ContactSensorCfg(
