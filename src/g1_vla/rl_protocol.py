@@ -44,6 +44,13 @@ RL_TEACHER_DEFAULTS = {
     "position_iterations": 16, "velocity_iterations": 4, "contact_offset_m": 0.001,
     "rest_offset_m": 0.0, "friction_combine_mode": "max", "hand_friction": 2.2,
     "cube_friction": 1.4, "table_friction": 1.0, "qualification_required": True,
+    "palm_friction": 2.0, "max_depenetration_velocity_m_s": 0.2,
+    "migration_position_tolerance_m": 0.001, "migration_rotation_tolerance_rad": 0.01,
+    "recursive_leaf_pattern_match": False,
+    "reward_reach": 1.0, "reward_fingertip": 0.5, "reward_contact": 1.0,
+    "reward_clearance": 4.0, "reward_support": 2.0, "reward_lift": 5.0,
+    "reward_success": 10.0, "penalty_action_change": 0.01,
+    "penalty_object_speed": 0.05, "penalty_force": 1.0, "penalty_penetration": 2.0,
     "scope": "local_pregrasp_course_only_not_original20_acceptance",
     "training_authorization": "explicit_user_authorized_20261016",
     "reset_protocol": "source15_joint_seed_official_geometry_jitter_v2",
@@ -89,6 +96,12 @@ def validate_rl_settings(settings):
                 "probe_height_cap_m", "probe_overshoot_tolerance_m", "qualification_required"):
         if settings[key] != RL_TEACHER_DEFAULTS[key]:
             raise ValueError(key + " requires an explicitly new protocol before it can change")
+    for key in ("palm_friction", "max_depenetration_velocity_m_s",
+                "migration_position_tolerance_m", "migration_rotation_tolerance_rad", "recursive_leaf_pattern_match"):
+        if settings[key] != RL_TEACHER_DEFAULTS[key]:
+            raise ValueError(key + " requires an explicitly new physical protocol")
+    if any(settings[key] < 0 for key in RL_TEACHER_DEFAULTS if key.startswith(("reward_", "penalty_"))):
+        raise ValueError("RL reward and penalty weights must be nonnegative")
     positive = ("num_envs", "smoke_steps", "steps_per_env", "max_iterations", "max_wall_time_s",
         "eval_interval", "eval_episodes", "eval_num_envs", "save_interval", "learning_rate",
         "num_learning_epochs", "num_mini_batches", "init_noise_std", "max_grad_norm",

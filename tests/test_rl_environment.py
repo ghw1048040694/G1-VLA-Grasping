@@ -19,6 +19,7 @@ from g1_vla.rl_environment import (
     audit_asset_manifest,
     audit_fixed_root_joints,
     consecutive_window_samples,
+    cube_contact_partner_layout,
     minimum_box_clearance,
     migration_pose_errors,
     policy_velocity_limits,
@@ -92,6 +93,16 @@ class PhysicalGeometryTest(unittest.TestCase):
 
 
 class ProtocolInputsTest(unittest.TestCase):
+    def test_cube_partners_preserve_camera_and_wrist_as_other_robot_contacts(self):
+        hand = ["right_hand_thumb_2_link", "right_hand_palm_link"]
+        paths = {name: "/Robot/"+name for name in hand+["right_hand_camera_base_link", "right_wrist_yaw_link", "pelvis"]}
+        names, other = cube_contact_partner_layout(paths, hand)
+        self.assertEqual(names[0], "Table")
+        self.assertEqual({names[index] for index in other}, {"right_hand_camera_base_link", "right_wrist_yaw_link", "pelvis"})
+        self.assertEqual(len(names), 6)
+        with self.assertRaises(RLEnvironmentError):
+            cube_contact_partner_layout(paths, hand+["missing_body"])
+
     def test_same_named_collision_mesh_cannot_replace_rigid_sensor_body(self):
         name = "right_hand_thumb_0_link"
         body = "/Robot/"+name

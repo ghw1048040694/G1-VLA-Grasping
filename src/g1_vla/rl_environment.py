@@ -302,6 +302,14 @@ def sensor_body_path_map(entries, required_names):
     return result
 
 
+def cube_contact_partner_layout(robot_body_paths, hand_contact_names):
+    """Map exact native partners; every non-hand robot body remains explicit."""
+    if not set(hand_contact_names).issubset(robot_body_paths):
+        raise RLEnvironmentError("cube partner ledger is missing a declared hand contact body")
+    names = ["Table"] + sorted(robot_body_paths)
+    return names, [index for index, name in enumerate(names) if index > 0 and name not in hand_contact_names]
+
+
 def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_mode=False, output_dir=None):
     """Build the state-only local grasp curriculum after Isaac AppLauncher.
 
@@ -345,6 +353,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     from isaaclab.utils.configclass import configclass
     from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul
     from isaaclab_physx.physics import PhysxCfg
+    import carb
+    tensor_settings = carb.settings.get_settings()
+    if config["rl_teacher"].get("recursive_leaf_pattern_match", False) is not False:
+        raise RLEnvironmentError("the exact-body contact protocol requires nonrecursive leaf matching")
+    tensor_settings.set_bool("/physics/tensors/recursiveLeafPatternMatch", False)
+    if tensor_settings.get("/physics/tensors/recursiveLeafPatternMatch") is not False:
+        raise RLEnvironmentError("native physics tensor leaf matching setting did not apply")
 
     def tensor(value):
         return value.torch if hasattr(value, "torch") else (wp.to_torch(value) if isinstance(value, wp.array) else value)
@@ -425,6 +440,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._action_origin = "not_started"
             self._state_hold_request_clipped = 0
             super().__init__(EnvironmentCfg(), render_mode=None)
+            self._contact_body_binding_audit = {}
+            for sensor, name in zip(self._hand_sensors + [self._cube_sensor], list(sensor_body_names) + ["Cube"]):
+                paths = list(sensor.body_physx_view.prim_paths)
+                if len(paths) != self.num_envs or any(path.rsplit("/", 1)[-1] != name for path in paths):
+                    raise RLEnvironmentError("native contact sensor did not bind exactly one declared rigid body per environment: " + name)
+                self._contact_body_binding_audit[name] = paths
             if not self.robot.is_fixed_base or self.robot.num_base_dofs != 0:
                 raise RLEnvironmentError("native physics did not recognize the imported robot as fixed-root")
             if self._evaluation_camera is not None:
@@ -579,15 +600,29 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             palm_material = material(settings["palm_friction"])
             palm_material.func("/World/RLPalmContactMaterial", palm_material)
             self._material_bindings = []
-            for prim in stage.Traverse():
+            self._instance_overrides = []
+            for prim in list(stage.Traverse()):
                 if not str(prim.GetPath()).startswith("/World/envs/env_0/Robot/") or not prim.HasAPI(UsdPhysics.CollisionAPI):
                     continue
                 ancestor = prim
                 while ancestor.IsValid() and not (ancestor.GetName() in sensor_body_names and ancestor.HasAPI(UsdPhysics.RigidBodyAPI)):
                     ancestor = ancestor.GetParent()
                 if ancestor.IsValid():
+                    collider_path = str(prim.GetPath())
+                    instance = prim
+                    while instance.IsValid() and not instance.IsInstance():
+                        instance = instance.GetParent()
+                    if instance.IsValid():
+                        instance_path = str(instance.GetPath())
+                        instance.SetInstanceable(False)
+                        self._instance_overrides.append(instance_path.replace("/env_0/", "/env_*/"))
+                        prim = stage.GetPrimAtPath(collider_path)
                     material_path = "/World/RLPalmContactMaterial" if ancestor.GetName() == palm_contact_body else "/World/RLHandContactMaterial"
                     bind_physics_material(str(prim.GetPath()), material_path, stage=stage)
+                    sim_utils.modify_collision_properties(str(prim.GetPath()), collision, stage=stage)
+                    bound = [str(path) for path in prim.GetRelationship("material:binding:physics").GetTargets()]
+                    if bound != [material_path]:
+                        raise RLEnvironmentError("explicit physics material relationship could not be authored: " + collider_path)
                     self._material_bindings.append({"collider": str(prim.GetPath()).replace("/env_0/", "/env_*/"),
                                                     "body": ancestor.GetName(), "material": material_path})
             if {item["body"] for item in self._material_bindings} != set(sensor_body_names):
@@ -599,6 +634,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     path_entries.append((prim.GetName(), text.replace("/env_0/", "/env_.*/"),
                                          prim.HasAPI(UsdPhysics.RigidBodyAPI)))
             paths = sensor_body_path_map(path_entries, sensor_body_names)
+            all_body_entries = []
+            for prim in stage.Traverse():
+                text = str(prim.GetPath())
+                if text.startswith("/World/envs/env_0/Robot/") and prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                    all_body_entries.append((prim.GetName(), text.replace("/env_0/", "/env_.*/"), True))
+            all_body_paths = sensor_body_path_map(all_body_entries, [entry[0] for entry in all_body_entries])
+            self._cube_filter_body_names, self._cube_other_filter_indices = cube_contact_partner_layout(all_body_paths, sensor_body_names)
             self._hand_sensors = []
             for body in sensor_body_names:
                 sensor = ContactSensor(ContactSensorCfg(
@@ -610,8 +652,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._hand_sensors.append(sensor)
             self._cube_sensor = ContactSensor(ContactSensorCfg(
                 prim_path="/World/envs/env_.*/Cube", update_period=0.0,
-                filter_prim_paths_expr=["/World/envs/env_.*/Table", "/World/envs/env_.*/Robot/.*"],
-                track_friction_forces=True, max_contact_data_count_per_prim=32))
+                filter_prim_paths_expr=["/World/envs/env_.*/Table"] +
+                    [all_body_paths[name] for name in self._cube_filter_body_names[1:]],
+                track_friction_forces=True, max_contact_data_count_per_prim=256))
             self.scene.sensors["cube_table"] = self._cube_sensor
             if self._standalone_video:
                 from isaaclab.sensors import Camera, CameraCfg
@@ -739,6 +782,58 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 }
             return normal, friction, fn, depth, vertical, loaded_count, padded_normal, padded_loaded
 
+        def _cube_contact_values(self):
+            """Read every explicit partner in one native query and GPU reduction."""
+            sensor = self._cube_sensor
+            data = sensor.data
+            width = len(self._cube_filter_body_names)
+            normal = tensor(data.force_matrix_w).reshape(self.num_envs, width, 3)
+            friction = tensor(data.friction_forces_w).reshape(self.num_envs, width, 3)
+            force, points, normals, separation, counts, starts = sensor.contact_view.get_contact_data(dt=self.physics_dt)
+            force, points = tensor(force).flatten(), tensor(points).reshape(-1, 3)
+            normals, separation = tensor(normals).reshape(-1, 3), tensor(separation).flatten()
+            counts = tensor(counts).long().reshape(self.num_envs, -1)
+            starts = tensor(starts).long().reshape(self.num_envs, -1)
+            if counts.shape[1] != width:
+                raise RLEnvironmentError("cube partner columns differ from explicit rigid-body filters")
+            flat_counts, flat_starts = counts.flatten(), starts.flatten()
+            if bool((flat_counts < 0).any()) or bool((flat_starts[flat_counts > 0]+flat_counts[flat_counts > 0] > len(force)).any()):
+                raise RLEnvironmentError("cube contact stream has overflow or invalid indices")
+            bucket = torch.repeat_interleave(torch.arange(self.num_envs*width, device=self.device), flat_counts)
+            offset = torch.repeat_interleave(torch.cumsum(flat_counts, 0)-flat_counts, flat_counts)
+            indices = torch.repeat_interleave(flat_starts, flat_counts)+torch.arange(len(bucket), device=self.device)-offset
+            raw_force, raw_separation = force[indices], separation[indices]
+            if not all(bool(torch.isfinite(value).all()) for value in
+                       (normal, friction, raw_force, raw_separation, normals[indices], points[indices])):
+                raise FloatingPointError("nonfinite native cube partner contact stream")
+            fn = torch.zeros(self.num_envs*width, device=self.device)
+            depth = torch.zeros_like(fn)
+            loaded = torch.zeros(self.num_envs*width, dtype=torch.int64, device=self.device)
+            if len(indices):
+                fn.scatter_add_(0, bucket, torch.abs(raw_force))
+                depth.scatter_reduce_(0, bucket, (-raw_separation).clamp_min(0), reduce="amax", include_self=True)
+                loaded.scatter_add_(0, bucket, ((torch.abs(raw_force) > 0) & (raw_separation <= 0)).long())
+            fn, depth, loaded = (value.reshape(self.num_envs, width) for value in (fn, depth, loaded))
+            if self._record:
+                owners = torch.div(bucket, width, rounding_mode="floor")
+                selected = owners < min(8, self.num_envs)
+                selected_indices = indices[selected]
+                self._raw_contact_tensors["Cube:all_explicit_partners"] = {
+                    "env_id": owners[selected], "partner_filter_index": bucket[selected] % width,
+                    "normal_force_n": force[selected_indices], "separation_m": separation[selected_indices],
+                    "normal_w": normals[selected_indices], "position_w_m": points[selected_indices],
+                    "normal_force_on_sensor_by_partner_w_n": normal[:min(8, self.num_envs)],
+                    "friction_force_on_sensor_by_partner_w_n": friction[:min(8, self.num_envs)],
+                    "physical_loaded_count_by_partner": loaded[:min(8, self.num_envs)]}
+            other = self._cube_other_filter_indices
+            cube_normal = tensor(data.net_forces_w).reshape(self.num_envs, -1, 3).sum(dim=1)
+            residual = torch.linalg.vector_norm(cube_normal-normal.sum(dim=1), dim=-1)
+            return {"table_normal": normal[:, 0], "table_fn": fn[:, 0], "table_loaded_count": loaded[:, 0],
+                    "robot_normal": normal[:, 1:].sum(dim=1), "robot_fn": fn[:, 1:].sum(dim=1),
+                    "maximum_penetration_m": depth.amax(dim=1),
+                    "other_fn": fn[:, other].sum(dim=1), "other_loaded_count": loaded[:, other].sum(dim=1),
+                    "unfiltered_normal_residual_n": residual}
+
         def _physical_state(self):
             cube_position = tensor(self.cube.data.root_pos_w)
             cube_rotation = tensor(self.cube.data.root_quat_w)
@@ -789,14 +884,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         directions[:, group] -= normal
                         if index in (2, 4, 6):
                             distal_normals[group], distal_loaded[group] = point_normal, point_loaded
-                table_force, _, table_fn, table_depth, _, table_loaded_count, _, _ = self._contact_values(self._cube_sensor)
-                robot_force, _, robot_fn, robot_depth, _, robot_loaded_count, _, _ = self._contact_values(self._cube_sensor, 1)
-                depth = torch.maximum(depth, table_depth)
-                depth = torch.maximum(depth, robot_depth)
-                cube_normal = tensor(self._cube_sensor.data.net_forces_w).reshape(self.num_envs, -1, 3).sum(dim=1)
-                residual = torch.linalg.vector_norm(cube_normal - robot_force - table_force, dim=-1)
-                other_force = (robot_fn-hand_fn).clamp_min(0) + residual
-                other_loaded_count = (robot_loaded_count-hand_loaded_count).clamp_min(0)
+                cube_contacts = self._cube_contact_values()
+                table_fn, table_loaded_count = cube_contacts["table_fn"], cube_contacts["table_loaded_count"]
+                depth = torch.maximum(depth, cube_contacts["maximum_penetration_m"])
+                other_force = cube_contacts["other_fn"] + cube_contacts["unfiltered_normal_residual_n"]
+                other_loaded_count = cube_contacts["other_loaded_count"]
                 self._qualification_supported = self._force_unavailable is None
             except (AttributeError, TypeError, RuntimeError, RLEnvironmentError) as exc:
                 self._force_unavailable = type(exc).__name__ + ": " + str(exc)
@@ -1238,6 +1330,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                         "qualification_semantics": "raw per-point distal opposition and normals; source loaded-contact ANDs; 100 consecutive 2ms samples",
                                         "compiled_asset_files": self._compiled_files,
                                         "hand_material_bindings": self._material_bindings,
+                                        "stage_only_instance_overrides": self._instance_overrides,
+                                        "tensor_recursive_leaf_pattern_match": tensor_settings.get("/physics/tensors/recursiveLeafPatternMatch"),
+                                        "cube_contact_partner_names": self._cube_filter_body_names,
+                                        "other_robot_contact_partner_indices": self._cube_other_filter_indices,
                                         "fixed_root_audit": self._fixed_root_audit,
                                         "native_joint_axis_frame_unit_schema": self._joint_schema_audit,
                                         "palm_site_body_name": palm_site_body,
@@ -1255,6 +1351,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                             "official USD collision geometry retained with 1 mm contact offset" if native_official_asset else
                                                 "historical PhysX convex collision conversion with 1 mm contact offset"],
                     "source_joint_limit_differences_rad": self._source_joint_limit_differences,
+                    "contact_body_binding_audit": self._contact_body_binding_audit,
                     "success_scope": "local precontact-reset curriculum only; original MuJoCo 15/19 and 20 not certified",
                     "contact_data_unavailable_reason": self._force_unavailable,
                     "qualification_supported": self._qualification_supported,
