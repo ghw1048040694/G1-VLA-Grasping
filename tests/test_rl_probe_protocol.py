@@ -524,5 +524,180 @@ class FixedClusterModelPlanTests(unittest.TestCase):
                 probe.verify_probe_reference(config, infos, current)
 
 
+@contextmanager
+def compliant_fixture():
+    with fixed_cluster_fixture() as (config, infos, current, model):
+        controller = probe.compliant_pinch_controller_contract()
+        config["rl_diagnostics"].update(
+            profile_plan="compliant_pinch_v4", backend="g1_control_physics_diagnostics_v4",
+            guided_target_lead_max_rad=None, compliant_pinch_controller=copy.deepcopy(controller))
+        current["diagnostic_controller_protocol"] = copy.deepcopy(controller)
+        current["control_probe_profile"] = copy.deepcopy(
+            probe.validate_probe_settings(config["rl_diagnostics"])["profiles"][0])
+        yield config, infos, current, model, controller
+
+
+class CompliantPinchPlanTests(unittest.TestCase):
+    def test_controller_is_a_pinned_copy_of_declared_outer_control_not_native_PD(self):
+        controller = probe.compliant_pinch_controller_contract()
+        self.assertEqual(controller["version"], "g1_joint_target_force_admittance_pinch_v1")
+        self.assertEqual(controller["kind"], "outer_force_admittance_joint_targets")
+        self.assertEqual(probe._canonical(controller),
+                         "ce31ed56f0435dbc60270a40dde00f55170135806dd03547e0f2583ecb8c99ae")
+        self.assertEqual(controller["parameters"]["force_target_n"], .35)
+        self.assertEqual(controller["parameters"]["contact_feedback_onset_n"], .02)
+        self.assertEqual(controller["parameters"]["adaptive_thumb0_closing_budget_rad"], .07)
+        self.assertEqual(controller["parameters"]["stage0_duration_s"], .9)
+        self.assertEqual(controller["parameters"]["stage0_contact_ready_controls"], 2)
+        self.assertEqual(controller["reference_semantics"]["maximum_retreat_rad"],
+                         "actual_most_closed_applied_target")
+        self.assertIn("not_physically_loaded_or_support",
+                      controller["reference_semantics"]["stage0_contact_force_min_n"])
+        controller["parameters"]["force_target_n"] = 5.
+        self.assertEqual(probe.compliant_pinch_controller_contract()["parameters"]["force_target_n"], .35)
+        with mock.patch.dict(probe._COMPLIANT_PINCH_CONTROLLER["parameters"], force_target_n=.36):
+            with self.assertRaisesRegex(ValueError, "pinned identity"):
+                probe.compliant_pinch_controller_contract()
+
+    def test_new_plan_declares_exact_single_profile_no_duplicate_lead(self):
+        with compliant_fixture() as (config, _, _, _, _):
+            result = probe.validate_probe_settings(config["rl_diagnostics"])
+            self.assertEqual(result["profiles"], [{"name": "compliant_pinch_pose_hold",
+                "action_source": "guided_hand_pose_hold", "control_guard_version": "box_halfspace_projected_v2"}])
+            self.assertIsNone(result["guided_target_lead_max_rad"])
+            for key, value in (("guided_target_lead_max_rad", .006), ("backend", "g1_control_physics_diagnostics_v3"),
+                               ("compliant_pinch_controller", None), ("candidate_sha256", "0"*64),
+                               ("profiles", probe.RL_PROBE_DEFAULTS["profiles"]), ("episodes_per_env", 5)):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    probe.validate_probe_settings({**config["rl_diagnostics"], key: value})
+
+    def test_every_parameter_is_exact_finite_and_not_a_support_override(self):
+        for key in probe.compliant_pinch_controller_contract()["parameters"]:
+            with self.subTest(key=key), compliant_fixture() as (config, _, _, _, _):
+                changed = config["rl_diagnostics"]["compliant_pinch_controller"]["parameters"]
+                changed[key] += .00001
+                with self.assertRaises(ValueError): probe.validate_probe_settings(config["rl_diagnostics"])
+        for change in ("version", "kind", "extra_top", "missing", "extra_parameter", "boolean", "nan", "inf",
+                       "reference", "missing_reference", "float_counter"):
+            with self.subTest(change=change), compliant_fixture() as (config, _, _, _, _):
+                value = config["rl_diagnostics"]["compliant_pinch_controller"]
+                if change in ("version", "kind"): value[change] = "unverified"
+                elif change == "extra_top": value["allow_unsafe"] = True
+                elif change == "missing": del value["parameters"]["maximum_penetration_m"]
+                elif change == "extra_parameter": value["parameters"]["support_window_s"] = .01
+                elif change == "boolean": value["parameters"]["force_target_n"] = True
+                elif change == "nan": value["parameters"]["force_target_n"] = float("nan")
+                elif change == "inf": value["parameters"]["force_target_n"] = float("inf")
+                elif change == "reference": value["reference_semantics"]["maximum_retreat_rad"] = "nominal_candidate"
+                elif change == "missing_reference": del value["reference_semantics"]["force_feedback"]
+                else: value["parameters"]["stage0_contact_ready_controls"] = 2.0
+                with self.assertRaises(ValueError): probe.validate_probe_settings(config["rl_diagnostics"])
+
+    def test_adaptive_interval_and_schedule_are_explicit_and_mechanically_bounded(self):
+        with compliant_fixture() as (config, infos, current, _, _):
+            result = probe.verify_probe_reference(config, infos, current)
+            intervention = result["candidate_reference"]["declared_control_interventions"]
+            self.assertTrue(intervention["nominal_candidate_file_unchanged"])
+            self.assertEqual(intervention["nominal_targets_rad"], [0.] * 7)
+            self.assertEqual(intervention["thumb0_declared_target_interval_rad"], [-.07, 0.])
+            self.assertEqual(intervention["other_six_extra_closing_budget_rad"], 0.)
+            self.assertFalse(intervention["physical_qualification"])
+            self.assertFalse(intervention["geometry_recomputed_by_protocol"])
+            settings = probe.validate_probe_settings(config["rl_diagnostics"])
+            target = [.99] + [0.] * 6
+            limits = [[-1.5, 1.5] for _ in range(7)]
+            stages = [{"name": "source"}] + [{"duration_s": x} for x in [1.5, .35, .2, .4, .4]]
+            checked = probe._compliant_candidate_interventions(settings, target, limits, stages, 2.85)
+            self.assertAlmostEqual(checked["thumb0_declared_target_interval_rad"][0], .92)
+            self.assertAlmostEqual(checked["controller_nominal_stage_duration_total_s"], 2.25)
+            self.assertEqual(checked["candidate_stage0_duration_s"], 1.5)
+            self.assertEqual(checked["controller_stage0_duration_s"], .9)
+            limits[0][0] = .95
+            with self.assertRaisesRegex(ValueError, "native joint bounds"):
+                probe._compliant_candidate_interventions(settings, target, limits, stages, 2.85)
+            limits[0][0] = -1.5
+            stages[1]["duration_s"] = .1
+            with self.assertRaisesRegex(ValueError, "episode budget"):
+                probe._compliant_candidate_interventions(settings, target, limits, stages, 6.)
+
+    def test_old_plans_keep_their_original_control_and_reject_new_controller(self):
+        self.assertIsNone(probe.validate_probe_settings({})["compliant_pinch_controller"])
+        with self.assertRaisesRegex(ValueError, "Legacy"):
+            probe.validate_probe_settings({"compliant_pinch_controller": probe.compliant_pinch_controller_contract()})
+        for plan, backend in (("geometry_pose_only_v2", "g1_control_physics_diagnostics_v2"),
+                              ("geometry_pose_fixed_cluster_v3", "g1_control_physics_diagnostics_v3")):
+            with self.subTest(plan=plan), compliant_fixture() as (config, _, _, _, _):
+                config["rl_diagnostics"].update(profile_plan=plan, backend=backend, guided_target_lead_max_rad=.006)
+                with self.assertRaisesRegex(ValueError, "Legacy"):
+                    probe.validate_probe_settings(config["rl_diagnostics"])
+        with fixture() as (config, infos, current, _, _):
+            current["diagnostic_controller_protocol"] = probe.compliant_pinch_controller_contract()
+            with self.assertRaisesRegex(ValueError, "Legacy"):
+                probe.verify_probe_reference(config, infos, current)
+
+    def test_bridge_verifies_declared_control_separately_and_preserves_support_policy(self):
+        with compliant_fixture() as (config, infos, current, model, controller):
+            before = copy.deepcopy((config, infos, current))
+            pre = probe.verify_probe_reference(config)
+            self.assertFalse(pre["ready_for_physical_probe"])
+            result = probe.verify_probe_reference(config, infos, current)
+            self.assertTrue(result["ready_for_physical_probe"])
+            self.assertFalse(result["source_identical_trained_eval"])
+            self.assertFalse(result["four_way_comparison_declared"])
+            self.assertFalse(result["four_way_comparison_complete"])
+            self.assertEqual(result["declared_profile_names"], ["compliant_pinch_pose_hold"])
+            self.assertEqual(result["diagnostic_controller_protocol"], controller)
+            self.assertEqual(result["diagnostic_controller_protocol_sha256"], probe._canonical(controller))
+            self.assertIn("not an environment-measured force or support certificate",
+                          result["diagnostic_controller_protocol_source"])
+            self.assertEqual(result["physics_model_comparison"]["fixed_cluster_collision_filter"], model)
+            self.assertNotEqual(result["current_config_semantic_sha256"], result["reference_training_config_sha256"])
+            self.assertEqual(result["reference_rest_config_comparison_sha256"], result["reference_training_config_sha256"])
+            self.assertEqual((config, infos, current), before)
+
+    def test_native_declaration_cannot_be_missing_changed_or_hidden_in_policy(self):
+        for change in ("missing", "null", "parameter", "extra", "in_policy", "old_profile", "missing_profile"):
+            with self.subTest(change=change), compliant_fixture() as (config, infos, current, _, _):
+                if change == "missing": del current["diagnostic_controller_protocol"]
+                elif change == "null": current["diagnostic_controller_protocol"] = None
+                elif change == "parameter": current["diagnostic_controller_protocol"]["parameters"]["force_target_n"] = .36
+                elif change == "extra": current["diagnostic_controller_protocol"]["parameters"]["skip_manifold"] = True
+                elif change == "in_policy":
+                    current["policy_contract"]["diagnostic_controller_protocol"] = current["diagnostic_controller_protocol"]
+                    current["policy_contract_sha256"] = probe._canonical(current["policy_contract"])
+                elif change == "old_profile": current["control_probe_profile"] = copy.deepcopy(probe._PROFILES[3])
+                else: del current["control_probe_profile"]
+                with self.assertRaises(ValueError): probe.verify_probe_reference(config, infos, current)
+
+    def test_compliance_cannot_admit_old_physics_or_force_support_changes(self):
+        for change in ("old_physics", "force_gate", "support_window", "pd", "reward", "new_checkpoint_policy"):
+            with self.subTest(change=change), compliant_fixture() as (config, infos, current, _, _):
+                if change == "old_physics": config["rl_teacher"]["physics_protocol"] = probe._OLD_PHYSICS
+                elif change == "force_gate": current["policy_contract"]["resolved_settings"]["group_force_max_n"] = 10.
+                elif change == "support_window": current["policy_contract"]["resolved_settings"]["support_window_s"] = .01
+                elif change == "pd": current["policy_contract"]["actual_pd_specifications"]["joint"]["kp"] = 1.
+                elif change == "reward": current["policy_contract"]["resolved_settings"]["reward_support"] = 0.
+                else: infos["policy_contract"]["physics_protocol"] = probe._FIXED_PHYSICS
+                current["policy_contract_sha256"] = probe._canonical(current["policy_contract"])
+                with self.assertRaises(ValueError): probe.verify_probe_reference(config, infos, current)
+
+    def test_ordinary_old_checkpoint_evaluation_still_rejects_new_physics(self):
+        from types import SimpleNamespace
+        from g1_vla import rl_ppo
+        with compliant_fixture() as (config, infos, current, _, _):
+            path = config["rl_diagnostics"]["reference_checkpoint_path"]
+            settings = {"evaluation": {"checkpoint_path": path, "checkpoint_sha256": probe._file_hash(path)},
+                        "device": "cpu", "training_config_sha256": infos["training_config_sha256"],
+                        "source_tree_sha256": infos["source_tree_sha256"]}
+            runner = mock.Mock()
+            tensor_runtime = SimpleNamespace(load=lambda *args, **kwargs: {"infos": infos})
+            with mock.patch.object(rl_ppo, "_make_runner", return_value=(runner, None)), \
+                    mock.patch.object(rl_ppo, "_collect_evaluation") as collect:
+                with self.assertRaisesRegex(ValueError, "policy contract"):
+                    rl_ppo._evaluation(None, settings, Path(config["paths"]["root"]), {}, None, tensor_runtime, current)
+                runner.alg.load.assert_not_called()
+                collect.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

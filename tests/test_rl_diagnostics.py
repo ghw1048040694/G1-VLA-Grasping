@@ -1,6 +1,8 @@
 """No-optimization control interventions and native dispatch regressions."""
 import copy
 import importlib.util
+import json
+from pathlib import Path
 import unittest
 
 from g1_vla.rl_probe_protocol import RL_PROBE_DEFAULTS
@@ -145,6 +147,64 @@ class DiagnosticControlTests(unittest.TestCase):
         self.assertTrue(self.t.equal(first, second))
         self.assertTrue(self.t.equal(e1["closure_stage_index"], e2["closure_stage_index"]))
         self.assertEqual(e1["arm_target_reference"], e2["arm_target_reference"])
+
+    def compliant_controller(self):
+        from g1_vla.rl_diagnostics import GuidedClosure
+        from g1_vla.rl_probe_protocol import compliant_pinch_controller_contract
+        candidate = json.loads((Path(__file__).resolve().parents[1] /
+            "resources/rl_geometry_candidates/balanced_thumb_force_limited_v3.json").read_text())
+        source = candidate["geometry_evidence"]["source_detail"]["stage_keyframes"][0]["target_rad"]
+        self.state["q_action_rad"][:, 7:] = self.t.tensor(source)
+        self.state["target_action_rad"][:, 7:] = self.t.tensor(source)
+        self.state["contact_metrics_current_episode"] = self.t.ones(2, dtype=self.t.bool)
+        self.state["unsafe_latched"] = self.t.zeros(2, dtype=self.t.bool)
+        self.state["metrics"] = {
+            "group_physical_loaded_contact_count": self.t.zeros(2, 3, dtype=self.t.long),
+            "no_positive_gap_hand_load": self.t.zeros(2, dtype=self.t.bool),
+            "friction_partner_manifold_certified": self.t.zeros(2, dtype=self.t.bool),
+            "maximum_penetration_m": self.t.zeros(2),
+            "finite": self.t.ones(2, dtype=self.t.bool),
+            "joint_safe": self.t.ones(2, dtype=self.t.bool),
+            "table_pair_measurement_supported": self.t.ones(2, dtype=self.t.bool),
+        }
+        cfg = copy.deepcopy(self.cfg)
+        cfg.update(profile_plan="compliant_pinch_v4", guided_target_lead_max_rad=None,
+            guided_hand_target_rad=candidate["target_rad"],
+            compliant_pinch_controller=compliant_pinch_controller_contract())
+        return GuidedClosure(self.t, cfg, source, self.state, candidate), candidate, cfg
+
+    def test_compliant_requests_are_not_reclamped_by_the_legacy_six_mrad_lead(self):
+        from g1_vla.rl_diagnostics import GuidedClosure
+        new, candidate, cfg = self.compliant_controller()
+        old_cfg = copy.deepcopy(cfg)
+        old_cfg.update(profile_plan="geometry_pose_fixed_cluster_v3",
+                       guided_target_lead_max_rad=.006, compliant_pinch_controller=None)
+        source = candidate["geometry_evidence"]["source_detail"]["stage_keyframes"][0]["target_rad"]
+        old = GuidedClosure(self.t, old_cfg, source, self.state, candidate)
+        for _ in range(10):
+            action, evidence = new.actions(self.t.zeros(2, 14), self.state,
+                "guided_hand_pose_hold", .066, 1.5)
+            _, legacy = old.actions(self.t.zeros(2, 14), self.state,
+                "guided_hand_pose_hold", .066, 1.5)
+        self.assertGreater(float(evidence["guided_target_hand_rad"][0, 3] -
+                                 self.state["q_action_rad"][0, 10]), .02)
+        self.assertLessEqual(float((legacy["guided_target_hand_rad"] -
+                                   self.state["q_action_rad"][:, 7:]).abs().max()), .0060001)
+        self.assertTrue((action.abs() <= 1).all())
+        self.assertIsNone(cfg["guided_target_lead_max_rad"])
+        self.assertTrue((evidence["guided_target_lead_max_rad"] == .04).all())
+        self.assertEqual(evidence["declared_controller_protocol"], cfg["compliant_pinch_controller"])
+        self.assertEqual(evidence["arm_target_reference"], "previous_applied_bounded_target")
+
+    def test_compliant_preload_flag_cannot_skip_hand_path_or_enable_probe(self):
+        controller, _, _ = self.compliant_controller()
+        self.state["preload_contact_ready"][:] = True
+        for _ in range(20):
+            _, evidence = controller.actions(self.t.zeros(2, 14), self.state,
+                "guided_hand_pose_hold", .066, 1.5)
+        self.assertFalse(evidence["closure_path_complete"].any())
+        self.assertFalse(evidence["probe_advance_permitted"].any())
+        self.assertTrue((evidence["probe_offset_m"] == 0).all())
 
     def test_hand_intervention_preserves_actor_arm_and_closes_declared_directions(self):
         from g1_vla.rl_diagnostics import GuidedClosure

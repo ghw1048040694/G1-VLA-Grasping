@@ -23,7 +23,8 @@ from pathlib import Path
 from .rl_probe_protocol import validate_probe_settings, verify_probe_reference
 
 
-DIAGNOSTIC_VERSION = "g1_frozen_actor_opposing_closure_control_v3"
+DIAGNOSTIC_VERSION = "g1_frozen_actor_opposing_closure_control_v4"
+STAGED_PLANS = ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3", "compliant_pinch_v4")
 POSE_SERVO = {"position_gain_per_s": 4.0, "orientation_gain_per_s": 2.0,
               "dls_regularizer": 0.02, "position_speed_max_m_s": 0.01,
               "angular_speed_max_rad_s": 0.1,
@@ -101,7 +102,8 @@ class GuidedClosure:
         self.rotation = state["palm_quaternion_xyzw"].clone()
         self.ready_count = torch.zeros_like(self.ids)
         self.probe = torch.zeros_like(q[:, 0])
-        self.staged = settings.get("profile_plan") in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3")
+        self.compliant = settings.get("profile_plan") == "compliant_pinch_v4"
+        self.staged = settings.get("profile_plan") in STAGED_PLANS
         if self.staged:
             if candidate is None:
                 raise ValueError("Staged closure requires its verified geometry candidate")
@@ -125,6 +127,10 @@ class GuidedClosure:
             self.stage_index = torch.zeros_like(self.ids)
             self.stage_elapsed = torch.zeros_like(q[:, 0])
             self.stage_start = self.seed_hand.clone()
+        if self.compliant:
+            from .rl_hand_control import CompliantPinchController
+            self.pinch = CompliantPinchController(torch, initial_hand, state, candidate,
+                parameters=settings["compliant_pinch_controller"]["parameters"])
 
     def _staged_target(self, state, changed, dt, force_limit, tracking):
         torch = self.torch
@@ -172,7 +178,11 @@ class GuidedClosure:
                 torch, self.rotation, state["palm_quaternion_xyzw"]), dim=-1)
             tracking = ((position_error <= POSE_SERVO["geometry_path_tracking_position_m"]) &
                         (orientation_error <= POSE_SERVO["geometry_path_tracking_orientation_rad"]))
-            desired_hand, fraction, stage_evidence = self._staged_target(state, changed, dt, force_limit, tracking)
+            if self.compliant:
+                desired_hand, fraction, stage_evidence = self.pinch.target(
+                    state, changed, dt, force_limit, tracking)
+            else:
+                desired_hand, fraction, stage_evidence = self._staged_target(state, changed, dt, force_limit, tracking)
             stage_evidence.update(actual_palm_reference_position_error_m=position_error,
                                   actual_palm_reference_orientation_error_rad=orientation_error)
         else:
@@ -182,20 +192,27 @@ class GuidedClosure:
             desired_hand = self.seed_hand + (self.goal_hand - self.seed_hand) * smooth[:, None]
         targets = state["target_action_rad"]
         per_step = state["per_step_action_rad"]
-        direction = torch.sign(self.goal_hand - self.seed_hand)
         overloaded = state["group_normal_force_n"] > force_limit
-        group_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2], device=targets.device)
-        relief = overloaded[:, group_ids]
-        relieved = targets[:, 7:] - direction * cfg["guided_force_relief_step_rad"]
-        # Relief retreats toward the seed; it never opens past that declared seed.
-        relieved = torch.where(direction > 0, torch.maximum(relieved, self.seed_hand),
-                    torch.where(direction < 0, torch.minimum(relieved, self.seed_hand), targets[:, 7:]))
-        desired_hand = torch.where(relief, relieved, desired_hand)
-        planned_hand = desired_hand.clone()
-        lead = cfg.get("guided_target_lead_max_rad")
-        if lead is not None:
-            measured_hand = state["q_action_rad"][:, 7:]
-            desired_hand = torch.maximum(torch.minimum(desired_hand, measured_hand + lead), measured_hand - lead)
+        if self.compliant:
+            # The new controller owns force admittance and its two measured-q
+            # lead bounds. Applying the historical relief/lead again would erase
+            # its coordinated targets and create a second hidden controller.
+            planned_hand = None
+            lead = None
+        else:
+            direction = torch.sign(self.goal_hand - self.seed_hand)
+            group_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2], device=targets.device)
+            relief = overloaded[:, group_ids]
+            relieved = targets[:, 7:] - direction * cfg["guided_force_relief_step_rad"]
+            # Relief retreats toward the seed; it never opens past that declared seed.
+            relieved = torch.where(direction > 0, torch.maximum(relieved, self.seed_hand),
+                        torch.where(direction < 0, torch.minimum(relieved, self.seed_hand), targets[:, 7:]))
+            desired_hand = torch.where(relief, relieved, desired_hand)
+            planned_hand = desired_hand.clone()
+            lead = cfg.get("guided_target_lead_max_rad")
+            if lead is not None:
+                measured_hand = state["q_action_rad"][:, 7:]
+                desired_hand = torch.maximum(torch.minimum(desired_hand, measured_hand + lead), measured_hand - lead)
         result = actor_actions.clone()
         result[:, 7:] = ((desired_hand - targets[:, 7:]) / per_step[..., 7:]).clamp(-1, 1)
         evidence = {"action_source": action_source, "guided_target_hand_rad": desired_hand,
@@ -242,6 +259,8 @@ class GuidedClosure:
                 upward_probe_request_clamped=pause_upward, requested_linear_velocity_world_m_s=linear,
                 arm_target_reference="previous_applied_bounded_target" if self.staged else "measured_q_legacy_v1",
                 preload_is_not_support_qualification=True, servo=dict(POSE_SERVO))
+        if self.compliant:
+            evidence["declared_controller_protocol"] = copy.deepcopy(cfg["compliant_pinch_controller"])
         return result, evidence
 
 
@@ -258,10 +277,14 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     observations = environment.get_observations().to(cfg["rl_teacher"]["device"])
     audit = _environment_audit(environment)
     audit["source_tree_sha256"] = source_tree_identity()
+    if settings["profile_plan"] == "compliant_pinch_v4":
+        # This is an explicit software-control declaration, not a measured
+        # contact or a change to the environment's physical policy contract.
+        audit["diagnostic_controller_protocol"] = copy.deepcopy(settings["compliant_pinch_controller"])
     reference = verify_probe_reference(cfg, checkpoint_infos=saved_infos, current_audit=audit)
     if not reference["ready_for_physical_probe"]:
         raise ValueError("Frozen actor diagnostic bridge did not admit physical execution")
-    if settings.get("profile_plan") in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3"):
+    if settings.get("profile_plan") in STAGED_PLANS:
         load = audit.get("diagnostic_native_joint_load_readback", {})
         pair = audit.get("diagnostic_native_self_pair_readback", {})
         if (load.get("binding", {}).get("verified") is not True or
@@ -272,7 +295,7 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     before = module_state_sha256(actor, torch)
     initial_hand = [audit["initial_state"]["joint_positions_rad"][name] for name in RIGHT_HAND]
     candidate = None
-    if settings.get("profile_plan") in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3"):
+    if settings.get("profile_plan") in STAGED_PLANS:
         payload = Path(settings["candidate_path"]).read_bytes()
         if hashlib.sha256(payload).hexdigest() != settings["candidate_sha256"]:
             raise ValueError("Geometry candidate changed after native reference verification")

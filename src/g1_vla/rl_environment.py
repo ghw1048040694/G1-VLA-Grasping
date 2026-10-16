@@ -1209,11 +1209,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if not self.robot.is_fixed_base or self.robot.num_base_dofs != 0:
                 raise RLEnvironmentError("native physics did not recognize the imported robot as fixed-root")
             if self._evaluation_camera is not None:
-                eye = self.scene.env_origins[0] + torch.tensor([1.05, -0.65, 1.30], device=self.device)
-                target = self.scene.env_origins[0] + torch.tensor([0.35, 0.055, 0.80], device=self.device)
+                pinch_closeup = (self._control_probe_profile is not None and
+                                 self._control_probe_profile["name"] == "compliant_pinch_pose_hold")
+                eye_offset = [0.635, -0.262, 1.045] if pinch_closeup else [1.05, -0.65, 1.30]
+                target_offset = [0.32, 0.055, 0.82] if pinch_closeup else [0.35, 0.055, 0.80]
+                eye = self.scene.env_origins[0] + torch.tensor(eye_offset, device=self.device)
+                target = self.scene.env_origins[0] + torch.tensor(target_offset, device=self.device)
                 self._evaluation_camera.set_world_poses_from_view(eye[None], target[None])
                 self._video_status.update(enabled=True, eye_world_m=eye.detach().cpu().tolist(),
-                                          target_world_m=target.detach().cpu().tolist())
+                                          target_world_m=target.detach().cpu().tolist(),
+                                          camera_scope="fixed external env0 pinch closeup" if pinch_closeup else "fixed external env0 audit view",
+                                          camera_view_protocol="g1_pinch_closeup_env0_v1" if pinch_closeup else "g1_overview_env0_v1")
             self._action_ids = [self.robot.joint_names.index(name) for name in ACTION_JOINT_NAMES]
             if len(self.robot.joint_names) != 43 or set(self.robot.joint_names) != set(initial["joint_positions_rad"]):
                 raise RLEnvironmentError("converted asset does not contain the exact 43 robot joints")

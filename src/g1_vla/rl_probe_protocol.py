@@ -32,10 +32,47 @@ _PROFILES = [
 ]
 _PLANS = {"four_way_v1": ("g1_control_physics_diagnostics_v1", _PROFILES),
           "geometry_pose_only_v2": ("g1_control_physics_diagnostics_v2", [_PROFILES[3]]),
-          "geometry_pose_fixed_cluster_v3": ("g1_control_physics_diagnostics_v3", [_PROFILES[3]])}
+          "geometry_pose_fixed_cluster_v3": ("g1_control_physics_diagnostics_v3", [_PROFILES[3]]),
+          "compliant_pinch_v4": ("g1_control_physics_diagnostics_v4", [
+              {"name": "compliant_pinch_pose_hold", "action_source": "guided_hand_pose_hold",
+               "control_guard_version": "box_halfspace_projected_v2"}])}
 _OLD_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v3"
 _FIXED_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v4_fixed_palm_adjacency"
 _V3_CANDIDATE_SHA256 = "09ee1ae234ab143076c514273d1105b1ee3a939cb7c349a5e3a40901a765e81f"
+_FIXED_MODEL_PLANS = frozenset(("geometry_pose_fixed_cluster_v3", "compliant_pinch_v4"))
+
+_COMPLIANT_PINCH_CONTROLLER = {
+    "version": "g1_joint_target_force_admittance_pinch_v1",
+    "kind": "outer_force_admittance_joint_targets",
+    "parameters": {
+        "free_target_lead_max_rad": .04,
+        "contact_target_lead_max_rad": .012,
+        "contact_feedback_onset_n": .02,
+        "force_target_n": .35,
+        "admittance_gain_rad_s_per_n": .1,
+        "close_speed_max_rad_s": .04,
+        "retreat_speed_max_rad_s": .08,
+        "maximum_retreat_rad": .04,
+        "stage0_near_arrival_rad": .025,
+        "stage_active_arrival_rad": .01,
+        "final_joint_arrival_rad": .01,
+        "final_contact_equilibrium_arrival_rad": .025,
+        "maximum_penetration_m": .003,
+        "adaptive_thumb0_closing_budget_rad": .07,
+        "stage0_duration_s": .9,
+        "stage0_contact_near_arrival_rad": .05,
+        "stage0_contact_force_min_n": .05,
+        "stage0_contact_ready_controls": 2,
+    },
+    "reference_semantics": {
+        "maximum_retreat_rad": "actual_most_closed_applied_target",
+        "adaptive_thumb0_closing_budget_rad": "explicit_extra_thumb0_closing_from_nominal_candidate_final",
+        "stage0_duration_s": "explicit_control_schedule_override_only_total_episode_budget_unchanged",
+        "force_feedback": "gain_times_force_target_minus_raw_normal_force_including_positive_gap_no_creep_override",
+        "stage0_contact_force_min_n": "raw_positive_gap_allowed_precontact_controller_signal_only_not_physically_loaded_or_support",
+    },
+}
+_COMPLIANT_PINCH_CONTROLLER_SHA256 = "ce31ed56f0435dbc60270a40dde00f55170135806dd03547e0f2583ecb8c99ae"
 
 _HAND_JOINT_ORDER = ["right_hand_" + x + "_joint" for x in
     ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1", "middle_0", "middle_1")]
@@ -48,6 +85,7 @@ RL_PROBE_DEFAULTS = {
     "candidate_sha256": "",
     "candidate_id": "",
     "guided_target_lead_max_rad": None,
+    "compliant_pinch_controller": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -77,6 +115,35 @@ _HOST_FIELDS = frozenset((
 def _canonical(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def compliant_pinch_controller_contract():
+    """Return the declared outer-control settings, never a support certificate.
+
+    The unchanged native PD, joint/velocity/height limits and strict support
+    qualification remain separate. Contact onset and desired force are control
+    feedback parameters; neither redefines physically loaded contact.
+    """
+    if _canonical(_COMPLIANT_PINCH_CONTROLLER) != _COMPLIANT_PINCH_CONTROLLER_SHA256:
+        raise ValueError("Versioned compliant controller declaration changed without its pinned identity")
+    return copy.deepcopy(_COMPLIANT_PINCH_CONTROLLER)
+
+
+def _verify_compliant_controller(value):
+    expected = compliant_pinch_controller_contract()
+    if (not isinstance(value, dict) or set(value) != set(expected) or
+            value.get("version") != expected["version"] or value.get("kind") != expected["kind"] or
+            value.get("reference_semantics") != expected["reference_semantics"] or
+            not isinstance(value.get("parameters"), dict) or
+            set(value["parameters"]) != set(expected["parameters"])):
+        raise ValueError("Compliant pinch requires the exact declared controller contract")
+    for key, number in value["parameters"].items():
+        if (type(number) not in (int, float) or not math.isfinite(number) or
+                number != expected["parameters"][key]):
+            raise ValueError("Compliant pinch controller pins " + key)
+    if _canonical(value) != _canonical(expected):
+        raise ValueError("Compliant pinch controller canonical identity changed")
+    return copy.deepcopy(expected)
 
 
 def _file_hash(path):
@@ -119,9 +186,13 @@ def validate_probe_settings(value):
     if result["profiles"] != profiles:
         raise ValueError("Diagnostics require exactly the declared profile_plan action/guard profiles in order")
     lead = result["guided_target_lead_max_rad"]
-    if ((plan == "four_way_v1" and lead is not None) or
+    if ((plan in ("four_way_v1", "compliant_pinch_v4") and lead is not None) or
             (plan in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3") and (type(lead) not in (int, float) or lead != .006))):
-        raise ValueError("Diagnostic plan pins guided_target_lead_max_rad: None forv1, .006 forv2")
+        raise ValueError("Diagnostic plan pins guided_target_lead_max_rad: None forv1/v4, .006 forv2/v3")
+    if plan == "compliant_pinch_v4":
+        result["compliant_pinch_controller"] = _verify_compliant_controller(result["compliant_pinch_controller"])
+    elif result["compliant_pinch_controller"] is not None:
+        raise ValueError("Legacy diagnostic plans cannot silently select the compliant controller")
     if plan == "four_way_v1":
         if (result["candidate_path"] is not None or
                 any(result[key] != "" for key in ("candidate_sha256", "candidate_id"))):
@@ -132,7 +203,7 @@ def validate_probe_settings(value):
                 not _is_sha(result["candidate_sha256"]) or
                 not isinstance(result["candidate_id"], str) or not result["candidate_id"].strip()):
             raise ValueError("Geometry diagnostic plan requires explicit candidate path/SHA256/ID")
-        if plan == "geometry_pose_fixed_cluster_v3" and result["candidate_sha256"] != _V3_CANDIDATE_SHA256:
+        if plan in _FIXED_MODEL_PLANS and result["candidate_sha256"] != _V3_CANDIDATE_SHA256:
             raise ValueError("Fixed-cluster model comparison must preserve the pinned geometry candidate")
     for key, limit in (("max_wall_time_s", 3600), ("guided_closure_ramp_s", 6)):
         number = result[key]
@@ -324,6 +395,36 @@ def _finite_vector(value, length, description):
     return [float(x) for x in value]
 
 
+def _compliant_candidate_interventions(settings, target, limits, stages, duration):
+    """Declare control deviations without relabeling the pinned geometry file."""
+    if settings["profile_plan"] != "compliant_pinch_v4":
+        return None
+    parameters = settings["compliant_pinch_controller"]["parameters"]
+    budget = parameters["adaptive_thumb0_closing_budget_rad"]
+    lower, upper = limits[0]
+    endpoint = target[0] - budget
+    if not lower <= endpoint <= target[0] <= upper:
+        raise ValueError("Declared adaptive thumb0 interval violates pinned native joint bounds")
+    stage0_duration = parameters["stage0_duration_s"]
+    control_duration = duration - stages[1]["duration_s"] + stage0_duration
+    if not 0 < control_duration <= 6.:
+        raise ValueError("Compliant control schedule exceeds the unchanged six-second episode budget")
+    return {
+        "nominal_candidate_file_unchanged": True,
+        "nominal_targets_rad": list(target),
+        "thumb0_extra_closing_budget_rad": budget,
+        "thumb0_declared_target_interval_rad": [endpoint, target[0]],
+        "other_six_extra_closing_budget_rad": 0.,
+        "candidate_stage0_duration_s": stages[1]["duration_s"],
+        "controller_stage0_duration_s": stage0_duration,
+        "controller_nominal_stage_duration_total_s": control_duration,
+        "total_episode_budget_s": 6.,
+        "geometry_recomputed_by_protocol": False,
+        "physical_qualification": False,
+        "scope": "declared thumb0 and schedule control interventions; not unchanged candidate execution or support qualification",
+    }
+
+
 def _verify_geometry_candidate(config, settings, policy, reference):
     """Verify pinned offline evidence; never certify physical contact/support."""
     if settings["profile_plan"] == "four_way_v1":
@@ -424,7 +525,7 @@ def _verify_geometry_candidate(config, settings, policy, reference):
         _canonical(candidate)
     except (ValueError, TypeError) as exc:
         raise ValueError("Candidate offline geometry evidence must be finite JSON") from exc
-    return path, {"candidate_id": candidate["candidate_id"], "candidate_sha256": settings["candidate_sha256"],
+    result = {"candidate_id": candidate["candidate_id"], "candidate_sha256": settings["candidate_sha256"],
         "candidate_path": str(path), "schema_and_provenance_verified": True,
         "geometry_recomputed_by_protocol": False, "physical_qualification": False,
         "evidence_protocol": evidence["protocol"],
@@ -432,6 +533,10 @@ def _verify_geometry_candidate(config, settings, policy, reference):
         "admission_limitations": copy.deepcopy(candidate["admission_limitations"]),
         "self_collision_free_claimed": False, "stage_keyframes": copy.deepcopy(stages),
         "declared_stage_duration_s": duration, "dynamic_feasibility_verified": False}
+    interventions = _compliant_candidate_interventions(settings, target, limits, stages, duration)
+    if interventions is not None:
+        result["declared_control_interventions"] = interventions
+    return path, result
 
 
 def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
@@ -467,7 +572,7 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
         raise ValueError("Source actor observation/action/cadence ABI is invalid")
     candidate_path, candidate = _verify_geometry_candidate(config, settings, policy, reference)
     current_semantic_sha = _semantic_training_identity(config)
-    fixed_model = settings["profile_plan"] == "geometry_pose_fixed_cluster_v3"
+    fixed_model = settings["profile_plan"] in _FIXED_MODEL_PLANS
     expected_physics = _FIXED_PHYSICS if fixed_model else _OLD_PHYSICS
     if policy.get("physics_protocol") != _OLD_PHYSICS or config["rl_teacher"].get("physics_protocol") != expected_physics:
         raise ValueError("Diagnostic plan must use its exact old-v3 or declared new-v4 physics model")
@@ -494,10 +599,19 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
                 any(type(checkpoint_infos.get(key)) is not int for key in ("completed_updates", "optimizer_steps")) or
                 checkpoint_infos.get("policy_contract") != policy):
             raise ValueError("Source checkpoint metadata does not match its original frozen identities")
+    controller = settings["compliant_pinch_controller"]
     current_sha, guard, current_verified = _current_source_identity(), None, current_audit is not None
     if current_verified:
         if not isinstance(current_audit, dict) or current_audit.get("source_tree_sha256") != current_sha:
             raise ValueError("Current diagnostic source hash must truthfully match current package bytes")
+        actual_controller = current_audit.get("diagnostic_controller_protocol")
+        if controller is not None:
+            if _verify_compliant_controller(actual_controller) != controller:
+                raise ValueError("Current compliant controller declaration does not match the selected control plan")
+            if current_audit.get("control_probe_profile") != settings["profiles"][0]:
+                raise ValueError("Current native profile does not match the declared compliant pinch profile")
+        elif actual_controller is not None:
+            raise ValueError("Legacy diagnostic plans cannot report an undeclared compliant controller")
         actual = copy.deepcopy(current_audit.get("policy_contract"))
         if not isinstance(actual, dict):
             raise ValueError("Current diagnostic policy contract is missing")
@@ -532,6 +646,11 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
         "current_source_tree_sha256": current_sha, "control_guard_version": guard,
         "current_config_semantic_sha256": current_semantic_sha,
         "reference_rest_config_comparison_sha256": semantic_sha,
+        "diagnostic_controller_protocol": copy.deepcopy(controller),
+        "diagnostic_controller_protocol_sha256": _canonical(controller) if controller is not None else None,
+        "diagnostic_controller_protocol_source": (
+            "validated declared outer-control settings; not an environment-measured force or support certificate"
+            if controller is not None else None),
         "physics_model_comparison": {
             "old_checkpoint_physics_protocol": policy["physics_protocol"],
             "current_declared_physics_protocol": expected_physics,
