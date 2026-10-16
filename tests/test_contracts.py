@@ -38,6 +38,7 @@ def contract_fixture():
 class ConfigTests(unittest.TestCase):
     def test_noslip_version_changes_only_scene_identity_and_preserves_older_config(self):
         config = config_fixture()
+        config["scene"]["contact_model"]["backend"] = "source_default_v1"
         original = ActionContract.from_config(config, metadata=source_metadata())
         legacy = copy.deepcopy(config)
         del legacy["contact_calibration"]
@@ -465,10 +466,13 @@ class CheckpointTests(unittest.TestCase):
                 validate_checkpoint_metadata(metadata, self.contract, vocabulary, stats, observation_spec=self.spec)
 
     def test_original_checkpoint_cannot_cross_the_versioned_global_friction_solver(self):
-        candidate = replace(self.contract, scene_protocol=scene_protocol_for_contact_model({
+        original = replace(self.contract, scene_protocol=scene_protocol_for_contact_model({
+            "backend": "source_default_v1", "time_constant_s": .02, "damping_ratio": 1.}))
+        metadata = make_checkpoint_metadata(original, self.vocabulary, self.stats, observation_spec=self.spec)
+        candidate = replace(original, scene_protocol=scene_protocol_for_contact_model({
             "backend": "source_default_noslip10_v1", "time_constant_s": .02, "damping_ratio": 1.}))
         with self.assertRaises(ContractError):
-            validate_checkpoint_metadata(self.metadata, candidate, self.vocabulary, self.stats, observation_spec=self.spec)
+            validate_checkpoint_metadata(metadata, candidate, self.vocabulary, self.stats, observation_spec=self.spec)
 
     def test_missing_metadata_and_boolean_schema_rejected(self):
         with self.assertRaisesRegex(ContractError, "envelope"):

@@ -18,7 +18,7 @@
     "assisted_grasp": false,
     "seed": 42,
     "contact_model": {
-      "backend": "source_default_v1",
+      "backend": "source_default_noslip10_v1",
       "time_constant_s": 0.02,
       "damping_ratio": 1.0
     }
