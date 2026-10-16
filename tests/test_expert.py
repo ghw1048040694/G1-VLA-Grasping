@@ -12,7 +12,7 @@ from g1_vla.expert import (ExpertError, effective_compensation, hand_target,
                            _robot_self_contacts, collision_distance_residual,
                            arm_torso_collision_pairs, run_teacher_episode,
                            green_contact_penetration_evidence, bounded_planning_seed,
-                           interpolate, cartesian_path_executed)
+                           interpolate, cartesian_path_executed, measured_lift_start_budget)
 
 
 PROFILE = {
@@ -38,6 +38,20 @@ def sample(start, duration=.1, *, contact=True, height=.12, assisted=False, safe
 
 
 class TeacherTests(unittest.TestCase):
+    def test_lift_slow_start_depends_on_actual_cube_rise_not_arm_progress(self):
+        settings = {"backend": "measured_cube_slow_start_v1", "cube_rise_m": .01, "progress_scale": .1}
+        grip = {"object_position_m": [.3, -.1, .775]}
+        cap, row = measured_lift_start_budget(settings, "lift", grip, .775, .066)
+        self.assertAlmostEqual(cap, .0066)
+        self.assertTrue(row["reduced_progress_active"])
+        self.assertFalse(row["contact_preservation_guaranteed"])
+        self.assertIsNone(measured_lift_start_budget(settings, "lift", grip, .786, .066)[0])
+        self.assertIsNone(measured_lift_start_budget(settings, "grasp", None, .775, .066)[0])
+        original = dict(settings, backend="original_progress_v1")
+        self.assertEqual(measured_lift_start_budget(original, "lift", None, .775, .066), (None, None))
+        with self.assertRaises(ExpertError):
+            measured_lift_start_budget(settings, "lift", None, .775, .066)
+
     def gate(self, rows):
         return physical_gate(rows, lift_height_m=.1, hold_duration_s=.5)
 

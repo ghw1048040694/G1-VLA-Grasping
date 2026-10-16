@@ -462,6 +462,31 @@ def joint_limit_excesses(model, data, controlled):
     return result
 
 
+def measured_lift_start_budget(settings, phase, grip_lock, object_z_m, period_s):
+    """Reduce path arc-time until the free cube itself has risen from grip.
+
+    This is a declared scalar speed hypothesis, not a force-closure guarantee
+    or a change to the physical cadence, route, phase deadline or task gates.
+    Empty-hand upward motion cannot release the reduced-speed condition.
+    """
+    if settings["backend"] == "original_progress_v1" or phase != "lift":
+        return None, None
+    if settings["backend"] != "measured_cube_slow_start_v1" or grip_lock is None:
+        raise ExpertError("measured lift start requires an actual fixed grip")
+    origin = float(grip_lock["object_position_m"][2])
+    values = (origin, object_z_m, period_s, settings["cube_rise_m"], settings["progress_scale"])
+    if (not all(math.isfinite(value) for value in values) or period_s <= 0
+            or settings["cube_rise_m"] <= 0 or not 0 < settings["progress_scale"] <= 1):
+        raise ExpertError("invalid measured lift start state or budget")
+    rise = float(object_z_m - origin)
+    active = rise < settings["cube_rise_m"]
+    cap = period_s * settings["progress_scale"] if active else None
+    return cap, {"backend": settings["backend"], "cube_rise_from_actual_grip_m": rise,
+        "required_cube_rise_m": settings["cube_rise_m"], "reduced_progress_active": active,
+        "maximum_advance_s": cap, "physical_period_s": period_s,
+        "phase_deadline_unchanged": True, "contact_preservation_guaranteed": False}
+
+
 def run_teacher_episode(config, spec, run_dir):
     """Run exactly one predeclared layout and persist true control-step pairs.
 
@@ -940,7 +965,12 @@ def run_teacher_episode(config, spec, run_dir):
                     and np.linalg.norm(actual_pose["C"] - reference_pose["C"]) <= settings["reference_tracking_m"]
                     and (not active_plan["closed"] or rotation_error(active_plan["target_R"], actual_pose["R"])
                          <= settings["closed_orientation_tolerance_rad"]))
-                path_status = path_progress.step(actual_pose["arm"], np.asarray(controller.previous_target)[arm_indices], tracking_ready)
+                advance_cap, start_detail = measured_lift_start_budget(config["expert"]["lift_start"],
+                    current_phase, grip_lock, float(data.xpos[object_body, 2]), controller.cadence.period_s)
+                path_status = path_progress.step(actual_pose["arm"], np.asarray(controller.previous_target)[arm_indices],
+                    tracking_ready, maximum_advance_s=advance_cap)
+                if start_detail is not None:
+                    path_status["measured_lift_start"] = start_detail
                 trajectory["progress_blocked_count"] += int(path_status["blocked"])
                 if path_status["reference"] is None:
                     raise ExpertError("Cartesian follower has no legal acknowledged reference: {}".format(path_status["reason"]))

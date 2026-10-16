@@ -18,8 +18,8 @@
     "assisted_grasp": false,
     "seed": 42,
     "contact_model": {
-      "backend": "right_hand_green_compliance_v2",
-      "time_constant_s": 0.006,
+      "backend": "source_default_v1",
+      "time_constant_s": 0.02,
       "damping_ratio": 1.0
     }
   },
@@ -163,6 +163,11 @@
     },
     "contact_diagnostics": {
       "enabled": true
+    },
+    "lift_start": {
+      "backend": "measured_cube_slow_start_v1",
+      "cube_rise_m": 0.01,
+      "progress_scale": 0.1
     },
     "labels": {
       "backend": "native_causal_prefix_v1",

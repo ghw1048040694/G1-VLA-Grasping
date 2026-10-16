@@ -234,6 +234,10 @@ SCHEMA = {
             "joint_target_tolerance_rad": _positive, "phase_timeout_scale": _positive,
         },
         "contact_diagnostics": {"enabled": _boolean},
+        "lift_start": {
+            "backend": _choice("original_progress_v1", "measured_cube_slow_start_v1"),
+            "cube_rise_m": _positive, "progress_scale": _fraction,
+        },
         "hand_control": {
             "backend": _choice("fixed_closure_v1", "contact_normal_position_v2"),
             "normal_force_target_n": _positive, "maximum_group_force_n": _positive,
@@ -496,6 +500,13 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.train", "resume_checkpoint and warm_start_checkpoint are mutually exclusive")
     teacher = config["expert"]["teacher"]
     hand_control = config["expert"]["hand_control"]
+    lift_start = config["expert"]["lift_start"]
+    if lift_start["progress_scale"] <= 0:
+        _error("config.expert.lift_start", "progress scale must be positive and at most one")
+    if (lift_start["backend"] == "measured_cube_slow_start_v1"
+            and (teacher["profile"] != "green_right_cartesian_feedback_v4"
+                 or hand_control["backend"] != "contact_normal_position_v2")):
+        _error("config.expert.lift_start", "slow start requires the actual Cartesian grip and contact controller")
     contact_model = config["scene"]["contact_model"]
     if contact_model["backend"] == "source_default_v1" and contact_model["time_constant_s"] != .02:
         _error("config.scene.contact_model", "source default has the original 0.02 second reference")

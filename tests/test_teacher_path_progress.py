@@ -200,6 +200,76 @@ class PathProgressTests(unittest.TestCase):
         self.assertFalse(follower.step([.1, .2], [.1, .2], False)["complete"])
         self.assertTrue(follower.step([.1, .2], [.1, .2], True)["complete"])
 
+    def test_explicit_none_is_identical_to_original_records_and_references(self):
+        original, optional = self.make(chord_validator=clear), self.make(chord_validator=clear)
+        previous = [0., 0.]
+        for _ in range(5):
+            left = original.step(previous, previous, True)
+            right = optional.step(previous, previous, True, maximum_advance_s=None)
+            self.assertEqual(left, right)
+            self.assertNotIn("maximum_advance_s", right)
+            previous = left["reference"]
+        self.assertEqual(original.records, optional.records)
+
+    def test_arc_cap_shortens_progress_across_polyline_without_changing_physical_limits(self):
+        follower = self.make([[0., 0.], [.01, 0.], [.01, .01], [.1, .01]], [1., 1.], chord_validator=clear)
+        result = follower.step([0., 0.], [0., 0.], True, maximum_advance_s=.025)
+        self.assertAlmostEqual(result["u_s"], .025)
+        self.assertEqual(result["segment_index"], 2)
+        self.assertAlmostEqual(result["reference"][0], .015)
+        self.assertAlmostEqual(result["reference"][1], .01)
+        self.assertEqual(result["maximum_advance_s"], .025)
+        self.assertEqual(result["period_s"], .066)
+        self.assertTrue(result["limit_checks"]["passed"])
+        # Bounds still use the original 66ms period, not a redefined cadence.
+        self.assertEqual(result["limit_checks"]["intersection_upper"], [.066, .066])
+        self.assertEqual([x["context"]["kind"] for x in result["validation"]["checks"]],
+                         ["polyline_piece"] * 3 + ["applied_command_shortcut", "actual_state_to_candidate"])
+
+    def test_zero_cap_holds_acknowledges_and_can_confirm_executed_endpoint(self):
+        follower = self.make([[0., 0.], [.01, .005]])
+        hold = follower.step([0., 0.], [0., 0.], True, maximum_advance_s=0.)
+        self.assertEqual(hold["reference"], [0., 0.])
+        self.assertEqual(hold["u_s"], 0.)
+        self.assertEqual(hold["advanced_u_s"], 0.)
+        self.assertFalse(hold["blocked"])
+        self.assertFalse(hold["complete"])
+        request = follower.step([0., 0.], [0., 0.], True, maximum_advance_s=.01)
+        self.assertTrue(request["end_reference_reached"])
+        self.assertFalse(request["complete"])
+        ack = follower.step(request["reference"], request["reference"], True, maximum_advance_s=0.)
+        self.assertTrue(ack["complete"])
+        self.assertEqual(ack["executed_u_s"], request["u_s"])
+        self.assertEqual(ack["advanced_u_s"], 0.)
+
+    def test_cap_cannot_bypass_ack_tracking_anchor_or_geometry_rejection(self):
+        follower = self.make(chord_validator=clear)
+        proposed = follower.step([0., 0.], [0., 0.], True, maximum_advance_s=.01)
+        unacked = follower.step([0., 0.], [0., 0.], True, maximum_advance_s=0.)
+        self.assertIsNone(unacked["reference"])
+        self.assertTrue(unacked["blocked"])
+        self.assertEqual(unacked["executed_u_s"], 0.)
+        waiting = follower.step(proposed["reference"], proposed["reference"], False, maximum_advance_s=.01)
+        self.assertEqual(waiting["advanced_u_s"], 0.)
+        self.assertTrue(waiting["blocked"])
+        illegal = self.make().step([.5, 0.], [0., 0.], True, maximum_advance_s=0.)
+        self.assertIsNone(illegal["reference"])
+        self.assertFalse(illegal["limit_checks"]["passed"])
+        rejected = self.make(chord_validator=lambda *args: False).step([0., 0.], [0., 0.], True, maximum_advance_s=.01)
+        self.assertEqual(rejected["u_s"], 0.)
+        self.assertTrue(rejected["blocked"])
+        self.assertEqual(rejected["reason"], "geometry_validator_rejected")
+
+    def test_invalid_caps_do_not_change_progress_or_acknowledge_unexecuted_references(self):
+        follower = self.make()
+        proposed = follower.step([0., 0.], [0., 0.], True)
+        before = follower.records
+        for value in (-.001, .066001, float("nan"), float("inf"), True, "0.01"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                follower.step(proposed["reference"], proposed["reference"], True, maximum_advance_s=value)
+            self.assertEqual(follower.records, before)
+            self.assertEqual(follower.reference, proposed["reference"])
+
     def test_nonfinite_invalid_dimensions_bounds_and_period_are_rejected(self):
         for dt in (0., -1., float("nan"), float("inf")):
             with self.subTest(dt=dt), self.assertRaises(ValueError):

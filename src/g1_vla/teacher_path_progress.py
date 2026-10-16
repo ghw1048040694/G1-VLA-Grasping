@@ -213,7 +213,19 @@ class JointPathProgress:
                 return False, {"passed": False, "callback_used": True, "checks": checks}
         return True, {"passed": True, "callback_used": True, "checks": checks}
 
-    def step(self, actual, previous_applied, tracking_ready):
+    def step(self, actual, previous_applied, tracking_ready, *, maximum_advance_s=None):
+        """Advance at most one original period, optionally less path arc-time.
+
+        An explicit cap never changes the physical period used for velocity,
+        anchor or acknowledgment checks. Zero is a legal acknowledged hold;
+        caller phase clocks continue independently. None preserves the original
+        behavior and ledger schema exactly.
+        """
+        advance_budget = self._dt
+        if maximum_advance_s is not None:
+            advance_budget = _number(maximum_advance_s, "maximum_advance_s")
+            if advance_budget < 0 or advance_budget > self._dt:
+                raise ValueError("maximum_advance_s must lie in [0, period_s]")
         actual = _vector(actual, "actual", self._dimensions)
         previous = _vector(previous_applied, "previous_applied", self._dimensions)
         if not isinstance(tracking_ready, bool):
@@ -240,11 +252,14 @@ class JointPathProgress:
         elif not tracking_ready:
             reason, blocked = "waiting_for_actual_reference_tracking", True
         elif self._u < self.total_duration_s:
-            budget_end = min(self._u + self._dt, self.total_duration_s)
+            budget_end = min(self._u + advance_budget, self.total_duration_s)
             candidate_u, geometry_limited = self._bounded_progress(budget_end, lower, upper)
             candidate = self._at(candidate_u)
             if candidate_u <= self._u:
-                reason, blocked = "no_continuous_feasible_progress", True
+                if maximum_advance_s is not None and advance_budget == 0:
+                    reason = "maximum_advance_s_zero_hold"
+                else:
+                    reason, blocked = "no_continuous_feasible_progress", True
             else:
                 passed, validation = self._validate(actual, previous, candidate, candidate_u)
                 if not passed:
@@ -291,5 +306,7 @@ class JointPathProgress:
                       "intersection_lower": list(lower), "intersection_upper": list(upper),
                       "geometry_limited_at_corner_without_callback": geometry_limited},
                   "validation": validation}
+        if maximum_advance_s is not None:
+            record["maximum_advance_s"] = advance_budget
         self._records.append(copy.deepcopy(record))
         return copy.deepcopy(record)
