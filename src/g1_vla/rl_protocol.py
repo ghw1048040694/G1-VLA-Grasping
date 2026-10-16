@@ -25,8 +25,8 @@ RL_TEACHER_DEFAULTS = {
     "asset_manifest_path": ".runtime/rebuild/rl_assets/official_v1/asset_manifest.json",
     "asset_manifest_sha256": None, "seed_state_sha256": None,
     "checkpoint_path": None, "checkpoint_sha256": None,
-    "action_joint_names": RIGHT_ACTION_JOINTS, "device": "cuda:0", "num_envs": 32,
-    "smoke_env_counts": [1, 8, 32], "smoke_steps": 128, "seed": 2026101601,
+    "action_joint_names": RIGHT_ACTION_JOINTS, "device": "cuda:0", "num_envs": 512,
+    "smoke_env_counts": [1, 8, 32, 128, 256, 512], "smoke_steps": 128, "seed": 2026101601,
     "evaluation_seed": 2026101602, "smoke_seed": 2026101603, "episode_length_s": 6.0,
     "steps_per_env": 32, "max_iterations": 400, "max_wall_time_s": 3600,
     "eval_interval": 50, "eval_episodes": 32, "eval_num_envs": 8, "save_interval": 50,
@@ -47,6 +47,7 @@ RL_TEACHER_DEFAULTS = {
     "palm_friction": 2.0, "max_depenetration_velocity_m_s": 0.2,
     "migration_position_tolerance_m": 0.001, "migration_rotation_tolerance_rad": 0.01,
     "recursive_leaf_pattern_match": False,
+    "contact_extraction_backend": "cube_partner_once_v3",
     "reward_reach": 1.0, "reward_fingertip": 0.5, "reward_contact": 1.0,
     "reward_clearance": 4.0, "reward_support": 2.0, "reward_lift": 5.0,
     "reward_success": 10.0, "penalty_action_change": 0.01,
@@ -97,7 +98,8 @@ def validate_rl_settings(settings):
         if settings[key] != RL_TEACHER_DEFAULTS[key]:
             raise ValueError(key + " requires an explicitly new protocol before it can change")
     for key in ("palm_friction", "max_depenetration_velocity_m_s",
-                "migration_position_tolerance_m", "migration_rotation_tolerance_rad", "recursive_leaf_pattern_match"):
+                "migration_position_tolerance_m", "migration_rotation_tolerance_rad", "recursive_leaf_pattern_match",
+                "contact_extraction_backend"):
         if settings[key] != RL_TEACHER_DEFAULTS[key]:
             raise ValueError(key + " requires an explicitly new physical protocol")
     if any(settings[key] < 0 for key in RL_TEACHER_DEFAULTS if key.startswith(("reward_", "penalty_"))):
@@ -108,8 +110,10 @@ def validate_rl_settings(settings):
         "episode_length_s", "action_scale_rad", "position_iterations", "velocity_iterations")
     if any(settings[key] <= 0 for key in positive):
         raise ValueError("RL budgets and learning parameters must be positive")
-    if settings["num_envs"] > 32 or settings["max_iterations"] > 400 or settings["max_wall_time_s"] > 3600:
-        raise ValueError("first declared RL budget is at most32 envs,400 updates and3600 seconds")
+    if settings["num_envs"] > 512 or settings["max_iterations"] > 400 or settings["max_wall_time_s"] > 3600:
+        raise ValueError("scaled RL budget is at most512 envs,400 updates and3600 seconds")
+    if settings["num_envs"] * settings["steps_per_env"] * settings["max_iterations"] > 6553600:
+        raise ValueError("scaled RL budget permits at most6553600 training transitions")
     if settings["smoke_steps"] * .066 < settings["episode_length_s"]:
         raise ValueError("smoke step budget must span at least one full episode duration")
     if settings["action_scale_rad"] > .08 or settings["eval_num_envs"] > settings["num_envs"]:
@@ -127,7 +131,7 @@ def validate_rl_settings(settings):
     if len({settings[key] for key in ("seed", "evaluation_seed", "smoke_seed")}) != 3:
         raise ValueError("train, validation and smoke seeds must differ")
     if (settings["smoke_env_counts"] != sorted(set(settings["smoke_env_counts"]))
-            or any(type(n) is not int or n <= 0 or n > 32 for n in settings["smoke_env_counts"])
+            or any(type(n) is not int or n <= 0 or n > 512 for n in settings["smoke_env_counts"])
             or settings["num_envs"] not in settings["smoke_env_counts"]):
         raise ValueError("training env count requires a declared monotonic smoke scale")
     if any(type(n) is not int or n <= 0 or n > 256 for n in settings["hidden_dims"]):

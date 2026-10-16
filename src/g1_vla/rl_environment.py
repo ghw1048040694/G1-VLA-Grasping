@@ -17,6 +17,10 @@ from .contracts import canonical_sha256, read_joint_order
 
 
 ENVIRONMENT_VERSION = "g1_physx_official_precontact_rl_v2"
+CONTACT_COLLECTION_VERSION = "cube_partner_once_v3"
+CONTACT_CROSSCHECK = {"num_envs": 1, "physics_samples": 33, "minimum_nonzero_contact_samples": 1,
+                      "force_atol_n": 1e-5, "force_rtol": 1e-4,
+                      "position_atol_m": 1e-6, "normal_atol": 1e-5}
 OBSERVATION_VERSION = "privileged_state_xyzw_81_v1"
 ACTION_VERSION = "right_arm_hand_velocity_limited_14_v1"
 OBSERVATION_DIM = 81
@@ -80,6 +84,10 @@ DEFAULT_SETTINGS = {
 
 class RLEnvironmentError(ValueError):
     """An unsafe or incompatible RL environment specification."""
+
+
+class ContactEquivalenceError(AssertionError):
+    """A same-step native contact-view crosscheck failed; never unsupported."""
 
 
 def wxyz_to_xyzw(quaternion):
@@ -154,6 +162,8 @@ def resolve_settings(config):
     settings = dict(DEFAULT_SETTINGS)
     settings.update(config.get("rl_teacher", {}).get("environment", {}))
     rl = config.get("rl_teacher", {})
+    if rl.get("contact_extraction_backend", CONTACT_COLLECTION_VERSION) != CONTACT_COLLECTION_VERSION:
+        raise RLEnvironmentError("RL contact extraction backend differs from this source protocol")
     for key in DEFAULT_SETTINGS:
         if key in rl:
             settings[key] = rl[key]
@@ -310,6 +320,147 @@ def cube_contact_partner_layout(robot_body_paths, hand_contact_names):
     return names, [index for index, name in enumerate(names) if index > 0 and name not in hand_contact_names]
 
 
+def _ragged_contact_indices(torch, counts, starts, capacity):
+    """Copy shared SDK indices, validate once, and unpack all pairs together."""
+    # Native normal/friction getters reuse the same counts/starts storage.
+    # Conversion copies both arrays before a subsequent native getter runs.
+    counts, starts = counts.to(dtype=torch.int64).clone(), starts.to(dtype=torch.int64).clone()
+    flat_count, flat_start = counts.flatten(), starts.flatten()
+    valid = (flat_count >= 0) & ((flat_count == 0) | ((flat_start >= 0) & (flat_start+flat_count <= capacity)))
+    if not bool(valid.all()):
+        raise RLEnvironmentError("native contact stream overflow or invalid pair indices")
+    bucket = torch.repeat_interleave(torch.arange(flat_count.numel(), device=counts.device), flat_count)
+    offset = torch.repeat_interleave(torch.cumsum(flat_count, 0)-flat_count, flat_count)
+    local = torch.arange(bucket.numel(), device=counts.device)-offset
+    indices = torch.repeat_interleave(flat_start, flat_count)+local
+    return counts, starts, bucket, indices, local
+
+
+def _reduce_friction_pairs(torch, forces, points, counts, starts):
+    """Reduce the installed SDK's (forces, points, counts, starts) tuple."""
+    counts, starts, bucket, indices, local = _ragged_contact_indices(torch, counts, starts, forces.shape[0])
+    selected_force, selected_points = forces[indices], points[indices]
+    if not bool(torch.isfinite(torch.cat((selected_force.flatten(), selected_points.flatten()))).all()):
+        raise FloatingPointError("nonfinite native friction force/position")
+    result = torch.zeros(counts.numel(), 3, dtype=forces.dtype, device=forces.device)
+    result.index_add_(0, bucket, selected_force)
+    return result.reshape(*counts.shape, 3), {"bucket": bucket, "indices": indices,
+                                             "force": selected_force, "point": selected_points,
+                                             "counts": counts, "starts": starts}
+
+
+def _reduce_contact_pairs(torch, *, normal, friction, net_normal, force, points, normals,
+                          separation, counts, starts, hand_indices, force_threshold, hand_inverse=None):
+    """One sparse GPU reduction for every Cube partner, plus all eight hands.
+
+    The result's hand vectors/normals act on the hand; Cube raw positions,
+    separations, scalar normal forces and counts retain their native values.
+    No view ordering is assumed: hand_indices explicitly maps named bodies.
+    """
+    num_envs, width = counts.shape
+    counts, starts, bucket, indices, local = _ragged_contact_indices(torch, counts, starts, force.numel())
+    raw_force, raw_normals = force[indices], normals[indices]
+    raw_separation, raw_points = separation[indices], points[indices]
+    finite_values = torch.cat(tuple(value.flatten() for value in
+                                   (normal, friction, net_normal, raw_force, raw_normals, raw_separation, raw_points)))
+    if not bool(torch.isfinite(finite_values).all()):
+        raise FloatingPointError("nonfinite native cube partner contact stream")
+    fn = torch.zeros(num_envs*width, dtype=normal.dtype, device=normal.device)
+    depth, vertical = torch.zeros_like(fn), torch.zeros_like(fn)
+    physically_loaded = torch.zeros(num_envs*width, dtype=torch.int64, device=normal.device)
+    fn.scatter_add_(0, bucket, raw_force.abs())
+    depth.scatter_reduce_(0, bucket, (-raw_separation).clamp_min(0), reduce="amax", include_self=True)
+    loaded = raw_force.abs() > force_threshold
+    vertical.scatter_reduce_(0, bucket, torch.where(loaded, raw_normals[:, 2].abs(), 0), reduce="amax", include_self=True)
+    physically_loaded.scatter_add_(0, bucket, ((raw_force.abs() > 0) & (raw_separation <= 0)).long())
+    fn, depth, vertical, physically_loaded = (value.reshape(num_envs, width)
+                                            for value in (fn, depth, vertical, physically_loaded))
+    if not hasattr(hand_indices, "device") and len(set(hand_indices)) != 8:
+        raise RLEnvironmentError("eight distinct named hand partners are required")
+    hand_indices = torch.as_tensor(hand_indices, device=normal.device, dtype=torch.int64)
+    if hand_indices.numel() != 8:
+        raise RLEnvironmentError("eight distinct named hand partners are required")
+    if bool((counts[:, hand_indices] > 32).any()):
+        raise RLEnvironmentError("hand contact count exceeds the unchanged 32-point capacity")
+    inverse = hand_inverse
+    if inverse is None:
+        inverse = torch.full((width,), -1, device=normal.device, dtype=torch.int64)
+        inverse[hand_indices] = torch.arange(8, device=normal.device)
+    hand_id = inverse[bucket % width]
+    selected = hand_id >= 0
+    owner = torch.div(bucket[selected], width, rounding_mode="floor")
+    hand_id, hand_local = hand_id[selected], local[selected]
+    padded_normal = torch.zeros(num_envs, 8, 32, 3, device=normal.device, dtype=normal.dtype)
+    padded_point = torch.zeros_like(padded_normal)
+    padded_separation = torch.zeros(num_envs, 8, 32, device=normal.device, dtype=normal.dtype)
+    padded_force = torch.zeros_like(padded_separation)
+    padded_valid = torch.zeros_like(padded_separation, dtype=torch.bool)
+    padded_loaded = torch.zeros_like(padded_valid)
+    padded_normal[owner, hand_id, hand_local] = -raw_normals[selected]
+    padded_point[owner, hand_id, hand_local] = raw_points[selected]
+    padded_separation[owner, hand_id, hand_local] = raw_separation[selected]
+    padded_force[owner, hand_id, hand_local] = raw_force[selected]
+    padded_valid[owner, hand_id, hand_local] = True
+    padded_loaded[owner, hand_id, hand_local] = loaded[selected]
+    hand = {"normal": -normal[:, hand_indices], "friction": -friction[:, hand_indices],
+            "fn": fn[:, hand_indices], "depth": depth[:, hand_indices], "vertical": vertical[:, hand_indices],
+            "physical_loaded_count": physically_loaded[:, hand_indices],
+            "point_normal": padded_normal, "point_loaded": padded_loaded, "point_valid": padded_valid,
+            "point": padded_point, "separation": padded_separation, "point_force": padded_force}
+    return {"normal": normal, "friction": friction, "fn": fn, "depth": depth,
+            "physical_loaded_count": physically_loaded, "hand": hand,
+            "unfiltered_normal_residual_n": torch.linalg.vector_norm(net_normal-normal.sum(dim=1), dim=-1),
+            "raw": {"bucket": bucket, "force": raw_force, "normal": raw_normals,
+                    "separation": raw_separation, "point": raw_points, "counts": counts, "starts": starts}}
+
+
+def _summarize_hand_contacts(torch, hand):
+    """Apply the unchanged per-finger/group and raw distal-normal definitions."""
+    fn = hand["fn"]
+    groups = torch.stack((fn[:, :3].sum(dim=1), fn[:, 3:5].sum(dim=1), fn[:, 5:7].sum(dim=1)), dim=-1)
+    distal_normal, distal_loaded = hand["point_normal"][:, (2, 4, 6)], hand["point_loaded"][:, (2, 4, 6)]
+    dots = torch.einsum("nki,ngli->ngkl", distal_normal[:, 0], distal_normal[:, 1:])
+    valid = distal_loaded[:, 0, None, :, None] & distal_loaded[:, 1:, None, :]
+    values = torch.where(valid, dots, -torch.ones_like(dots)).amax(dim=(-1, -2))
+    opposition = torch.where(valid.any(dim=(-1, -2)), values, torch.ones_like(values)).amax(dim=-1)
+    return {"normal_sum": -hand["normal"].sum(dim=1),
+            "total_sum": -(hand["normal"]+hand["friction"]).sum(dim=1),
+            "groups": groups, "depth": hand["depth"].amax(dim=1),
+            "normal_vertical": torch.where(fn > 0.02, hand["vertical"], 0).amax(dim=1),
+            "opposition": opposition}
+
+
+def _compare_hand_contacts(torch, actual, reference, tolerances=CONTACT_CROSSCHECK):
+    """Compare independent views without assuming their raw point ordering."""
+    differences, valid = {}, []
+    for name in ("normal", "friction", "fn", "depth", "vertical", "physical_loaded_count"):
+        left, right = actual[name], reference[name]
+        differences[name] = float((left-right).abs().amax().item())
+        if name == "physical_loaded_count":
+            valid.append(torch.equal(left, right))
+        else:
+            is_force = name in ("normal", "friction", "fn")
+            atol = tolerances["force_atol_n"] if is_force else (
+                tolerances["position_atol_m"] if name == "depth" else tolerances["normal_atol"])
+            valid.append(bool(torch.isclose(left, right, atol=atol,
+                                           rtol=tolerances["force_rtol"] if is_force else 0).all()))
+    valid.append(torch.equal(actual["point_valid"].sum(-1), reference["point_valid"].sum(-1)))
+    position_difference = torch.linalg.vector_norm(actual["point"][:, :, :, None]-reference["point"][:, :, None, :], dim=-1)
+    normal_difference = torch.linalg.vector_norm(actual["point_normal"][:, :, :, None]-reference["point_normal"][:, :, None, :], dim=-1)
+    separation_difference = (actual["separation"][:, :, :, None]-reference["separation"][:, :, None, :]).abs()
+    point_force_close = torch.isclose(actual["point_force"][:, :, :, None], reference["point_force"][:, :, None, :],
+                                     atol=tolerances["force_atol_n"], rtol=tolerances["force_rtol"])
+    matches = (position_difference <= tolerances["position_atol_m"]) & (normal_difference <= tolerances["normal_atol"])
+    matches &= (separation_difference <= tolerances["position_atol_m"]) & point_force_close
+    matches &= actual["point_valid"][:, :, :, None] & reference["point_valid"][:, :, None, :]
+    valid.append(bool(((~actual["point_valid"]) | matches.any(-1)).all()))
+    valid.append(bool(((~reference["point_valid"]) | matches.any(-2)).all()))
+    # The actual gates are exact Boolean comparisons: numeric tolerances never
+    # authorize a disagreement at one of the original physical thresholds.
+    return {"passed": all(valid), "maximum_absolute_differences": differences,
+            "unordered_raw_points_match": valid[-1] and valid[-2] and valid[-3]}
+
+
 def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_mode=False, output_dir=None):
     """Build the state-only local grasp curriculum after Isaac AppLauncher.
 
@@ -439,13 +590,27 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._next_action_origin = "policy_or_zero_target_hold"
             self._action_origin = "not_started"
             self._state_hold_request_clipped = 0
+            self._contact_crosscheck = {"protocol": CONTACT_COLLECTION_VERSION,
+                                       "required_physics_samples": CONTACT_CROSSCHECK["physics_samples"],
+                                       "enabled": num_envs == CONTACT_CROSSCHECK["num_envs"],
+                                       "completed_physics_samples": 0, "completed_nonzero_samples": 0, "started": False,
+                                       "status": "pending_nonzero_contact" if num_envs == 1 else "not_requested_multi_env",
+                                       "maximum_absolute_differences": {}, "first_failure": None}
+            self._crosscheck_record = None
             super().__init__(EnvironmentCfg(), render_mode=None)
             self._contact_body_binding_audit = {}
-            for sensor, name in zip(self._hand_sensors + [self._cube_sensor], list(sensor_body_names) + ["Cube"]):
+            binding_names = (list(sensor_body_names) if self._hand_sensors else []) + ["Cube"]
+            for sensor, name in zip(self._hand_sensors + [self._cube_sensor], binding_names):
                 paths = list(sensor.body_physx_view.prim_paths)
                 if len(paths) != self.num_envs or any(path.rsplit("/", 1)[-1] != name for path in paths):
                     raise RLEnvironmentError("native contact sensor did not bind exactly one declared rigid body per environment: " + name)
                 self._contact_body_binding_audit[name] = paths
+            # The full Cube ledger explicitly names every hand. Only the
+            # bounded one-environment crosscheck creates the old eight views.
+            self._cube_hand_filter_indices = [self._cube_filter_body_names.index(name) for name in sensor_body_names]
+            self._cube_hand_index_tensor = torch.tensor(self._cube_hand_filter_indices, device=self.device)
+            self._cube_hand_inverse = torch.full((len(self._cube_filter_body_names),), -1, dtype=torch.int64, device=self.device)
+            self._cube_hand_inverse[self._cube_hand_index_tensor] = torch.arange(8, device=self.device)
             if not self.robot.is_fixed_base or self.robot.num_base_dofs != 0:
                 raise RLEnvironmentError("native physics did not recognize the imported robot as fixed-root")
             if self._evaluation_camera is not None:
@@ -642,7 +807,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             all_body_paths = sensor_body_path_map(all_body_entries, [entry[0] for entry in all_body_entries])
             self._cube_filter_body_names, self._cube_other_filter_indices = cube_contact_partner_layout(all_body_paths, sensor_body_names)
             self._hand_sensors = []
-            for body in sensor_body_names:
+            for body in sensor_body_names if self._contact_crosscheck["enabled"] else ():
                 sensor = ContactSensor(ContactSensorCfg(
                     prim_path=paths[body], update_period=0.0,
                     filter_prim_paths_expr=["/World/envs/env_.*/Cube"],
@@ -754,6 +919,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             vertical = torch.zeros_like(fn)
             loaded_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
             padded_normal = torch.zeros(self.num_envs, 32, 3, device=self.device)
+            padded_point = torch.zeros_like(padded_normal)
+            padded_separation = torch.zeros(self.num_envs, 32, device=self.device)
+            padded_force = torch.zeros_like(padded_separation)
+            padded_valid = torch.zeros(self.num_envs, 32, dtype=torch.bool, device=self.device)
             padded_loaded = torch.zeros(self.num_envs, 32, dtype=torch.bool, device=self.device)
             if len(indices):
                 fn.scatter_add_(0, owners, torch.abs(force[indices]))
@@ -767,6 +936,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 loaded_count.scatter_add_(0, owners, physically_loaded.long())
                 local_ids = torch.arange(len(owners), device=self.device)-repeated_offsets
                 padded_normal[owners, local_ids] = normals[indices]
+                padded_point[owners, local_ids] = tensor(points).reshape(-1, 3)[indices]
+                padded_separation[owners, local_ids] = separation[indices]
+                padded_force[owners, local_ids] = force[indices]
+                padded_valid[owners, local_ids] = True
                 padded_loaded[owners, local_ids] = loaded
             if self._record:
                 selected = owners < min(8, self.num_envs)
@@ -780,59 +953,128 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "friction_force_on_sensor_w_n": friction[:min(8, self.num_envs)],
                     "physical_loaded_count": loaded_count[:min(8, self.num_envs)],
                 }
-            return normal, friction, fn, depth, vertical, loaded_count, padded_normal, padded_loaded
+            return {"normal": normal, "friction": friction, "fn": fn, "depth": depth,
+                    "vertical": vertical, "physical_loaded_count": loaded_count,
+                    "point_normal": padded_normal, "point_loaded": padded_loaded,
+                    "point": padded_point, "separation": padded_separation,
+                    "point_force": padded_force, "point_valid": padded_valid}
 
         def _cube_contact_values(self):
-            """Read every explicit partner in one native query and GPU reduction."""
+            """Read one native view; never trigger ContactSensor.data updates."""
             sensor = self._cube_sensor
-            data = sensor.data
+            view = sensor.contact_view
             width = len(self._cube_filter_body_names)
-            normal = tensor(data.force_matrix_w).reshape(self.num_envs, width, 3)
-            friction = tensor(data.friction_forces_w).reshape(self.num_envs, width, 3)
-            force, points, normals, separation, counts, starts = sensor.contact_view.get_contact_data(dt=self.physics_dt)
+            normal = tensor(view.get_contact_force_matrix(dt=self.physics_dt)).reshape(self.num_envs, width, 3)
+            cube_normal = tensor(view.get_net_contact_forces(dt=self.physics_dt)).reshape(self.num_envs, 3)
+            friction_force, friction_points, friction_counts, friction_starts = view.get_friction_data(dt=self.physics_dt)
+            friction, friction_raw = _reduce_friction_pairs(
+                torch, tensor(friction_force).reshape(-1, 3), tensor(friction_points).reshape(-1, 3),
+                tensor(friction_counts).reshape(self.num_envs, width), tensor(friction_starts).reshape(self.num_envs, width))
+            # The preceding reducer copied/reduced the shared counts/starts.
+            # This final getter may overwrite the SDK's shared index buffers.
+            force, points, normals, separation, counts, starts = view.get_contact_data(dt=self.physics_dt)
             force, points = tensor(force).flatten(), tensor(points).reshape(-1, 3)
             normals, separation = tensor(normals).reshape(-1, 3), tensor(separation).flatten()
-            counts = tensor(counts).long().reshape(self.num_envs, -1)
-            starts = tensor(starts).long().reshape(self.num_envs, -1)
+            counts, starts = tensor(counts).reshape(self.num_envs, -1), tensor(starts).reshape(self.num_envs, -1)
             if counts.shape[1] != width:
                 raise RLEnvironmentError("cube partner columns differ from explicit rigid-body filters")
-            flat_counts, flat_starts = counts.flatten(), starts.flatten()
-            if bool((flat_counts < 0).any()) or bool((flat_starts[flat_counts > 0]+flat_counts[flat_counts > 0] > len(force)).any()):
-                raise RLEnvironmentError("cube contact stream has overflow or invalid indices")
-            bucket = torch.repeat_interleave(torch.arange(self.num_envs*width, device=self.device), flat_counts)
-            offset = torch.repeat_interleave(torch.cumsum(flat_counts, 0)-flat_counts, flat_counts)
-            indices = torch.repeat_interleave(flat_starts, flat_counts)+torch.arange(len(bucket), device=self.device)-offset
-            raw_force, raw_separation = force[indices], separation[indices]
-            if not all(bool(torch.isfinite(value).all()) for value in
-                       (normal, friction, raw_force, raw_separation, normals[indices], points[indices])):
-                raise FloatingPointError("nonfinite native cube partner contact stream")
-            fn = torch.zeros(self.num_envs*width, device=self.device)
-            depth = torch.zeros_like(fn)
-            loaded = torch.zeros(self.num_envs*width, dtype=torch.int64, device=self.device)
-            if len(indices):
-                fn.scatter_add_(0, bucket, torch.abs(raw_force))
-                depth.scatter_reduce_(0, bucket, (-raw_separation).clamp_min(0), reduce="amax", include_self=True)
-                loaded.scatter_add_(0, bucket, ((torch.abs(raw_force) > 0) & (raw_separation <= 0)).long())
-            fn, depth, loaded = (value.reshape(self.num_envs, width) for value in (fn, depth, loaded))
+            result = _reduce_contact_pairs(torch, normal=normal, friction=friction, net_normal=cube_normal,
+                                          force=force, points=points, normals=normals, separation=separation,
+                                          counts=counts, starts=starts, hand_indices=self._cube_hand_index_tensor,
+                                          hand_inverse=self._cube_hand_inverse,
+                                          force_threshold=settings["group_force_min_n"])
+            fn, depth, loaded, raw = result["fn"], result["depth"], result["physical_loaded_count"], result["raw"]
             if self._record:
-                owners = torch.div(bucket, width, rounding_mode="floor")
+                owners = torch.div(raw["bucket"], width, rounding_mode="floor")
                 selected = owners < min(8, self.num_envs)
-                selected_indices = indices[selected]
                 self._raw_contact_tensors["Cube:all_explicit_partners"] = {
-                    "env_id": owners[selected], "partner_filter_index": bucket[selected] % width,
-                    "normal_force_n": force[selected_indices], "separation_m": separation[selected_indices],
-                    "normal_w": normals[selected_indices], "position_w_m": points[selected_indices],
+                    "env_id": owners[selected], "partner_filter_index": raw["bucket"][selected] % width,
+                    "normal_force_n": raw["force"][selected], "separation_m": raw["separation"][selected],
+                    "normal_w": raw["normal"][selected], "position_w_m": raw["point"][selected],
                     "normal_force_on_sensor_by_partner_w_n": normal[:min(8, self.num_envs)],
                     "friction_force_on_sensor_by_partner_w_n": friction[:min(8, self.num_envs)],
                     "physical_loaded_count_by_partner": loaded[:min(8, self.num_envs)]}
+                friction_owner = torch.div(friction_raw["bucket"], width, rounding_mode="floor")
+                selected = friction_owner < min(8, self.num_envs)
+                self._raw_contact_tensors["Cube:friction_explicit_partners"] = {
+                    "env_id": friction_owner[selected], "partner_filter_index": friction_raw["bucket"][selected] % width,
+                    "friction_force_on_cube_w_n": friction_raw["force"][selected],
+                    "friction_point_world_m": friction_raw["point"][selected]}
+                for index, name in enumerate(sensor_body_names):
+                    hand = result["hand"]
+                    env_ids, point_ids = torch.where(hand["point_valid"][:min(8, self.num_envs), index])
+                    self._raw_contact_tensors[name+":derived_from_cube"] = {
+                        "env_id": env_ids, "normal_force_n": hand["point_force"][env_ids, index, point_ids],
+                        "separation_m": hand["separation"][env_ids, index, point_ids],
+                        "normal_w": hand["point_normal"][env_ids, index, point_ids],
+                        "position_w_m": hand["point"][env_ids, index, point_ids],
+                        "normal_force_on_sensor_w_n": hand["normal"][:min(8, self.num_envs), index],
+                        "friction_force_on_sensor_w_n": hand["friction"][:min(8, self.num_envs), index],
+                        "physical_loaded_count": hand["physical_loaded_count"][:min(8, self.num_envs), index]}
             other = self._cube_other_filter_indices
-            cube_normal = tensor(data.net_forces_w).reshape(self.num_envs, -1, 3).sum(dim=1)
-            residual = torch.linalg.vector_norm(cube_normal-normal.sum(dim=1), dim=-1)
             return {"table_normal": normal[:, 0], "table_fn": fn[:, 0], "table_loaded_count": loaded[:, 0],
                     "robot_normal": normal[:, 1:].sum(dim=1), "robot_fn": fn[:, 1:].sum(dim=1),
                     "maximum_penetration_m": depth.amax(dim=1),
                     "other_fn": fn[:, other].sum(dim=1), "other_loaded_count": loaded[:, other].sum(dim=1),
-                    "unfiltered_normal_residual_n": residual}
+                    "unfiltered_normal_residual_n": result["unfiltered_normal_residual_n"],
+                    "hand": result["hand"]}
+
+        def _crosscheck_hand_views(self, hand):
+            audit = self._contact_crosscheck
+            if not audit["enabled"] or audit["completed_physics_samples"] >= audit["required_physics_samples"]:
+                return None
+            has_contact = bool((hand["fn"] > 0).any())
+            if not audit["started"] and not has_contact:
+                return None
+            audit["started"] = True
+            references = [self._contact_values(sensor) for sensor in self._hand_sensors]
+            reference = {name: torch.stack([item[name] for item in references], dim=1) for name in hand}
+            self._crosscheck_current_raw = (hand, reference)
+            comparison = _compare_hand_contacts(torch, hand, reference)
+            audit["completed_physics_samples"] += 1
+            if has_contact:
+                audit["completed_nonzero_samples"] += 1
+            for name, value in comparison["maximum_absolute_differences"].items():
+                audit["maximum_absolute_differences"][name] = max(value, audit["maximum_absolute_differences"].get(name, 0))
+            audit["status"] = ("passed" if comparison["passed"] and
+                               audit["completed_physics_samples"] >= audit["required_physics_samples"] and
+                               audit["completed_nonzero_samples"] >= CONTACT_CROSSCHECK["minimum_nonzero_contact_samples"] else "checking")
+            row = {"event": "same_physics_step_contact_crosscheck", "physics_sample": self._physics_samples+1,
+                   "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                   "has_nonzero_hand_contact": has_contact, "hand_names": list(sensor_body_names),
+                   "comparison": comparison, "tolerances": CONTACT_CROSSCHECK,
+                   "completed_physics_samples": audit["completed_physics_samples"],
+                   "completed_nonzero_samples": audit["completed_nonzero_samples"]}
+            if not comparison["passed"]:
+                row["cube_derived_hand"] = {name: value.detach().cpu().tolist() for name, value in hand.items()}
+                row["independent_hand_sensor"] = {name: value.detach().cpu().tolist() for name, value in reference.items()}
+                audit["status"], audit["first_failure"] = "failed", row
+            if output:
+                if self._crosscheck_record is None:
+                    self._crosscheck_record = (output / "contact_collection_crosscheck.jsonl").open("x", encoding="utf-8")
+                self._crosscheck_record.write(json.dumps(_json_finite(row), allow_nan=False)+"\n")
+                self._crosscheck_record.flush()
+            if not comparison["passed"]:
+                raise ContactEquivalenceError("Cube-derived and independent hand contact views disagree")
+            return _summarize_hand_contacts(torch, reference)
+
+        def _check_crosscheck_gates(self, actual, reference):
+            if reference is None:
+                return
+            different = {name: bool((actual[name] != reference[name]).any()) for name in actual}
+            if any(different.values()):
+                row = {"event": "contact_gate_crosscheck_failure", "physics_sample": self._physics_samples+1,
+                       "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                       "different_gates": different,
+                       "actual": {name: value.detach().cpu().tolist() for name, value in actual.items()},
+                       "reference": {name: value.detach().cpu().tolist() for name, value in reference.items()}}
+                for label, values in zip(("cube_derived_hand", "independent_hand_sensor"), self._crosscheck_current_raw):
+                    row[label] = {name: value.detach().cpu().tolist() for name, value in values.items()}
+                self._contact_crosscheck["status"], self._contact_crosscheck["first_failure"] = "failed", row
+                if self._crosscheck_record:
+                    self._crosscheck_record.write(json.dumps(row)+"\n")
+                    self._crosscheck_record.flush()
+                raise ContactEquivalenceError("same-step contact gate Boolean mismatch")
 
         def _physical_state(self):
             cube_position = tensor(self.cube.data.root_pos_w)
@@ -859,32 +1101,20 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             joint_tolerance = float(config["eval"]["joint_limit_tolerance_rad"])
             joint_safe = ((tensor(self.robot.data.joint_pos) >= self._limits[..., 0] - joint_tolerance) &
                           (tensor(self.robot.data.joint_pos) <= self._limits[..., 1] + joint_tolerance)).all(dim=-1)
-            normal_sum = torch.zeros(self.num_envs, 3, device=self.device)
-            total_sum = torch.zeros_like(normal_sum)
+            total_sum = torch.zeros(self.num_envs, 3, device=self.device)
             groups = torch.zeros(self.num_envs, 3, device=self.device)
-            directions = torch.zeros(self.num_envs, 3, 3, device=self.device)
             depth = torch.zeros(self.num_envs, device=self.device)
             normal_vertical = torch.zeros_like(depth)
-            hand_loaded_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
-            hand_fn = torch.zeros_like(depth)
-            distal_normals, distal_loaded = {}, {}
+            opposition = torch.ones(self.num_envs, device=self.device)
+            reference_summary = None
             contact_available = self._force_unavailable is None
             try:
-                for index, sensor in enumerate(self._hand_sensors):
-                    normal, friction, fn, current_depth, vertical, loaded_count, point_normal, point_loaded = self._contact_values(sensor)
-                    normal_sum -= normal
-                    total_sum -= normal + friction
-                    hand_fn += fn
-                    hand_loaded_count += loaded_count
-                    depth = torch.maximum(depth, current_depth)
-                    normal_vertical = torch.maximum(normal_vertical, torch.where(fn > 0.02, vertical, 0.0))
-                    if index < 7:
-                        group = 0 if index < 3 else 1 if index < 5 else 2
-                        groups[:, group] += fn
-                        directions[:, group] -= normal
-                        if index in (2, 4, 6):
-                            distal_normals[group], distal_loaded[group] = point_normal, point_loaded
                 cube_contacts = self._cube_contact_values()
+                summary = _summarize_hand_contacts(torch, cube_contacts["hand"])
+                reference_summary = self._crosscheck_hand_views(cube_contacts["hand"])
+                total_sum, groups = summary["total_sum"], summary["groups"]
+                depth, normal_vertical = summary["depth"], summary["normal_vertical"]
+                opposition = summary["opposition"]
                 table_fn, table_loaded_count = cube_contacts["table_fn"], cube_contacts["table_loaded_count"]
                 depth = torch.maximum(depth, cube_contacts["maximum_penetration_m"])
                 other_force = cube_contacts["other_fn"] + cube_contacts["unfiltered_normal_residual_n"]
@@ -906,16 +1136,6 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             drift = torch.linalg.vector_norm(relative - self._grip_reference, dim=-1)
             cosine = torch.abs(torch.sum(relative_rotation * self._grip_rotation, dim=-1)).clamp(0.0, 1.0)
             rotation_error = 2 * torch.acos(cosine)
-            opposition = torch.ones(self.num_envs, device=self.device)
-            if contact_available and set(distal_normals) == {0, 1, 2}:
-                pair_dots = []
-                for group in (1, 2):
-                    dots = torch.einsum("nki,nli->nkl", distal_normals[0], distal_normals[group])
-                    valid = distal_loaded[0][:, :, None] & distal_loaded[group][:, None, :]
-                    value = torch.where(valid, dots, -torch.ones_like(dots)).amax(dim=(1, 2))
-                    value = torch.where(valid.any(dim=(1, 2)), value, torch.ones_like(value))
-                    pair_dots.append(value)
-                opposition = torch.maximum(pair_dots[0], pair_dots[1])
             weight = 0.08 * 9.81
             upward = total_sum[:, 2]
             speed = torch.linalg.vector_norm(velocity, dim=-1)
@@ -930,6 +1150,37 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             support &= (clearance >= settings["support_clearance_min_m"])
             support &= (speed <= settings["max_linear_speed_m_s"]) & (spin <= settings["max_angular_speed_rad_s"])
             support &= self._grip_locked & (drift <= settings["grip_drift_m"])
+            if reference_summary is not None:
+                ref_groups = reference_summary["groups"]
+                ref_depth = torch.maximum(reference_summary["depth"], cube_contacts["maximum_penetration_m"])
+                ref_upward = reference_summary["total_sum"][:, 2]
+                ref_loaded = (ref_groups > settings["group_force_min_n"]).all(dim=-1)
+                ref_safe = ref_loaded & (ref_groups <= settings["group_force_max_n"]).all(dim=-1)
+                ref_safe &= (ref_depth <= settings["max_penetration_m"])
+                ref_safe &= reference_summary["normal_vertical"] <= settings["max_abs_normal_z"]
+                ref_safe &= reference_summary["opposition"] <= settings["opposition_dot_max"]
+                ref_support = finite & joint_safe & ref_safe & bool(contact_available)
+                ref_support &= (table_fn <= 0.05*weight) & (other_force <= 0.02)
+                ref_support &= (table_loaded_count == 0) & (other_loaded_count == 0)
+                ref_support &= (ref_upward >= 0.8*weight) & (ref_upward <= 1.2*weight)
+                ref_support &= clearance >= settings["support_clearance_min_m"]
+                ref_support &= (speed <= settings["max_linear_speed_m_s"]) & (spin <= settings["max_angular_speed_rad_s"])
+                ref_support &= self._grip_locked & (drift <= settings["grip_drift_m"])
+                self._check_crosscheck_gates(
+                    {"group_loaded": groups > settings["group_force_min_n"],
+                     "group_force_safe": groups <= settings["group_force_max_n"],
+                     "penetration_safe": depth <= settings["max_penetration_m"],
+                     "side_normals_safe": normal_vertical <= settings["max_abs_normal_z"],
+                     "opposition_safe": opposition <= settings["opposition_dot_max"],
+                     "upward_load_min": upward >= 0.8*weight, "upward_load_max": upward <= 1.2*weight,
+                     "loaded": loaded, "contact_safe": contact_safe, "support": support},
+                    {"group_loaded": ref_groups > settings["group_force_min_n"],
+                     "group_force_safe": ref_groups <= settings["group_force_max_n"],
+                     "penetration_safe": ref_depth <= settings["max_penetration_m"],
+                     "side_normals_safe": reference_summary["normal_vertical"] <= settings["max_abs_normal_z"],
+                     "opposition_safe": reference_summary["opposition"] <= settings["opposition_dot_max"],
+                     "upward_load_min": ref_upward >= 0.8*weight, "upward_load_max": ref_upward <= 1.2*weight,
+                     "loaded": ref_loaded, "contact_safe": ref_safe, "support": ref_support})
             self._support_count = torch.where(support, self._support_count + 1, 0)
             self._max_support_samples = torch.maximum(self._max_support_samples, self._support_count)
             qualified_now = self._support_count >= consecutive_window_samples(settings["support_window_s"], self.physics_dt)
@@ -945,6 +1196,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._last_metrics = {"clearance_m": clearance, "object_speed_m_s": speed,
                                   "object_lift_height_m": lift_height,
                                   "object_angular_speed_rad_s": spin, "grip_drift_m": drift,
+                                  "grip_reference_locked": self._grip_locked,
                                   "relative_rotation_rad": rotation_error, "table_normal_force_n": table_fn,
                                   "hand_upward_force_n": upward, "other_normal_force_n": other_force,
                                   "no_loaded_table_contact": table_loaded_count == 0,
@@ -1117,35 +1369,49 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 super()._reset_idx(env_ids)
                 return
             terminal = self.reset_buf[env_ids] & (self.episode_length_buf[env_ids] > 0)
-            for index in env_ids[terminal].tolist():
-                metrics = {name: _json_finite(value[index].detach().cpu().tolist()) for name, value in self._last_metrics.items()}
+            terminal_ids = env_ids[terminal]
+            terminal_indices = terminal_ids.detach().cpu().tolist()
+            # Copy each field once for the complete terminal batch. Per-episode
+            # JSON construction below runs on CPU, including every flag/item.
+            metric_batch = {name: value[terminal_ids].detach().cpu().tolist()
+                            for name, value in self._last_metrics.items()} if terminal_indices else {}
+            fields = {"probe_overshoot": self._probe_overshoot, "unsafe": self._unsafe,
+                      "support_qualified": self._support_qualified, "local_success": self._local_success,
+                      "episode_id": self._episode_ids, "elapsed_steps": self.episode_length_buf,
+                      "episode_return": self._episode_return, "max_clearance_m": self._max_clearance,
+                      "maximum_support_samples": self._max_support_samples}
+            field_batch = {name: value[terminal_ids].detach().cpu().tolist()
+                           for name, value in fields.items()} if terminal_indices else {}
+            for offset, index in enumerate(terminal_indices):
+                metrics = {name: _json_finite(values[offset]) for name, values in metric_batch.items()}
+                episode = {name: values[offset] for name, values in field_batch.items()}
                 gates = {name: value for name, value in metrics.items() if isinstance(value, bool)}
                 failure = []
                 if self._force_unavailable:
                     failure.append("contact_measurement_unavailable")
-                if bool(self._probe_overshoot[index]):
+                if episode["probe_overshoot"]:
                     failure.append("local_probe_exceeded_6mm_before_qualification")
-                if bool(self._unsafe[index]):
+                if episode["unsafe"]:
                     failure.append("unsafe_physical_state")
-                if not bool(self._support_qualified[index]):
+                if not episode["support_qualified"]:
                     failure.append("continuous_support_not_qualified")
-                if not bool(self._local_success[index]):
+                if not episode["local_success"]:
                     failure.append("local_support_window_not_qualified")
-                self._outcomes.append({"env_id": index, "episode_id": int(self._episode_ids[index].item()),
+                self._outcomes.append({"env_id": index, "episode_id": int(episode["episode_id"]),
                                        "seed": int(self._evaluation_seed if self._eval_mode else train_seed),
                                        "rollout_domain": "physx_precontact_validation" if self._eval_mode else "physx_precontact_training",
                                        "layout_id": "contact_entry_seed_jitter",
                                        "validation_offset_index": index % len(config["rl_teacher"]["validation_offsets_m"]) if self._eval_mode else None,
                                        "validation_offset_m": config["rl_teacher"]["validation_offsets_m"][index % len(config["rl_teacher"]["validation_offsets_m"])] if self._eval_mode else None,
-                                       "elapsed_steps": int(self.episode_length_buf[index].item()),
-                                       "sim_time_s": float(self.episode_length_buf[index].item()*self.step_dt),
-                                       "episode_return": float(self._episode_return[index].item()),
-                                       "success": None if self._force_unavailable else bool(self._local_success[index]),
-                                       "local_success": False if self._force_unavailable else bool(self._local_success[index]),
+                                       "elapsed_steps": int(episode["elapsed_steps"]),
+                                       "sim_time_s": float(episode["elapsed_steps"]*self.step_dt),
+                                       "episode_return": float(episode["episode_return"]),
+                                       "success": None if self._force_unavailable else bool(episode["local_success"]),
+                                       "local_success": False if self._force_unavailable else bool(episode["local_success"]),
                                        "qualification_supported": self._qualification_supported,
                                        "unavailable_reason": self._force_unavailable, "gates": gates, "metrics": metrics,
-                                       "max_clearance_m": float(self._max_clearance[index].item()),
-                                       "maximum_support_samples": int(self._max_support_samples[index].item()),
+                                       "max_clearance_m": float(episode["max_clearance_m"]),
+                                       "maximum_support_samples": int(episode["maximum_support_samples"]),
                                        "failure_reasons": failure})
             self._interrupted += int(((~terminal) & (self.episode_length_buf[env_ids] > 0)).sum().item())
             super()._reset_idx(env_ids)
@@ -1303,6 +1569,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         def runtime_audit(self):
             return {"environment_version": ENVIRONMENT_VERSION, "settings": dict(settings),
                     "policy_contract": {"environment_version": ENVIRONMENT_VERSION,
+                                        "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
+                                        "cube_raw_contact_capacity_per_env": 256,
+                                        "reference_hand_raw_contact_capacity_per_body_per_env": 32,
+                                        "contact_measurement_capacity_change": "Cube raw buffer expanded from historical 32 to 256 points per env; measurement capacity only, not a physics setting",
+                                        "contact_crosscheck_protocol": CONTACT_CROSSCHECK,
+                                        "hand_contact_partner_indices": self._cube_hand_filter_indices,
                                         "observation_version": OBSERVATION_VERSION, "observation_dim": OBSERVATION_DIM,
                                         "action_version": ACTION_VERSION, "action_dim": 14,
                                         "action_joint_names": list(ACTION_JOINT_NAMES),
@@ -1352,8 +1624,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                                 "historical PhysX convex collision conversion with 1 mm contact offset"],
                     "source_joint_limit_differences_rad": self._source_joint_limit_differences,
                     "contact_body_binding_audit": self._contact_body_binding_audit,
+                    "cube_raw_contact_capacity_per_env": 256,
+                    "reference_hand_raw_contact_capacity_per_body_per_env": 32,
+                    "contact_collection_crosscheck": dict(self._contact_crosscheck),
                     "success_scope": "local precontact-reset curriculum only; original MuJoCo 15/19 and 20 not certified",
                     "contact_data_unavailable_reason": self._force_unavailable,
+                    "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
                     "qualification_supported": self._qualification_supported,
                     "mechanical_migration_qualification": self._mechanical_migration,
                     "support_required_samples": consecutive_window_samples(settings["support_window_s"], self.physics_dt),
@@ -1373,6 +1649,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "actual_physics_dt_s": float(self.sim.get_physics_dt()),
                     "control_period_s": float(self.step_dt),
                     "contact_data_unavailable_reason": self._force_unavailable,
+                    "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
+                    "contact_collection_crosscheck": dict(self._contact_crosscheck),
                     "qualification_supported": self._qualification_supported,
                     "evaluation_video": dict(self._video_status),
                     "nonfinite_state": bool((~self._last_metrics.get("finite", torch.ones(self.num_envs, dtype=torch.bool, device=self.device))).any()),
@@ -1380,6 +1658,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "reward_components": {name: float(value.mean().item()) for name, value in self._reward_terms.items()}}
 
         def close(self):
+            if getattr(self, "_crosscheck_record", None):
+                self._crosscheck_record.close()
+                self._crosscheck_record = None
+            if output and hasattr(self, "_contact_crosscheck"):
+                path = output / "contact_collection_crosscheck_summary.json"
+                if not path.exists():
+                    with path.open("x", encoding="utf-8") as stream:
+                        json.dump(self._contact_crosscheck, stream, indent=2, allow_nan=False)
             if getattr(self, "_record", None):
                 self._record.close()
                 self._record = None

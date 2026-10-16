@@ -1,6 +1,7 @@
 """Contract, denominator and optimizer safety checks without an Isaac task."""
 
 import copy
+import contextlib
 import importlib.util
 import json
 import math
@@ -65,14 +66,146 @@ class RunnerContractTests(unittest.TestCase):
 
     def test_budget_expansion_and_seed_reuse_are_rejected(self):
         for key, value in (("max_iterations", 401), ("max_wall_time_s", 3601),
-                           ("num_envs", 64), ("steps_per_env", 64),
+                           ("num_envs", 513), ("steps_per_env", 64),
                            ("num_learning_epochs", 8), ("eval_interval", 100),
+                           ("num_mini_batches", 8),
                            ("evaluation_seed", 101), ("learning_rate", float("nan"))):
             with self.subTest(key=key):
                 raw = flat_config()
                 raw[key] = value
                 with self.assertRaises(ValueError):
                     rl_ppo._validate_settings(rl_ppo.normalize_settings(raw))
+
+    def test_capacity512_declares_full_budget_without_increasing_network_or_optimizer_calls(self):
+        raw = flat_config()
+        raw.update(num_envs=512, smoke_env_counts=[1, 8, 32, 128, 256, 512])
+        settings = rl_ppo.normalize_settings(raw)
+        rl_ppo._validate_settings(settings)
+        plan = settings["planned_interaction"]
+        self.assertEqual(plan["training_environment_transitions"], 6_553_600)
+        self.assertEqual(plan["training_control_steps"], 12_800)
+        self.assertEqual(plan["optimizer_steps"], 6_400)
+        self.assertFalse(plan["observed_execution"])
+        self.assertEqual(rl_ppo.build_rsl_config(settings)["actor"]["hidden_dims"], [128, 128])
+        for counts in ([1, 8, 32], [1, 8, 32, 512, 512], [1, 32, 8, 512],
+                       [1, 8, 32, True, 512], [1, 8, 32, 513], [1, 8, 512]):
+            with self.subTest(counts=counts):
+                raw["smoke_env_counts"] = counts
+                with self.assertRaises(ValueError):
+                    rl_ppo._validate_settings(rl_ppo.normalize_settings(raw))
+        raw.update(num_envs=128, smoke_env_counts=[1, 8, 32, 128, 512])
+        rl_ppo._validate_settings(rl_ppo.normalize_settings(raw))
+
+    def test_memory_reserves_stop_without_claiming_capacity(self):
+        memory = {"cuda": True, "free_bytes": rl_ppo.MIN_DEVICE_FREE_BYTES,
+                  "host_available_ram_bytes": rl_ppo.MIN_HOST_AVAILABLE_BYTES}
+        self.assertEqual(rl_ppo.memory_capacity_issues(memory), [])
+        for field in ("free_bytes", "host_available_ram_bytes"):
+            with self.subTest(field=field):
+                self.assertTrue(rl_ppo.memory_capacity_issues(dict(memory, **{field: memory[field] - 1})))
+                self.assertTrue(rl_ppo.memory_capacity_issues(dict(memory, **{field: None})))
+        with tempfile.TemporaryDirectory() as directory:
+            profile = {"num_envs": 512, "passed": False}
+            stream = rl_ppo.EvidenceStream(Path(directory) / "memory.jsonl")
+            try:
+                with mock.patch.object(rl_ppo, "_gpu_memory", return_value=dict(memory, free_bytes=1)):
+                    with self.assertRaises(rl_ppo.CapacityUnavailable):
+                        rl_ppo._record_profile_memory(profile, "after_build", None, "cuda:0", stream,
+                                                      require_headroom=True)
+                self.assertFalse(profile["passed"])
+                self.assertEqual(profile["memory"]["after_build"]["free_bytes"], 1)
+                self.assertEqual(stream.count, 1)
+            finally:
+                stream.close()
+
+    def test_contact_equivalence_requires_33_actual_samples_and_nonzero_contact(self):
+        passed = {"enabled": True, "status": "passed", "completed_physics_samples": 33,
+                  "completed_nonzero_samples": 1, "first_failure": None}
+        self.assertEqual(rl_ppo.verify_contact_collection_crosscheck({"contact_collection_crosscheck": passed}), passed)
+        for key, value in (("enabled", False), ("status", "pending_nonzero_contact"),
+                           ("completed_physics_samples", 32), ("completed_physics_samples", 34),
+                           ("completed_nonzero_samples", 0), ("completed_nonzero_samples", True),
+                           ("first_failure", {"difference": 1})):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(rl_ppo.NumericalFailure):
+                    rl_ppo.verify_contact_collection_crosscheck({"contact_collection_crosscheck": dict(passed, **{key: value})})
+        with self.assertRaises(rl_ppo.NumericalFailure):
+            rl_ppo.verify_contact_collection_crosscheck({})
+
+    @contextlib.contextmanager
+    def native_capacity_fakes(self, directory):
+        state = {"built": [], "closed": [], "fail_build_count": None, "low_after_first": False}
+        app = types.SimpleNamespace(close=mock.Mock())
+        torch = types.SimpleNamespace(cuda=types.SimpleNamespace(reset_peak_memory_stats=mock.Mock(),
+                                                                 empty_cache=mock.Mock()))
+        def build(config, **kwargs):
+            state["built"].append(kwargs)
+            count = kwargs["num_envs"]
+            if state["fail_build_count"] == count:
+                raise MemoryError("capacity allocation failed")
+            env = types.SimpleNamespace(num_envs=count, step_audit=lambda: {}, get_observations=lambda: {})
+            env.unwrapped = env
+            env.close = lambda: state["closed"].append(count)
+            return env
+        def memory(*args):
+            return {"cuda": True, "free_bytes": 1 if state["low_after_first"] and state["closed"] else 2 * 1024**3,
+                    "total_bytes": 8 * 1024**3, "peak_allocated_bytes": 100,
+                    "host_available_ram_bytes": 3 * 1024**3}
+        modules = {"isaaclab": types.ModuleType("isaaclab"),
+            "isaaclab.app": types.SimpleNamespace(AppLauncher=lambda **kwargs: types.SimpleNamespace(app=app)),
+            "torch": torch, "isaaclab_rl": types.ModuleType("isaaclab_rl"),
+            "isaaclab_rl.rsl_rl": types.SimpleNamespace(RslRlVecEnvWrapper=lambda env, **kwargs: env),
+            "g1_vla.rl_environment": types.SimpleNamespace(build_environment=build)}
+        config = {"rl_teacher": flat_config()}
+        git = Path(directory) / "git.exe"
+        asset = Path(directory) / "robot.usd"
+        git.write_bytes(b"fake native git executable")
+        asset.write_bytes(b"fake frozen asset")
+        config["rl_teacher"].update(git_executable=str(git), asset_path=str(asset))
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(sys.modules, modules))
+            stack.enter_context(mock.patch.object(rl_ppo, "_seed"))
+            stack.enter_context(mock.patch.object(rl_ppo, "_assert_finite"))
+            stack.enter_context(mock.patch.object(rl_ppo, "_environment_audit", return_value={"policy_contract": {"fake": True}}))
+            stack.enter_context(mock.patch.object(rl_ppo, "_gpu_memory", side_effect=memory))
+            stack.enter_context(mock.patch.object(rl_ppo.importlib.metadata, "version", return_value="5.0.1"))
+            stack.enter_context(mock.patch.object(rl_ppo, "_smoke", return_value={"optimizer_steps": 0}))
+            yield state, config
+
+    def test_native_capacity_stop_retains_lower_results_and_uses_actual_smoke_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.native_capacity_fakes(directory) as (state, config):
+                state["low_after_first"] = True
+                run = Path(directory) / "run"
+                with self.assertRaises(rl_ppo.CapacityUnavailable):
+                    rl_ppo.run_native_stage("rl-smoke", config, run)
+            report = json.loads((run / "native_report.json").read_text())
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["status"], "capacity_stopped")
+            self.assertEqual([row["num_envs"] for row in state["built"]], [1])
+            self.assertEqual(state["built"][0]["train_seed"], 103)
+            self.assertEqual(report["profiles"][0]["actual_environment_seed"], 103)
+            self.assertTrue(report["profiles"][0]["passed"])
+            self.assertFalse(report["profiles"][1]["passed"])
+            self.assertIn("before_build", report["profiles"][1]["memory"])
+            self.assertEqual(report["capacity_summary"]["completed_profiles"], [1])
+            self.assertEqual(report["capacity_summary"]["unattempted_profiles"], [32])
+            self.assertFalse(report["capacity_summary"]["requested_training_capacity_smoke_passed"])
+            self.assertEqual(report["optimizer_steps"], 0)
+
+    def test_native_build_oom_is_not_hidden_by_lower_smoke_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.native_capacity_fakes(directory) as (state, config):
+                state["fail_build_count"] = 8
+                run = Path(directory) / "run"
+                with self.assertRaises(MemoryError):
+                    rl_ppo.run_native_stage("rl-smoke", config, run)
+            report = json.loads((run / "native_report.json").read_text())
+            self.assertFalse(report["passed"])
+            self.assertTrue(report["failure"]["out_of_memory"])
+            self.assertTrue(report["profiles"][1]["out_of_memory"])
+            self.assertEqual(report["capacity_summary"]["highest_completed_num_envs"], 1)
+            self.assertIn("at_failure", report["profiles"][1]["memory"])
 
     def test_identity_ignores_only_host_selection_and_execution_budgets(self):
         config = {"rl_teacher": flat_config(), "control": {"gain": 12}, "action": {"joint_names": ["a"]}}

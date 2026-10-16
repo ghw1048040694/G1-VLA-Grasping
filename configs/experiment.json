@@ -845,11 +845,14 @@
       "right_hand_middle_1_joint"
     ],
     "device": "cuda:0",
-    "num_envs": 32,
+    "num_envs": 512,
     "smoke_env_counts": [
       1,
       8,
-      32
+      32,
+      128,
+      256,
+      512
     ],
     "smoke_steps": 128,
     "seed": 2026101601,
@@ -935,6 +938,7 @@
     "migration_position_tolerance_m": 0.001,
     "migration_rotation_tolerance_rad": 0.01,
     "recursive_leaf_pattern_match": false,
+    "contact_extraction_backend": "cube_partner_once_v3",
     "reward_reach": 1.0,
     "reward_fingertip": 0.5,
     "reward_contact": 1.0,

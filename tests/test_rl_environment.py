@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -16,6 +17,10 @@ from g1_vla.rl_environment import (
     RLEnvironmentError,
     _actuator_specifications,
     _seed_state,
+    _compare_hand_contacts,
+    _reduce_contact_pairs,
+    _reduce_friction_pairs,
+    _summarize_hand_contacts,
     audit_asset_manifest,
     audit_fixed_root_joints,
     consecutive_window_samples,
@@ -93,6 +98,12 @@ class PhysicalGeometryTest(unittest.TestCase):
 
 
 class ProtocolInputsTest(unittest.TestCase):
+    def test_contact_collection_backend_cannot_silently_change(self):
+        config = configuration()
+        config["rl_teacher"]["contact_extraction_backend"] = "old-nine-views"
+        with self.assertRaises(RLEnvironmentError):
+            resolve_settings(config)
+
     def test_cube_partners_preserve_camera_and_wrist_as_other_robot_contacts(self):
         hand = ["right_hand_thumb_2_link", "right_hand_palm_link"]
         paths = {name: "/Robot/"+name for name in hand+["right_hand_camera_base_link", "right_wrist_yaw_link", "pelvis"]}
@@ -208,6 +219,93 @@ class ProtocolInputsTest(unittest.TestCase):
     def test_module_import_does_not_import_torch_isaac_or_warp(self):
         code = "import sys; import g1_vla.rl_environment; assert not any(n in sys.modules for n in ('torch', 'warp', 'isaaclab', 'isaacsim'))"
         subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "Torch-free host; run sparse contact tests in the native runtime")
+class SparseContactReductionTest(unittest.TestCase):
+    def setUp(self):
+        import torch
+        self.torch = torch
+
+    def make_contacts(self):
+        torch = self.torch
+        width, hand = 11, [5, 1, 9, 2, 10, 4, 7, 8]
+        counts = torch.zeros(2, width, dtype=torch.int64)
+        starts = torch.zeros_like(counts)
+        force = torch.full((32,), float("nan"))
+        points, normals = torch.zeros(32, 3), torch.zeros(32, 3)
+        separation = torch.zeros(32)
+        normal = torch.zeros(2, width, 3)
+        for env, partner, slot, value, direction in (
+                (0, 0, 19, .015, (0, 0, 1)),
+                (0, hand[2], 7, .1, (1, 0, 0)),
+                (0, hand[4], 2, .2, (-1, 0, 0)),
+                (0, hand[6], 27, .3, (-1, 0, 0)),
+                (1, hand[0], 12, .01, (0, 0, 1))):
+            counts[env, partner], starts[env, partner] = 1, slot
+            force[slot], normals[slot] = value, torch.tensor(direction)
+            separation[slot], points[slot] = -.0001, torch.tensor((slot*.001, env, .8))
+            normal[env, partner] = value*normals[slot]
+        return dict(normal=normal, friction=torch.zeros_like(normal), net_normal=normal.sum(1),
+                    force=force, points=points, normals=normals, separation=separation,
+                    counts=counts, starts=starts, hand_indices=hand, force_threshold=.02)
+
+    def test_named_noncontiguous_partners_and_raw_contact_semantics(self):
+        torch = self.torch
+        values = self.make_contacts()
+        result = _reduce_contact_pairs(torch, **values)
+        hand = result["hand"]
+        self.assertAlmostEqual(result["fn"][0, 0].item(), .015)
+        self.assertEqual(result["physical_loaded_count"][0, 0].item(), 1)
+        self.assertEqual(hand["physical_loaded_count"][1, 0].item(), 1)
+        self.assertFalse(hand["point_loaded"][1, 0].any())
+        self.assertTrue(torch.equal(hand["normal"], -values["normal"][:, values["hand_indices"]]))
+        self.assertEqual(hand["point_normal"][0, 2, 0].tolist(), [-1, 0, 0])
+        self.assertEqual(hand["point"][0, 2, 0].tolist(), values["points"][7].tolist())
+        summary = _summarize_hand_contacts(torch, hand)
+        self.assertTrue(torch.allclose(summary["groups"][0], torch.tensor([.1, .2, .3])))
+        self.assertEqual(summary["opposition"][0].item(), -1)
+        self.assertEqual(summary["opposition"][1].item(), 1)
+
+    def test_friction_counts_and_starts_keep_distinct_semantics_and_copy_alias(self):
+        torch = self.torch
+        forces = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+        counts, starts = torch.tensor([[2, 1]]), torch.tensor([[4, 0]])
+        result, raw = _reduce_friction_pairs(torch, forces, torch.zeros_like(forces), counts, starts)
+        self.assertTrue(torch.equal(result[0, 0], forces[4]+forces[5]))
+        self.assertTrue(torch.equal(result[0, 1], forces[0]))
+        counts.fill_(0)
+        starts.fill_(7)
+        self.assertEqual(raw["counts"].tolist(), [[2, 1]])
+        self.assertEqual(raw["starts"].tolist(), [[4, 0]])
+
+    def test_invalid_indices_and_selected_nan_fail_closed(self):
+        torch = self.torch
+        values = self.make_contacts()
+        values["force"][7] = float("nan")
+        with self.assertRaises(FloatingPointError):
+            _reduce_contact_pairs(torch, **values)
+        values = self.make_contacts()
+        values["starts"][0, 0] = 32
+        with self.assertRaises(RLEnvironmentError):
+            _reduce_contact_pairs(torch, **values)
+
+    def test_crosscheck_matches_world_points_without_raw_array_order(self):
+        torch = self.torch
+        hand = _reduce_contact_pairs(torch, **self.make_contacts())["hand"]
+        reference = {name: value.clone() for name, value in hand.items()}
+        for name in ("point", "point_normal", "point_force", "point_valid", "point_loaded", "separation"):
+            reference[name] = reference[name].flip(2)
+        self.assertTrue(_compare_hand_contacts(torch, hand, reference)["passed"])
+        reference["point"][0, 2, -1, 0] += .001
+        self.assertFalse(_compare_hand_contacts(torch, hand, reference)["passed"])
+
+    def test_opposition_uses_worst_loaded_point_not_mean_normal(self):
+        torch = self.torch
+        hand = _reduce_contact_pairs(torch, **self.make_contacts())["hand"]
+        hand["point_normal"][0, 4, 1] = hand["point_normal"][0, 2, 0]
+        hand["point_loaded"][0, 4, 1] = True
+        self.assertEqual(_summarize_hand_contacts(torch, hand)["opposition"][0].item(), 1)
 
 
 if __name__ == "__main__":

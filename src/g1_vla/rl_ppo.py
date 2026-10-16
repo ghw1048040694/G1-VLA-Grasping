@@ -9,6 +9,7 @@ and environment records around its public methods.
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import importlib.metadata
 import json
@@ -24,7 +25,12 @@ from typing import Any
 
 
 NATIVE_STAGES = frozenset(("rl-audit", "rl-smoke", "rl-train", "rl-eval"))
-RUNNER_VERSION = "g1_rsl5_bounded_ppo_v1"
+RUNNER_VERSION = "g1_rsl5_bounded_ppo_capacity512_v2"
+MAX_PARALLEL_ENVS = 512
+MAX_TRAINING_TRANSITIONS = 6_553_600
+MAX_OPTIMIZER_STEPS = 6_400
+MIN_DEVICE_FREE_BYTES = 512 * 1024**2
+MIN_HOST_AVAILABLE_BYTES = 1024**3
 
 
 class BudgetExpired(RuntimeError):
@@ -33,6 +39,10 @@ class BudgetExpired(RuntimeError):
 
 class NumericalFailure(RuntimeError):
     """A nonfinite state, loss, gradient, or parameter was observed."""
+
+
+class CapacityUnavailable(RuntimeError):
+    """A measured memory reserve is insufficient for further capacity probing."""
 
 
 def canonical_sha256(value: Any) -> str:
@@ -168,7 +178,7 @@ def build_rsl_config(settings: dict) -> dict:
 
 def normalize_settings(flat: dict) -> dict:
     """Map the unified JSON configuration to runner-only names without mutation."""
-    return {
+    settings = {
         "train_seed": flat["seed"], "eval_seed": flat["evaluation_seed"],
         "smoke_seed": flat["smoke_seed"], "device": flat["device"],
         "num_envs": flat["num_envs"],
@@ -188,6 +198,23 @@ def normalize_settings(flat: dict) -> dict:
                 "gamma": flat["gamma"], "lam": flat["lam"], "clip_param": flat["clip_param"],
                 "max_grad_norm": flat["max_grad_norm"]},
     }
+    settings["planned_interaction"] = planned_interaction(settings)
+    return settings
+
+
+def planned_interaction(settings: dict) -> dict:
+    """Declare upper bounds; these are not observed steps or completed training."""
+    ppo = settings["ppo"]
+    return {"training_num_envs": settings["num_envs"],
+            "rollout_control_steps_per_update": ppo["rollout_steps"],
+            "max_updates": ppo["max_updates"],
+            "training_control_steps": settings["ppo"]["rollout_steps"] * ppo["max_updates"],
+            "training_environment_transitions": settings["num_envs"] * ppo["rollout_steps"] * ppo["max_updates"],
+            "optimizer_steps": ppo["max_updates"] * ppo["epochs"] * ppo["minibatches"],
+            "smoke_environment_transitions": sum(settings["smoke"]["num_envs"]) * settings["smoke"]["control_steps"],
+            "validation_transitions_excluded_from_training_budget": True,
+            "wall_seconds_including_setup_and_validation": ppo["wall_time_seconds"],
+            "observed_execution": False}
 
 
 def policy_training_identity(config: dict) -> str:
@@ -222,10 +249,24 @@ def _validate_settings(settings: dict) -> None:
         raise ValueError("Initial teacher budget is at most 400 PPO updates")
     if ppo["validation_interval"] != 50:
         raise ValueError("Validation interval must remain 50 PPO updates")
-    if type(settings["num_envs"]) is not int or not 1 <= settings["num_envs"] <= 32:
-        raise ValueError("The first task admits between 1 and 32 parallel environments")
-    if list(settings["smoke"]["num_envs"]) != [1, 8, 32]:
-        raise ValueError("Smoke parallelism is predeclared as [1, 8, 32]")
+    if type(settings["num_envs"]) is not int or not 1 <= settings["num_envs"] <= MAX_PARALLEL_ENVS:
+        raise ValueError("The capacity protocol admits between 1 and 512 parallel environments")
+    profiles = settings["smoke"]["num_envs"]
+    if (not isinstance(profiles, list) or not profiles or
+            any(type(count) is not int or not 1 <= count <= MAX_PARALLEL_ENVS for count in profiles) or
+            any(left >= right for left, right in zip(profiles, profiles[1:])) or
+            not {1, 8, 32, settings["num_envs"]}.issubset(profiles)):
+        raise ValueError("Smoke counts must be unique, increasing, <=512 and include 1, 8, 32 and training num_envs")
+    for key, expected in (("rollout_steps", 32), ("epochs", 4), ("minibatches", 4)):
+        if type(ppo[key]) is not int or ppo[key] != expected:
+            raise ValueError(f"The capacity protocol pins {key}={expected}")
+    budget = planned_interaction(settings)
+    if budget["training_environment_transitions"] > MAX_TRAINING_TRANSITIONS:
+        raise ValueError("Training interaction budget exceeds 6553600 environment transitions")
+    if budget["optimizer_steps"] > MAX_OPTIMIZER_STEPS:
+        raise ValueError("Training budget exceeds 6400 optimizer calls")
+    if settings.get("planned_interaction") != budget:
+        raise ValueError("Normalized planned interaction does not match the execution settings")
     for key in ("train_seed", "eval_seed", "smoke_seed"):
         if type(settings[key]) is not int or settings[key] < 0:
             raise ValueError(f"{key} must be a nonnegative integer")
@@ -435,15 +476,15 @@ class OptimizerAudit:
 
 
 def _gpu_memory(torch: Any, device: str) -> dict:
-    if not str(device).startswith("cuda"):
-        return {"device": device, "cuda": False}
-    free, total = torch.cuda.mem_get_info(device)
-    result = {"device": device, "cuda": True, "free_bytes": free, "total_bytes": total,
-            "allocated_bytes": torch.cuda.memory_allocated(device),
-            "reserved_bytes": torch.cuda.memory_reserved(device),
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
-            "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
-            "peak_scope": "torch allocator only; free/total are device-wide observations"}
+    result = {"device": device, "cuda": str(device).startswith("cuda")}
+    if result["cuda"]:
+        free, total = torch.cuda.mem_get_info(device)
+        result.update(free_bytes=int(free), total_bytes=int(total),
+            allocated_bytes=int(torch.cuda.memory_allocated(device)),
+            reserved_bytes=int(torch.cuda.memory_reserved(device)),
+            peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+            peak_scope="torch allocator only; free/total are device-wide observations")
     try:
         import psutil
         memory = psutil.Process().memory_info()
@@ -451,6 +492,48 @@ def _gpu_memory(torch: Any, device: str) -> dict:
     except ImportError:
         result["host_memory_unavailable"] = "psutil is unavailable"
     return result
+
+
+def memory_capacity_issues(memory: dict) -> list[str]:
+    """Fail closed on missing observations or breached documented reserve floors."""
+    issues = []
+    if memory.get("cuda"):
+        free = memory.get("free_bytes")
+        if type(free) is not int:
+            issues.append("device_free_memory_unavailable")
+        elif free < MIN_DEVICE_FREE_BYTES:
+            issues.append("device_free_memory_below_512_MiB_reserve")
+    available = memory.get("host_available_ram_bytes")
+    if type(available) is not int:
+        issues.append("host_available_memory_unavailable")
+    elif available < MIN_HOST_AVAILABLE_BYTES:
+        issues.append("host_available_memory_below_1_GiB_reserve")
+    return issues
+
+
+def verify_contact_collection_crosscheck(final_audit: dict) -> dict:
+    """A finite smoke cannot qualify a collector without actual contact coverage."""
+    check = final_audit.get("contact_collection_crosscheck")
+    if (not isinstance(check, dict) or check.get("enabled") is not True or
+            check.get("status") != "passed" or check.get("completed_physics_samples") != 33 or
+            type(check.get("completed_nonzero_samples")) is not int or
+            check["completed_nonzero_samples"] < 1 or check.get("first_failure") is not None):
+        raise NumericalFailure("Smoke contact collection equivalence is incomplete or failed: " + str(check))
+    return check
+
+
+def _record_profile_memory(profile: dict, phase: str, torch: Any, device: str,
+                           stream: EvidenceStream, *, require_headroom: bool = False) -> dict:
+    snapshot = _gpu_memory(torch, device)
+    snapshot["observed_utc"] = datetime.now(timezone.utc).isoformat()
+    issues = memory_capacity_issues(snapshot)
+    profile.setdefault("memory", {})[phase] = snapshot
+    stream.write({"num_envs": profile["num_envs"], "phase": phase,
+                  "memory": snapshot, "capacity_issues": issues})
+    if require_headroom and issues:
+        profile["capacity_issues"] = issues
+        raise CapacityUnavailable("Capacity probe stopped at " + phase + ": " + ", ".join(issues))
+    return snapshot
 
 
 def _seed(seed: int, torch: Any) -> None:
@@ -512,7 +595,7 @@ def _new_streams(run_dir: Path) -> dict[str, EvidenceStream]:
     try:
         for key, filename in (("steps", "steps.jsonl"), ("episodes", "episode_outcomes.jsonl"),
                               ("updates", "updates.jsonl"), ("optimizers", "optimizer_steps.jsonl"),
-                              ("validations", "validations.jsonl")):
+                              ("validations", "validations.jsonl"), ("memory", "profile_memory.jsonl")):
             result[key] = EvidenceStream(run_dir / filename)
     except BaseException:
         for stream in result.values():
@@ -796,13 +879,16 @@ def _train_impl(environment: Any, settings: dict, run_dir: Path, streams: dict,
 
 
 def _smoke(environment: Any, settings: dict, streams: dict, deadline: Deadline,
-           torch: Any, profile: int) -> dict:
+           torch: Any, profile: int, memory_profile: dict | None = None) -> dict:
     outcomes = []
     obs = environment.get_observations()
     _assert_finite(obs, torch, "smoke initial observation")
     steps = int(settings["smoke"]["control_steps"])
     initial = _json_safe(environment.unwrapped.step_audit())
     start = time.monotonic()
+    if memory_profile is not None:
+        memory_profile.update(control_steps=0, environment_transitions=0, initial_step_audit=initial,
+                              planned_control_steps=steps)
     with torch.inference_mode():
         for step in range(steps):
             deadline.check()
@@ -813,8 +899,17 @@ def _smoke(environment: Any, settings: dict, streams: dict, deadline: Deadline,
             obs, rewards, dones, extras = environment.step(actions)
             _assert_finite((obs, rewards), torch, "smoke transition")
             outcomes.extend(_record_step(environment, extras, streams, f"smoke_{profile}", step + 1, None, torch))
+            if memory_profile is not None:
+                memory_profile.update(control_steps=step + 1, environment_transitions=(step + 1) * profile,
+                                      wall_seconds=time.monotonic() - start)
+            if memory_profile is not None and (step + 1) % 16 == 0:
+                _record_profile_memory(memory_profile, f"control_step_{step + 1}", torch, settings["device"],
+                                       streams["memory"], require_headroom=True)
     elapsed = time.monotonic() - start
     final = _json_safe(environment.unwrapped.step_audit())
+    if memory_profile is not None:
+        memory_profile["final_step_audit"] = final
+    crosscheck = verify_contact_collection_crosscheck(final) if profile == 1 else None
     reset_envs = sorted({row["env_id"] for row in outcomes})
     if reset_envs != list(range(profile)) or final["reset_count"] <= initial["reset_count"]:
         raise NumericalFailure("Smoke did not observe a real terminal reset for every parallel environment")
@@ -822,6 +917,7 @@ def _smoke(environment: Any, settings: dict, streams: dict, deadline: Deadline,
             "wall_seconds": elapsed, "transitions_per_second": steps * profile / max(elapsed, 1e-9),
             "optimizer_steps": 0, "actions": "first half zero target-hold, second half seeded bounded uniform",
             "initial_step_audit": initial, "final_step_audit": final,
+            "contact_collection_crosscheck": crosscheck,
             "terminal_reset_observed_for_env_ids": reset_envs,
             "outcomes": summarize_outcomes(outcomes), "gpu_memory": _gpu_memory(torch, settings["device"]),
             "success_claim_scope": "smoke execution and numerical checks only"}
@@ -878,12 +974,18 @@ def run_native_stage(stage: str, config: dict, run_dir: str | Path) -> dict:
                    "started_utc": datetime.now(timezone.utc).isoformat(), "optimizer_steps": 0,
                    "training_requested": stage == "rl-train", "training_started": False,
                    "reward_used_as_success": False,
-                   "original_focus_or_20_acceptance": False, "run_dir": str(run_dir)}
+                   "original_focus_or_20_acceptance": False, "run_dir": str(run_dir),
+                   "planned_interaction": settings["planned_interaction"],
+                   "capacity_reserve_policy": {"minimum_device_free_bytes": MIN_DEVICE_FREE_BYTES,
+                                               "minimum_host_available_ram_bytes": MIN_HOST_AVAILABLE_BYTES,
+                                               "missing_observation_stops_probe": True},
+                   "profiles": []}
     app = None
     environment = None
     torch = None
     error = None
     training_progress = None
+    active_profile = None
     try:
         # This is process-local and precedes GitPython's import from rsl_rl.
         git_path = Path(settings["runtime"]["git_executable"])
@@ -913,15 +1015,28 @@ def run_native_stage(stage: str, config: dict, run_dir: str | Path) -> dict:
         profiles = list(settings["smoke"]["num_envs"]) if stage == "rl-smoke" else [
             1 if stage == "rl-audit" else int(settings["evaluation"]["num_envs"])
             if stage == "rl-eval" else int(settings["num_envs"])]
-        result["profiles"] = []
+        result["requested_profiles"] = profiles
         for count in profiles:
             deadline.check()
+            active_profile = {"num_envs": count, "passed": False, "status": "building", "optimizer_steps": 0,
+                              "actual_environment_seed": int(settings["smoke_seed"] if stage == "rl-smoke"
+                                                             else settings["train_seed"])}
+            result["profiles"].append(active_profile)
+            if str(settings["device"]).startswith("cuda"):
+                torch.cuda.reset_peak_memory_stats(settings["device"])
+            _record_profile_memory(active_profile, "before_build", torch, settings["device"],
+                                   streams["memory"], require_headroom=True)
             env_out = run_dir / f"environment_{count}"
             env_out.mkdir(exist_ok=False)
-            native_env = build_environment(config, num_envs=count, device=settings["device"],
-                asset_path=str(asset_path), train_seed=int(settings["train_seed"]),
+            environment = build_environment(config, num_envs=count, device=settings["device"],
+                asset_path=str(asset_path), train_seed=active_profile["actual_environment_seed"],
                 eval_mode=stage == "rl-eval", output_dir=str(env_out))
-            environment = RslRlVecEnvWrapper(native_env, clip_actions=1.0)
+            environment = RslRlVecEnvWrapper(environment, clip_actions=1.0)
+            if environment.num_envs != count:
+                raise ValueError("Actual environment count differs from the declared capacity profile")
+            _record_profile_memory(active_profile, "after_build", torch, settings["device"],
+                                   streams["memory"], require_headroom=True)
+            active_profile["status"] = "running"
             environment._g1_last_step_audit = _json_safe(environment.unwrapped.step_audit())
             audit = _environment_audit(environment)
             _write_json_new(env_out / "environment_audit.json", audit)
@@ -930,7 +1045,7 @@ def run_native_stage(stage: str, config: dict, run_dir: str | Path) -> dict:
                 profile = {"num_envs": count, "optimizer_steps": 0,
                            "environment_audit": audit, "success_claim_scope": "none; audit only"}
             elif stage == "rl-smoke":
-                profile = _smoke(environment, settings, streams, deadline, torch, count)
+                profile = _smoke(environment, settings, streams, deadline, torch, count, active_profile)
             elif stage == "rl-train":
                 training_progress = {}
                 profile = _train(environment, settings, run_dir, streams, deadline, torch, audit, training_progress)
@@ -938,17 +1053,34 @@ def run_native_stage(stage: str, config: dict, run_dir: str | Path) -> dict:
                 result["training_started"] = profile["optimizer_steps"] > 0
             else:
                 profile = _evaluation(environment, settings, run_dir, streams, deadline, torch, audit)
-            result["profiles"].append(profile)
+            active_profile.update(profile)
+            _record_profile_memory(active_profile, "after_execution", torch, settings["device"], streams["memory"],
+                                   require_headroom=stage == "rl-smoke")
             environment.close()
             environment = None
+            gc.collect()
+            if str(settings["device"]).startswith("cuda"):
+                torch.cuda.empty_cache()
+            _record_profile_memory(active_profile, "after_close", torch, settings["device"], streams["memory"])
+            active_profile.update(passed=True, status="completed")
+            active_profile = None
         result["passed"] = True
         result["status"] = "completed"
     except BaseException as exc:
         error = exc
-        result["status"] = "failed"
+        result["status"] = "capacity_stopped" if isinstance(exc, CapacityUnavailable) else "failed"
         result["failure"] = {"type": type(exc).__name__, "message": str(exc),
                              "traceback": traceback.format_exc(),
-                             "out_of_memory": "out of memory" in str(exc).lower()}
+                             "out_of_memory": isinstance(exc, MemoryError) or "out of memory" in str(exc).lower()
+                                              or "outofmemory" in type(exc).__name__.lower()}
+        if active_profile is not None:
+            active_profile.update(passed=False, status=result["status"], failure_type=type(exc).__name__,
+                                  failure_message=str(exc), out_of_memory=result["failure"]["out_of_memory"])
+            if torch is not None:
+                try:
+                    _record_profile_memory(active_profile, "at_failure", torch, settings["device"], streams["memory"])
+                except BaseException as observation_error:
+                    active_profile["failure_memory_unavailable"] = str(observation_error)
         partial = run_dir / "training_partial_failure.json"
         if training_progress is not None:
             result["partial_training"] = _json_safe(training_progress)
@@ -962,10 +1094,24 @@ def run_native_stage(stage: str, config: dict, run_dir: str | Path) -> dict:
         if environment is not None:
             try:
                 environment.close()
+                environment = None
+                gc.collect()
+                if torch is not None and str(settings["device"]).startswith("cuda"):
+                    torch.cuda.empty_cache()
+                if active_profile is not None and torch is not None:
+                    _record_profile_memory(active_profile, "after_failure_close", torch, settings["device"], streams["memory"])
             except BaseException as exc:
                 result["environment_close_error"] = {"type": type(exc).__name__, "message": str(exc)}
                 result["passed"] = False
                 result["status"] = "failed"
+        completed = [item["num_envs"] for item in result["profiles"] if item.get("passed") is True]
+        attempted = [item["num_envs"] for item in result["profiles"]]
+        result["capacity_summary"] = {"completed_profiles": completed,
+            "highest_completed_num_envs": max(completed, default=None),
+            "unattempted_profiles": [count for count in result.get("requested_profiles", []) if count not in attempted],
+            "requested_training_num_envs": settings["num_envs"],
+            "requested_training_capacity_smoke_passed": stage == "rl-smoke" and settings["num_envs"] in completed,
+            "lower_capacity_pass_does_not_qualify_larger_profile": True}
         if torch is not None:
             try:
                 result["gpu_memory_final"] = _gpu_memory(torch, settings["device"])

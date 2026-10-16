@@ -27,7 +27,7 @@ class RLProtocolTests(unittest.TestCase):
     def test_RL_cannot_silently_change_physics_action_bounds_or_original_scoring_scope(self):
         for key, value in (("physics_dt_s", .004), ("decimation", 16), ("cube_mass_kg", .01),
                            ("qualification_required", False), ("scope", "formal_original20"),
-                           ("max_iterations", 401), ("num_envs", 64), ("max_wall_time_s", 3601),
+                           ("max_iterations", 401), ("num_envs", 513), ("max_wall_time_s", 3601),
                            ("seed", True), ("smoke_steps", 32), ("action_scale_rad", .2)):
             config = copy.deepcopy(RL_TEACHER_DEFAULTS)
             config[key] = value
