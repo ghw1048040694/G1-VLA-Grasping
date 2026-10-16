@@ -559,3 +559,162 @@ def audit_raw_pairing(root: Union[str, Path], config: Dict, *, run_dir: Optional
             for row in results:
                 stream.write(_json(row) + "\n")
     return report
+
+
+def audit_causal_action_labels(root: Union[str, Path], config: Dict, *,
+                               run_dir: Optional[Union[str, Path]] = None,
+                               records: Optional[Sequence[Dict]] = None) -> Dict[str, Any]:
+    """Export diagnostic causal-prefix artifacts through the unified pairing stage.
+
+    Each source is read/revalidated independently; no cross-source window, raw
+    rewrite, split assignment or training admission is performed. Legacy full
+    eight-command statistics remain an independent, unchanged diagnostic.
+    """
+    from .contracts import ActionContract
+    from .native_action_labels import (LABEL_BACKEND, LABEL_PROTOCOL, encode_causal_prefixes,
+                                       masked_action_diagnostics, validate_masked_labels)
+    np = _numpy()
+    base = Path(root).expanduser().resolve()
+    options = config.get("expert", {}).get("labels", {})
+    if options.get("backend") != LABEL_BACKEND:
+        raise PairingError("causal label export requires explicit native_causal_prefix_v1 backend")
+    contract = ActionContract.from_config(config, project_root=base)
+    if records is None:
+        registered = []
+        for run_id in options.get("source_run_ids", []):
+            if not isinstance(run_id, str) or not run_id or Path(run_id).name != run_id or run_id in (".", ".."):
+                raise PairingError("label source run IDs must be single safe directory names")
+            source_dir = base / ".runtime" / "rebuild" / "runs" / run_id / "teacher"
+            paths = sorted(source_dir.glob("*/expert_pick_place_episode.npz"))
+            if not paths:
+                raise PairingError("configured native label source run has no recorded teacher episodes: " + run_id)
+            registered.extend({"raw_path": str(path), "source_run_id": run_id} for path in paths)
+    else:
+        registered = list(records)
+    if not registered:
+        raise PairingError("causal label audit requires explicit nonempty native sources")
+    destination = None
+    if run_dir is not None:
+        destination = Path(run_dir).expanduser().resolve()
+        if destination == base or destination.name == "outputs":
+            raise PairingError("label output must be an independent run directory")
+        destination.mkdir(parents=True, exist_ok=True)
+        if (destination / "causal_action_labels.json").exists() or (destination / "causal_action_labels").exists():
+            raise PairingError("causal label results are immutable; choose a new run directory")
+        (destination / "causal_action_labels").mkdir()
+    results, errors, seen = [], [], set()
+    for record in registered:
+        raw = Path(record["raw_path"])
+        if not raw.is_absolute():
+            raw = base / raw
+        row = {"raw_path": str(raw), "source_run_id": record.get("source_run_id"),
+               "training_eligible": False, "split": "diagnostic", "label_exported": False}
+        try:
+            raw.resolve().relative_to(base)
+            if str(raw.resolve()) in seen:
+                raise PairingError("duplicate native source cannot inflate coverage")
+            seen.add(str(raw.resolve()))
+            before = sha256_file(raw)
+            if record.get("raw_sha256") and record["raw_sha256"] != before:
+                raise PairingError("raw differs from protected source hash")
+            original = _load_npz(raw)
+            episode = _new_schema_audit(original, list(contract.joint_names), 1.0 / contract.control_hz)
+            metadata = json.loads(str(episode["metadata_json"]))
+            if not metadata["pairing_eligible"] or metadata["source"].get("parent_root") != str(base):
+                raise PairingError("native source pairing/lineage is not established for this project")
+            encoded = encode_causal_prefixes(episode, contract)
+            labels = encoded["arrays"]
+            validate_masked_labels(labels, contract)
+            legacy = encode_paired_chunks(episode, contract)
+            indices = labels["anchor_record_index"]
+            coverage = {}
+            if "tracking_json" in original:
+                tracking = json.loads(str(original["tracking_json"].item()))
+                if (not isinstance(tracking, list) or len(tracking) != len(episode["pairing_valid"])
+                        or any(not isinstance(value, dict) or not isinstance(value.get("phase"), str)
+                               or not value["phase"].strip() for value in tracking)):
+                    raise PairingError("tracking phase evidence must correspond to every actual interval")
+                phases = [value["phase"] for value in tracking]
+                labels["anchor_phase"] = np.asarray([phases[index] for index in indices])
+                for phase in sorted(set(phases)):
+                    candidates = sum(bool(episode["pairing_valid"][i]) and phases[i] == phase for i in range(len(phases)))
+                    admitted = sum(phases[index] == phase for index in indices)
+                    coverage[phase] = {"candidate_anchors": candidates, "admitted_anchors": admitted}
+            source = metadata["source"]
+            provenance = {"inherited_any_frame_physical_positive": metadata["episode_strict_physical_success"],
+                          "inherited_field_semantics": "legacy episode_strict_physical_success is frame_physical_positive.any(), not strict teacher acceptance",
+                          "reported_expert_episode_passed": None, "reported_acceptance_layout_passed": None, "physical_success_is_not_label_admission": True}
+            teacher_report = raw.parent / "teacher_report.json"
+            if teacher_report.is_file() and not teacher_report.is_symlink():
+                report_hash = sha256_file(teacher_report)
+                measured = json.loads(teacher_report.read_text(encoding="utf-8"))
+                report_raw = Path(measured.get("raw_episode", ""))
+                if not report_raw.is_absolute():
+                    report_raw = base / report_raw
+                if (not isinstance(measured.get("passed"), bool) or report_raw.resolve() != raw.resolve()
+                        or measured.get("layout_fingerprint") != source.get("layout_fingerprint")
+                        or sha256_file(teacher_report) != report_hash):
+                    raise PairingError("colocated strict teacher report does not bind this raw source/layout")
+                provenance.update(reported_expert_episode_passed=measured["passed"],
+                                  expert_report_path=str(teacher_report), expert_report_sha256=report_hash,
+                                  expert_report_scope="expert episode report only; composite suite acceptance is a separate source")
+            acceptance_path = raw.parent.parent.parent / "teacher_acceptance.json"
+            if raw.parent.parent.name == "teacher" and acceptance_path.is_file() and not acceptance_path.is_symlink():
+                acceptance_hash = sha256_file(acceptance_path)
+                acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
+                matches = []
+                for item in acceptance.get("layouts", []):
+                    item_path = Path(item.get("raw_path", ""))
+                    if not item_path.is_absolute():
+                        item_path = base / item_path
+                    if item_path.resolve() == raw.resolve():
+                        matches.append(item)
+                if (len(matches) != 1 or not isinstance(matches[0].get("passed"), bool)
+                        or matches[0].get("layout_fingerprint") != source.get("layout_fingerprint")
+                        or acceptance.get("action_contract_sha256") != contract.contract_sha256
+                        or sha256_file(acceptance_path) != acceptance_hash):
+                    raise PairingError("source acceptance report does not bind this raw/layout/action contract")
+                provenance.update(reported_acceptance_layout_passed=matches[0]["passed"],
+                                  acceptance_report_path=str(acceptance_path), acceptance_report_sha256=acceptance_hash,
+                                  acceptance_scope=acceptance.get("scope"), acceptance_smoke=acceptance.get("smoke"),
+                                  acceptance_evidence_scope="reported composite source acceptance, not recomputed or used as label admission")
+            artifact_metadata = json.loads(str(labels["metadata_json"]))
+            artifact_metadata.update(source=source, raw_path=str(raw), raw_sha256=before,
+                                     physical_provenance=provenance)
+            labels["metadata_json"] = np.asarray(_json(artifact_metadata))
+            row.update(raw_sha256=before, source=source, **encoded["summary"],
+                       legacy_full8_count=len(legacy["anchor_record_index"]),
+                       legacy_full8_consistent_count=int(legacy["action_contract_consistent"].sum()),
+                       legacy_full8_inconsistent_count=int((~legacy["action_contract_consistent"]).sum()),
+                       excluded_anchors=encoded["excluded"], phase_coverage=coverage,
+                       physical_provenance=provenance,
+                       mask_consumer=masked_action_diagnostics(labels, contract) if len(indices) else {"sample_count": 0, "training_eligible": False},
+                       label_exported=True)
+            after = sha256_file(raw)
+            row.update(raw_sha256_after=after, raw_unchanged=before == after)
+            if before != after:
+                raise PairingError("raw source changed while deriving causal labels")
+            if destination is not None:
+                path = destination / "causal_action_labels" / (canonical_sha256(str(raw))[:24] + ".npz")
+                with path.open("xb") as stream:
+                    np.savez_compressed(stream, **labels)
+                row.update(label_artifact_path=str(path), label_artifact_sha256=sha256_file(path))
+        except (OSError, ValueError, KeyError, TypeError, IndexError, zipfile.BadZipFile) as error:
+            row["label_exported"] = False
+            errors.append({"raw_path": str(raw), "error_type": type(error).__name__, "message": str(error)})
+        results.append(row)
+    counts = ("raw_control_count", "candidate_anchor_count", "admitted_anchor_count", "excluded_anchor_count",
+              "real_label_position_count", "unique_real_command_count", "padding_position_count",
+              "legacy_full8_count", "legacy_full8_consistent_count", "legacy_full8_inconsistent_count")
+    summary = {key: sum(row.get(key, 0) for row in results if row["label_exported"]) for key in counts}
+    summary.update(record_count=len(results), error_count=len(errors), training_eligible_count=0,
+                   exported_source_count=sum(row["label_exported"] for row in results))
+    report = {"schema_version": 1, "backend": LABEL_BACKEND, "protocol": LABEL_PROTOCOL,
+              "training_started": False, "training_eligible": False, "raw_modified": False,
+              "contract": contract.metadata(), "root": str(base), "records": results, "summary": summary, "errors": errors,
+              "consumer_bridge": "Existing ContinuousDataset rejects masked artifacts; pure validated stats/loss adapters are implemented. No approved split/cache bridge exists.",
+              "coverage_limitation": "Overlapping label positions are not independent commands; filtered prefixes may underrepresent moving phases. No trajectory-level or training admission follows."}
+    if destination is not None:
+        with (destination / "causal_action_labels.json").open("x", encoding="utf-8") as stream:
+            stream.write(_json(report) + "\n")
+    return report

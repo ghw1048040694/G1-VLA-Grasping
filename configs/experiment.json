@@ -158,6 +158,26 @@
     },
     "contact_diagnostics": {
       "enabled": true
+    },
+    "labels": {
+      "backend": "native_causal_prefix_v1",
+      "source_run_ids": [
+        "G1-REBUILD-20261016-teacher-v4-20-01"
+      ]
+    },
+    "hand_control": {
+      "backend": "contact_normal_position_v1",
+      "normal_force_target_n": 0.3,
+      "maximum_group_force_n": 1.5,
+      "maximum_penetration_m": 0.003,
+      "relief_step_rad": 0.01,
+      "takeup_velocity_rad_s": 0.1,
+      "maximum_recovery_drift_m": 0.015,
+      "minimum_loaded_force_n": 0.02,
+      "maximum_closing_scale": 1.5,
+      "force_feedback_gain": 0.25,
+      "posture_gain": 0.05,
+      "maximum_posture_delta_rad": 0.003
     }
   },
   "data": {

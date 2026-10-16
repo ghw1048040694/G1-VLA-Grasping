@@ -514,6 +514,7 @@ def run_teacher_episode(config, spec, run_dir):
                                       "timestamp_s": None, "phase": None} for kind in ("hand", "table")}
     closure_start_event = None
     hand_contact_rows = []
+    hand_controller = None
     current_phase, planned_next_phase = None, None
     maximum_joint_overrun, pending = {}, {}
     planner, active_plan, path_progress, path_status, grip_lock = None, None, None, {}, None
@@ -566,6 +567,14 @@ def run_teacher_episode(config, spec, run_dir):
         object_body = api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, "green_cube")
         if object_body < 0:
             raise ExpertError("green object is missing")
+        if config["expert"].get("hand_control", {}).get("backend") == "contact_normal_position_v1":
+            from .hand_control import ContactHandControl
+            nominal_hand = baseline.copy()
+            for i, name in enumerate(names):
+                if name.startswith("right_hand_"):
+                    nominal_hand[i] = hand_target(name, profile)
+            hand_controller = ContactHandControl(model, data, controller, object_body,
+                config["expert"]["hand_control"], nominal_hand, baseline, api)
         initial_position = data.xpos[object_body].copy()
         report["initial_object_position_m"] = initial_position.tolist()
         report["control"] = controller.metadata()
@@ -941,6 +950,11 @@ def run_teacher_episode(config, spec, run_dir):
             for index, name in enumerate(names):
                 if name.startswith("right_hand_"):
                     target[index] = (1 - close) * baseline[index] + close * hand_target(name, profile)
+            if hand_controller is not None:
+                hand_request = hand_controller.target(close, current_phase, grip_lock)
+                for index, name in enumerate(names):
+                    if name.startswith("right_hand_"):
+                        target[index] = hand_request[index]
             # Teacher plans at every actual observation. The eventual data chunk
             # is built from eight next real control commands by the shared codec.
             controller.execute_target(target.tolist(), joint_names=names,
@@ -1084,6 +1098,9 @@ def run_teacher_episode(config, spec, run_dir):
         "enabled": config["expert"].get("contact_diagnostics", {}).get("enabled", False),
         "original_success_gate_unchanged": True, "physics_substeps": hand_contact_rows,
         "force_scope": "after baseline mj_step->mj_forward, same post-state as original gates; under held ctrl, not integrated solver force"}
+    report["hand_control"] = {"settings": config["expert"].get("hand_control"),
+        "original_gates_unchanged": True, "requests": hand_controller.rows if hand_controller is not None else [],
+        "scope": "candidate equivalent position requests, not achieved normal force or force closure; shared PD and original limits retained"}
     report["contact_penetration_diagnostic_scope"] = "actual every-substep green/right-hand and green/calibration-table contacts; inherited mesh/capsule overlap retained; depth does not modify the original acceptance gate"
     report["phase_planning"] = "home initialization only before control/video; future poses solved once their phase is entered from actual object state and visited right-arm seed; rejected entry records latest_phase_planning_attempt; hold preserves completed lift reference"
     report["phases"] = phase_records

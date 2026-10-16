@@ -55,8 +55,19 @@ def _valid_lengths(cache) -> list[int]:
     return lengths
 
 
+def _reject_masked_native_cache(cache):
+    """Fail closed until the diagnostic prefix protocol has a reviewed cache bridge."""
+    metadata = cache.get("metadata", {})
+    protocol = cache.get("label_protocol")
+    if ("action_is_pad" in cache or protocol is not None
+            or isinstance(metadata, Mapping) and (metadata.get("label_protocol") is not None
+                                                     or metadata.get("protocol") == "common_anchor_causal_applied_prefix_v1")):
+        raise TrainingNotReady("Masked native labels are diagnostic; ContinuousDataset has no approved causal-prefix cache bridge")
+
+
 def action_label(cache, episode: int, frame: int, contract: ActionContract):
     """Encode the next-command sequence against one observed planning anchor."""
+    _reject_masked_native_cache(cache)
     require_torch()
     anchor = cache["state"][episode, frame].float()
     targets = cache["command_target"][episode, frame:frame + contract.chunk_steps].float()
@@ -74,6 +85,7 @@ class ContinuousDataset(Dataset):
     source directory naming has no effect on labels or weighting.
     """
     def __init__(self, cache: Mapping[str, Any], contract: ActionContract, *, weighted=False, correction_boost=1.0):
+        _reject_masked_native_cache(cache)
         require_torch()
         _numpy()
         if not isinstance(contract, ActionContract):
@@ -156,6 +168,7 @@ Data = ContinuousDataset
 
 def get_stats(cache, contract: ActionContract):
     """Compute statistics for fresh audited data only; never during warm-start."""
+    _reject_masked_native_cache(cache)
     require_torch()
     valid = cache["valid_frame"].bool()
     lengths = _valid_lengths(cache)
