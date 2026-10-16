@@ -94,6 +94,54 @@ class ContactEquivalenceError(AssertionError):
     """A same-step native contact-view crosscheck failed; never unsupported."""
 
 
+def control_probe_profile(profile):
+    """Validate an explicitly enabled, non-training controller diagnostic."""
+    if profile is None:
+        return None
+    if not isinstance(profile, dict):
+        raise RLEnvironmentError("control_probe must be a profile dictionary or None")
+    required = ("name", "action_source", "control_guard_version")
+    if any(not isinstance(profile.get(key), str) or not profile[key].strip() for key in required):
+        raise RLEnvironmentError("control_probe needs name, action_source and control_guard_version")
+    if profile["control_guard_version"] not in ("legacy_scalar_v1", "box_halfspace_projected_v2"):
+        raise RLEnvironmentError("unknown diagnostic control guard")
+    return {key: profile[key] for key in required}
+
+
+def offset_point_jacobian(torch, link_jacobian, offset_world):
+    """Shift a world [linear; angular] Jacobian from link origin to a site."""
+    if (link_jacobian.ndim != 3 or link_jacobian.shape[1] != 6 or
+            offset_world.shape != (link_jacobian.shape[0], 3)):
+        raise RLEnvironmentError("site Jacobian requires (N,6,J) and (N,3)")
+    result = link_jacobian.clone()
+    correction = torch.cross(link_jacobian[:, 3:].transpose(1, 2),
+                             offset_world[:, None, :].expand(-1, link_jacobian.shape[-1], -1), dim=-1)
+    result[:, :3] += correction.transpose(1, 2)
+    return result
+
+
+def _probe_payload(torch, value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {key: _probe_payload(torch, item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_probe_payload(torch, item) for item in value]
+    return value
+
+
+def preload_contact_ready(torch, metrics, num_envs, device):
+    """Contact prerequisites for a guarded probe; this is not load support."""
+    ready = torch.ones(num_envs, dtype=torch.bool, device=device)
+    for key in ("contact_safe", "grip_reference_locked", "no_positive_gap_hand_load",
+                "friction_partner_manifold_certified", "finite", "joint_safe"):
+        value = metrics.get(key)
+        if value is None:
+            return torch.zeros_like(ready)
+        ready &= value
+    return ready
+
+
 class TableContactChannel:
     """Require a native rigid binding and a positive measured load witness."""
 
@@ -549,12 +597,16 @@ def _compare_hand_contacts(torch, actual, reference, tolerances=CONTACT_CROSSCHE
             "unordered_raw_points_match": valid[-1] and valid[-2] and valid[-3]}
 
 
-def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_mode=False, output_dir=None):
+def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_mode=False, output_dir=None,
+                      control_probe=None):
     """Build the state-only local grasp curriculum after Isaac AppLauncher.
 
     The fixed robot and free cube are reset only at episode boundaries. Force,
     separation and normal data must all be available for independent success.
     """
+    probe_profile = control_probe_profile(control_probe)
+    if probe_profile is not None and (not eval_mode or output_dir is None or num_envs > 8):
+        raise RLEnvironmentError("control diagnostics require standalone evaluation, output and at most eight environments")
     settings = resolve_settings(config)
     initial = _seed_state(config)
     actuator_specs = _actuator_specifications(initial)
@@ -679,6 +731,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._next_action_origin = "policy_or_zero_target_hold"
             self._action_origin = "not_started"
             self._state_hold_request_clipped = 0
+            self._control_probe_enabled = probe_profile is not None
+            self._control_probe_profile = probe_profile
+            self._control_probe_stream = None
+            self._control_command_id = 0
+            self._control_transition_snapshot = None
+            self._control_transition_recorded = 0
+            self._control_guard_correction_count = 0
+            self._control_guard_unsafe_count = 0
             self._contact_crosscheck = {"protocol": CONTACT_COLLECTION_VERSION,
                                        "required_physics_samples": CONTACT_CROSSCHECK["physics_samples"],
                                        "enabled": num_envs == CONTACT_CROSSCHECK["num_envs"],
@@ -777,6 +837,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                                      "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
             if output:
                 output.mkdir(parents=True, exist_ok=True)
+                if self._control_probe_enabled:
+                    self._control_probe_stream = (output / "control_commands.jsonl").open("x", encoding="utf-8")
                 if eval_mode:
                     self._open_evaluation_recording()
                     self._video_frame_dir = output / "rgb_frames"
@@ -786,7 +848,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                                           "fps_numerator": 500, "fps_denominator": 33,
                                                           "scope": "actual env0 pre-reset post-physics external camera; no policy image input",
                                                           "eye_world_m": self._video_status.get("eye_world_m"),
-                                                          "target_world_m": self._video_status.get("target_world_m")}) + "\n")
+                                                          "target_world_m": self._video_status.get("target_world_m"),
+                                                          **({"control_probe": dict(self._control_probe_profile)} if self._control_probe_enabled else {})}) + "\n")
+            if self._control_probe_enabled:
+                self.configure_control_probe(self._control_probe_profile)
 
         def _setup_scene(self):
             self.robot = Articulation(ArticulationCfg(
@@ -947,6 +1012,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         def _pre_physics_step(self, actions):
             if tuple(actions.shape) != (self.num_envs, 14) or not bool(torch.isfinite(actions).all()):
                 raise RLEnvironmentError("nonfinite or incorrectly shaped policy action")
+            if self._control_probe_enabled and self._control_transition_snapshot is not None:
+                raise RLEnvironmentError("previous diagnostic transition must be recorded before the next command")
             self._previous_actions[:] = self._actions
             self._action_origin, self._next_action_origin = self._next_action_origin, "policy_or_zero_target_hold"
             self._actions[:] = actions.clamp(-1.0, 1.0)
@@ -984,8 +1051,46 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             allowance = (self._start_palm_z + settings["probe_clearance_max_m"] - previous_prediction).clamp_min(0)
             factor = torch.where(predicted_increment > allowance,
                                  allowance/predicted_increment.clamp_min(1e-12), torch.ones_like(allowance)).clamp(0, 1)
-            self._shield_count += int((factor < 1).sum().item())
-            desired[:, :7] = previous_arm + increment*factor[:, None]
+            if not self._control_probe_enabled:
+                # Preserve the frozen training path expression for expression.
+                self._shield_count += int((factor < 1).sum().item())
+                desired[:, :7] = previous_arm + increment*factor[:, None]
+            else:
+                from .rl_probe_control import apply_probe_guard, LEGACY_JOINT_ROUNDOFF_TOLERANCE_RAD
+                candidate = desired.clone()
+                version = self._control_probe_profile["control_guard_version"]
+                guarded, evidence = apply_probe_guard(
+                    torch, desired[:, :7], previous_arm, current_arm, low[:, :7], high[:, :7],
+                    point_jz, palm_z, self._start_palm_z, settings["probe_clearance_max_m"], mode=version)
+                desired[:, :7] = guarded
+                bound_tolerance = LEGACY_JOINT_ROUNDOFF_TOLERANCE_RAD if version == "legacy_scalar_v1" else 0.0
+                lower_violation = (low-desired).clamp_min(0)
+                upper_violation = (desired-high).clamp_min(0)
+                bounds_ok = ((lower_violation <= bound_tolerance) & (upper_violation <= bound_tolerance)).all(-1)
+                guard_unsafe = evidence["requires_unsafe"] | ~bounds_ok
+                self._unsafe |= guard_unsafe
+                corrected = (evidence["target_correction"] != 0).any(-1)
+                self._control_guard_correction_count += int(corrected.sum().item())
+                self._control_guard_unsafe_count += int(guard_unsafe.sum().item())
+                self._shield_count += int((evidence["factor"] < 1).sum().item()) if version == "legacy_scalar_v1" else int(corrected.sum().item())
+                self._control_command_id += 1
+                self._write_control_probe({
+                    "event": "control_command", "command_id": self._control_command_id,
+                    "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                    "episode_id": self._episode_ids, "episode_control_steps": self.episode_length_buf,
+                    "raw_action": actions, "clipped_action": self._actions,
+                    "previous_target_action_rad": previous, "measured_q_action_rad": current,
+                    "measured_qd_action_rad_s": tensor(self.robot.data.joint_vel)[:, self._action_ids],
+                    "per_step_action_rad": per_step, "lower_action_bound_rad": low, "upper_action_bound_rad": high,
+                    "unbounded_candidate_action_rad": previous+self._actions*per_step,
+                    "limited_candidate_action_rad": candidate, "post_guard_target_action_rad": desired,
+                    "point_jz": point_jz, "palm_position_world_m": tensor(self.robot.data.body_pos_w)[:, self._palm_id]+offset_w,
+                    "palm_point_jacobian_w": offset_point_jacobian(torch, palm_jac, offset_w),
+                    "start_palm_z_m": self._start_palm_z, "guard_evidence": evidence,
+                    "pre_guard_infeasible": infeasible, "post_lower_bound_violation_rad": lower_violation,
+                    "post_upper_bound_violation_rad": upper_violation, "post_bound_tolerance_rad": bound_tolerance,
+                    "post_bounds_passed": bounds_ok, "requires_unsafe": guard_unsafe,
+                    "legacy_diagnostic_difference": "post-guard box/height violations are explicit unsafe; roundoff-only legacy residuals remain logged"})
             self._targets[:, self._action_ids] = desired
 
         def _apply_action(self):
@@ -1389,6 +1494,24 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._pending_physics_sample:
                 self._sample_physics()
                 self._pending_physics_sample = False
+            if self._control_probe_enabled:
+                # DirectRLEnv resets terminal environments before returning
+                # from step. Keep the actual pre-reset transition for the
+                # runner's explicit post-step recording call.
+                self._control_transition_snapshot = {
+                    "event": "control_transition", "command_id": self._control_command_id,
+                    "profile": dict(self._control_probe_profile),
+                    "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                    "episode_id": self._episode_ids.detach().clone(),
+                    "episode_control_steps": self.episode_length_buf.detach().clone(),
+                    "measured_q_rad": tensor(self.robot.data.joint_pos).detach().clone(),
+                    "measured_qd_rad_s": tensor(self.robot.data.joint_vel).detach().clone(),
+                    "applied_target_rad": self._targets.detach().clone(),
+                    "cube_position_world_m": tensor(self.cube.data.root_pos_w).detach().clone(),
+                    "cube_quaternion_xyzw": tensor(self.cube.data.root_quat_w).detach().clone(),
+                    "metrics": {name: value.detach().clone() for name, value in self._last_metrics.items()},
+                    "unsafe_latched": self._unsafe.detach().clone(),
+                    "main_lift_authorized": False, "pre_reset": True}
             if self._standalone_video:
                 self._capture_evaluation_frame()
             dropped = tensor(self.cube.data.root_pos_w)[:, 2] < 0.70
@@ -1570,7 +1693,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                        "unavailable_reason": measurement_unavailable, "gates": gates, "metrics": metrics,
                                        "max_clearance_m": float(episode["max_clearance_m"]),
                                        "maximum_support_samples": int(episode["maximum_support_samples"]),
-                                       "failure_reasons": failure})
+                                       "failure_reasons": failure,
+                                       **({"control_probe_profile": dict(self._control_probe_profile)} if self._control_probe_enabled else {})})
             self._interrupted += int(((~terminal) & (self.episode_length_buf[env_ids] > 0)).sum().item())
             super()._reset_idx(env_ids)
             n = len(env_ids)
@@ -1630,12 +1754,111 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                                        "episode_id": int(self._episode_ids[0].item()),
                                                        "next_frame_index": self._video_status["frames"],
                                                        "native_physics_step_count": int(self.sim.get_physics_step_count()),
-                                                       "sim_time_s": int(self.sim.get_physics_step_count())*float(self.sim.get_physics_dt())}) + "\n")
+                                                       "sim_time_s": int(self.sim.get_physics_step_count())*float(self.sim.get_physics_dt()),
+                                                       **({"profile_name": self._control_probe_profile["name"]} if self._control_probe_enabled else {})}) + "\n")
                 self._video_manifest.flush()
 
         def pop_episode_outcomes(self):
             result, self._outcomes = self._outcomes, []
             return result
+
+        def _write_control_probe(self, row):
+            if not self._control_probe_enabled or self._control_probe_stream is None:
+                raise RLEnvironmentError("diagnostic evidence stream is not enabled")
+            row = {**row, "profile_name": self._control_probe_profile["name"],
+                   "control_probe_profile": dict(self._control_probe_profile),
+                   "env_ids": list(range(self.num_envs))}
+            self._control_probe_stream.write(json.dumps(_json_finite(_probe_payload(torch, row)),
+                                                         ensure_ascii=False, allow_nan=False)+"\n")
+            self._control_probe_stream.flush()
+
+        def configure_control_probe(self, profile):
+            """Change diagnostic controller identity at a completed control boundary."""
+            if not self._control_probe_enabled:
+                raise RLEnvironmentError("controller diagnostics were not enabled at construction")
+            if self._pending_physics_sample or self._control_transition_snapshot is not None:
+                raise RLEnvironmentError("a profile may change only after its complete transition is recorded")
+            selected = control_probe_profile(profile)
+            if selected is None:
+                raise RLEnvironmentError("diagnostic profiles cannot be silently disabled")
+            self._control_probe_profile = selected
+            row = {"event": "control_profile_boundary", "profile": dict(selected),
+                   "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                   "next_frame_index": self._video_status["frames"],
+                   "next_command_id": self._control_command_id+1,
+                   "joint_names": list(self.robot.joint_names), "action_joint_names": list(ACTION_JOINT_NAMES),
+                   "action_joint_ids": list(self._action_ids), "main_lift_authorized": False}
+            self._write_control_probe(row)
+            self._write_evaluation_row(row)
+            if self._video_manifest:
+                self._video_manifest.write(json.dumps({**row, "profile_name": selected["name"]})+"\n")
+                self._video_manifest.flush()
+            return dict(selected)
+
+        def control_diagnostic_state(self):
+            """Return measured tensors; calling this never advances or writes physics."""
+            if not self._control_probe_enabled:
+                raise RLEnvironmentError("controller diagnostics were not enabled at construction")
+            body_rotation = tensor(self.robot.data.body_quat_w)[:, self._palm_id]
+            offset_w = quat_apply(body_rotation, self._palm_local)
+            jacobian = tensor(self.robot.data.body_link_jacobian_w)
+            if jacobian.shape[1] != self.robot.num_bodies-1 or jacobian.shape[-1] != 43:
+                raise RLEnvironmentError("diagnostic site Jacobian requires the verified fixed-root articulation")
+            point_jacobian = offset_point_jacobian(torch,
+                jacobian[:, self._palm_id-1][:, :, self._action_ids[:7]], offset_w)
+            per_step = torch.minimum(self._velocity*self.step_dt,
+                                     torch.full_like(self._velocity, float(config["rl_teacher"]["action_scale_rad"])))
+            values = {
+                "q_action_rad": tensor(self.robot.data.joint_pos)[:, self._action_ids],
+                "qd_action_rad_s": tensor(self.robot.data.joint_vel)[:, self._action_ids],
+                "target_action_rad": self._targets[:, self._action_ids],
+                "per_step_action_rad": per_step,
+                "joint_limits_action_rad": self._limits[:, self._action_ids],
+                "palm_position_world_m": tensor(self.robot.data.body_pos_w)[:, self._palm_id]+offset_w,
+                "palm_quaternion_xyzw": quat_mul(body_rotation, self._palm_local_rotation),
+                "palm_point_jacobian_w": point_jacobian,
+                "cube_position_world_m": tensor(self.cube.data.root_pos_w),
+                "cube_quaternion_xyzw": tensor(self.cube.data.root_quat_w),
+                "group_normal_force_n": torch.where((self.episode_length_buf > 0)[:, None],
+                    self._last_metrics.get("group_normal_force_n", torch.zeros(self.num_envs, 3, device=self.device)),
+                    torch.zeros(self.num_envs, 3, device=self.device)),
+                "episode_control_steps": self.episode_length_buf,
+                "episode_id": self._episode_ids,
+                "q_all_rad": tensor(self.robot.data.joint_pos),
+                "qd_all_rad_s": tensor(self.robot.data.joint_vel),
+                "target_all_rad": self._targets,
+                "tip_link_origin_world_m": tensor(self.robot.data.body_pos_w)[:, self._tip_ids],
+                "unsafe_latched": self._unsafe,
+                "probe_overshoot": self._probe_overshoot,
+                "preload_contact_ready": (preload_contact_ready(torch, self._last_metrics, self.num_envs, self.device) &
+                                          self._grip_locked & (self.episode_length_buf > 0)),
+                "contact_metrics_current_episode": self.episode_length_buf > 0,
+                "metrics": self._last_metrics,
+            }
+            def clone(value):
+                if torch.is_tensor(value):
+                    return value.detach().clone()
+                return {name: clone(item) for name, item in value.items()}
+            result = {name: clone(value) for name, value in values.items()}
+            result.update(action_joint_ids=list(self._action_ids), action_joint_names=list(ACTION_JOINT_NAMES),
+                          all_joint_names=list(self.robot.joint_names),
+                          tip_link_order=["thumb_2", "middle_1", "index_1"],
+                          control_probe_profile=dict(self._control_probe_profile),
+                          native_physics_step_count=int(self.sim.get_physics_step_count()))
+            return result
+
+        def record_control_probe_transition(self):
+            """Persist actual post-step, pre-reset states exactly once per command."""
+            row = self._control_transition_snapshot
+            if not self._control_probe_enabled or row is None or row["command_id"] <= self._control_transition_recorded:
+                raise RLEnvironmentError("no new complete diagnostic control transition is available")
+            if row["profile"] != self._control_probe_profile:
+                raise RLEnvironmentError("diagnostic profile changed before transition recording")
+            self._write_control_probe(row)
+            self._control_transition_recorded = row["command_id"]
+            self._control_transition_snapshot = None
+            return {"command_id": row["command_id"], "profile_name": row["profile"]["name"],
+                    "native_physics_step_count": row["native_physics_step_count"]}
 
         def state_hold_actions(self):
             """Request current measured 14-joint positions through the same limiter.
@@ -1681,7 +1904,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                        "camera_frame_counter": camera_frame,
                        "cube_position_world_m": tensor(self.cube.data.root_pos_w)[0].detach().cpu().tolist(),
                        "cube_quaternion_xyzw": tensor(self.cube.data.root_quat_w)[0].detach().cpu().tolist(),
-                       "pre_reset": True}
+                       "pre_reset": True,
+                       **({"profile_name": self._control_probe_profile["name"]} if self._control_probe_enabled else {})}
                 self._video_manifest.write(json.dumps(row, allow_nan=False) + "\n")
                 self._video_manifest.flush()
                 self._video_status["frames"] = frame+1
@@ -1722,10 +1946,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
 
         def _write_evaluation_row(self, row):
             if self._record:
+                if self._control_probe_enabled:
+                    row = {**row, "control_probe_profile": dict(self._control_probe_profile)}
                 self._record.write(json.dumps(_json_finite(row), ensure_ascii=False, allow_nan=False) + "\n")
 
         def runtime_audit(self):
-            return {"environment_version": ENVIRONMENT_VERSION, "settings": dict(settings),
+            audit = {"environment_version": ENVIRONMENT_VERSION, "settings": dict(settings),
                     "policy_contract": {"environment_version": ENVIRONMENT_VERSION,
                                         "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
                                         "support_gate_version": SUPPORT_GATE_VERSION,
@@ -1803,6 +2029,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "original_main_lift_enabled": False,
                     "main_lift_authorized": False,
                     "observation_cameras": [], "in_episode_object_state_writes": 0, "object_attachments": 0}
+            if self._control_probe_enabled:
+                audit["policy_contract"]["control_guard_version"] = self._control_probe_profile["control_guard_version"]
+                audit["control_probe_profile"] = dict(self._control_probe_profile)
+                audit["diagnostic_legacy_postcheck"] = "exact residuals recorded; source-pinned roundoff-only allowance, meaningful box/height violations latch unsafe"
+            return audit
 
         def step_audit(self):
             return {"physics_samples": self._physics_samples, "reset_count": self._resets,
@@ -1823,9 +2054,19 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "evaluation_video": dict(self._video_status),
                     "nonfinite_state": bool((~self._last_metrics.get("finite", torch.ones(self.num_envs, dtype=torch.bool, device=self.device))).any()),
                     "success_count_pending": sum(row["success"] is True for row in self._outcomes),
-                    "reward_components": {name: float(value.mean().item()) for name, value in self._reward_terms.items()}}
+                    "reward_components": {name: float(value.mean().item()) for name, value in self._reward_terms.items()},
+                    **({"control_probe_profile": dict(self._control_probe_profile),
+                        "control_command_count": self._control_command_id,
+                        "control_transition_count": self._control_transition_recorded,
+                        "control_guard_correction_count": self._control_guard_correction_count,
+                        "control_guard_unsafe_count": self._control_guard_unsafe_count,
+                        "shield_count_semantics": "legacy applied scalar<1; projected actual target correction nonzero"}
+                       if self._control_probe_enabled else {})}
 
         def close(self):
+            if getattr(self, "_control_probe_stream", None):
+                self._control_probe_stream.close()
+                self._control_probe_stream = None
             if getattr(self, "_crosscheck_record", None):
                 self._crosscheck_record.close()
                 self._crosscheck_record = None

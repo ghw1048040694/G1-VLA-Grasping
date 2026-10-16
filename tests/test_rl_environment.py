@@ -1,5 +1,6 @@
 """Math and immutable input checks for the separate PhysX RL curriculum."""
 
+import ast
 import copy
 import hashlib
 import importlib.util
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from g1_vla.rl_environment import (
     ACTION_JOINT_NAMES,
@@ -26,9 +28,12 @@ from g1_vla.rl_environment import (
     audit_asset_manifest,
     audit_fixed_root_joints,
     consecutive_window_samples,
+    control_probe_profile,
     cube_contact_partner_layout,
     minimum_box_clearance,
     migration_pose_errors,
+    offset_point_jacobian,
+    preload_contact_ready,
     policy_velocity_limits,
     resolve_settings,
     sensor_body_path_map,
@@ -100,6 +105,17 @@ class PhysicalGeometryTest(unittest.TestCase):
 
 
 class ProtocolInputsTest(unittest.TestCase):
+    def test_controller_diagnostics_require_explicit_versioned_identity(self):
+        self.assertIsNone(control_probe_profile(None))
+        profile = {"name": "policy_legacy", "action_source": "frozen_actor",
+                   "control_guard_version": "legacy_scalar_v1"}
+        result = control_probe_profile(profile)
+        self.assertEqual(result, profile)
+        self.assertIsNot(result, profile)
+        for invalid in ({}, dict(profile, name=""), dict(profile, control_guard_version="unbounded"), []):
+            with self.assertRaises(RLEnvironmentError):
+                control_probe_profile(invalid)
+
     def test_table_is_declared_as_gravity_disabled_kinematic_at_original_geometry(self):
         self.assertTrue(TABLE_BODY_PROTOCOL["kinematic_enabled"])
         self.assertTrue(TABLE_BODY_PROTOCOL["disable_gravity"])
@@ -260,6 +276,143 @@ class ProtocolInputsTest(unittest.TestCase):
     def test_module_import_does_not_import_torch_isaac_or_warp(self):
         code = "import sys; import g1_vla.rl_environment; assert not any(n in sys.modules for n in ('torch', 'warp', 'isaaclab', 'isaacsim'))"
         subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "Torch-free host; run controller tensor tests on CPU Torch")
+class ControllerDiagnosticTensorTest(unittest.TestCase):
+    def setUp(self):
+        import torch
+        self.torch = torch
+
+    def method(self, name, **extra):
+        # Exercise the real nested environment method without importing Isaac
+        # or constructing a simulator. Only measured tensor providers are fake.
+        tree = ast.parse((ROOT / "src/g1_vla/rl_environment.py").read_text())
+        environment = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "Environment")
+        method = next(node for node in environment.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        scope = {"torch": self.torch, "tensor": lambda value: value, "RLEnvironmentError": RLEnvironmentError,
+                 "__package__": "g1_vla", **extra}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "<actual-environment-method>", "exec"), scope)
+        return scope[name]
+
+    def test_site_jacobian_corrects_angular_velocity_at_offset_without_mutation(self):
+        t = self.torch
+        jacobian = t.zeros(1, 6, 2)
+        jacobian[0, 5, 0], jacobian[0, 4, 1] = 1, 2
+        saved = jacobian.clone()
+        shifted = offset_point_jacobian(t, jacobian, t.tensor([[.14, 0, 0]]))
+        self.assertAlmostEqual(shifted[0, 1, 0].item(), .14, places=6)
+        self.assertAlmostEqual(shifted[0, 2, 1].item(), -.28, places=6)
+        self.assertTrue(t.equal(jacobian, saved))
+        self.assertTrue(t.equal(shifted[:, 3:], jacobian[:, 3:]))
+
+    def test_preload_readiness_requires_real_contact_but_does_not_claim_support(self):
+        t = self.torch
+        keys = ("contact_safe", "grip_reference_locked", "no_positive_gap_hand_load",
+                "friction_partner_manifold_certified", "finite", "joint_safe")
+        metrics = {key: t.ones(2, dtype=t.bool) for key in keys}
+        metrics.update(no_loaded_table_contact=t.zeros(2, dtype=t.bool),
+                       support_current=t.zeros(2, dtype=t.bool))
+        self.assertTrue(preload_contact_ready(t, metrics, 2, "cpu").all())
+        metrics["grip_reference_locked"][0] = False
+        self.assertEqual(preload_contact_ready(t, metrics, 2, "cpu").tolist(), [False, True])
+        del metrics["friction_partner_manifold_certified"]
+        self.assertFalse(preload_contact_ready(t, metrics, 2, "cpu").any())
+
+    def test_no_diagnostic_preserves_historical_scalar_target_formula(self):
+        t = self.torch
+        jac = t.zeros(1, 1, 6, 43)
+        jac[0, 0, 2, 0], jac[0, 0, 4, 1] = 1, -2
+        data = SimpleNamespace(joint_pos=t.zeros(1, 43), body_quat_w=t.tensor([[[0., 0, 0, 1], [0., 0, 0, 1]]]),
+                               body_pos_w=t.zeros(1, 2, 3), body_link_jacobian_w=jac)
+        fake = SimpleNamespace(num_envs=1, _control_probe_enabled=False, _previous_actions=t.zeros(1, 14),
+            _actions=t.zeros(1, 14), _next_action_origin="actor", _targets=t.zeros(1, 43),
+            _action_ids=list(range(14)), _velocity=t.full((14,), .5), step_dt=.066,
+            _limits=t.tensor([[[-1., 1.]]*43]), _unsafe=t.zeros(1, dtype=t.bool),
+            robot=SimpleNamespace(data=data, num_bodies=2), _palm_id=1, _palm_local=t.tensor([[.14, 0, 0]]),
+            _start_palm_z=t.full((1,), float("nan")), _shield_count=0)
+        action = t.ones(1, 14)
+        function = self.method("_pre_physics_step", quat_apply=lambda q, offset: offset,
+            config={"rl_teacher": {"action_scale_rad": .08}, "control": {"max_anchor_delta_rad": .08}},
+            settings={"probe_clearance_max_m": .006})
+        function(fake, action)
+        previous = t.zeros(1, 7)
+        increment = t.full((1, 7), .5*.066)
+        jz = t.tensor([[1., .28, 0, 0, 0, 0, 0]])
+        predicted = (jz*increment).sum(-1)
+        factor = (.006/predicted.clamp_min(1e-12)).clamp(0, 1)
+        expected = previous+increment*factor[:, None]
+        self.assertTrue(t.equal(fake._targets[:, :7], expected))
+        self.assertTrue(t.equal(fake._targets[:, 7:14], increment))
+        self.assertEqual(fake._shield_count, 1)
+        self.assertFalse(fake._unsafe.any())
+
+    def test_terminal_transition_keeps_actual_pre_reset_state_and_records_once(self):
+        t = self.torch
+        profile = {"name": "guided", "action_source": "guidance", "control_guard_version": "box_halfspace_projected_v2"}
+        q = t.full((1, 43), .123)
+        metric = t.tensor([.2])
+        fake = SimpleNamespace(_pending_physics_sample=False, _control_probe_enabled=True, _control_command_id=1,
+            _control_probe_profile=profile, _episode_ids=t.tensor([7]), episode_length_buf=t.tensor([91]),
+            robot=SimpleNamespace(data=SimpleNamespace(joint_pos=q, joint_vel=t.zeros_like(q))),
+            cube=SimpleNamespace(data=SimpleNamespace(root_pos_w=t.tensor([[0., 0, .775]]), root_quat_w=t.tensor([[0., 0, 0, 1]]))),
+            sim=SimpleNamespace(get_physics_step_count=lambda: 3003), _targets=q.clone(),
+            _last_metrics={"example": metric}, _unsafe=t.tensor([False]), _local_success=t.tensor([False]),
+            _standalone_video=False, max_episode_length=91, _control_transition_recorded=0)
+        terminated, truncated = self.method("_get_dones")(fake)
+        self.assertFalse(terminated.any())
+        self.assertTrue(truncated.all())
+        q.zero_(); metric.zero_(); fake._episode_ids += 1
+        recorded = []
+        fake._write_control_probe = recorded.append
+        method = self.method("record_control_probe_transition")
+        method(fake)
+        self.assertAlmostEqual(recorded[0]["measured_q_rad"][0, 0].item(), .123, places=6)
+        self.assertAlmostEqual(recorded[0]["metrics"]["example"][0].item(), .2, places=6)
+        self.assertEqual(recorded[0]["episode_id"].item(), 7)
+        self.assertTrue(recorded[0]["pre_reset"])
+        with self.assertRaises(RLEnvironmentError):
+            method(fake)
+
+    def test_diagnostic_state_has_measured_site_tensors_and_masks_previous_episode_contact(self):
+        t = self.torch
+        keys = ("contact_safe", "grip_reference_locked", "no_positive_gap_hand_load",
+                "friction_partner_manifold_certified", "finite", "joint_safe")
+        metrics = {key: t.tensor([True]) for key in keys}
+        metrics["group_normal_force_n"] = t.full((1, 3), .4)
+        q = t.full((1, 43), .1)
+        data = SimpleNamespace(joint_pos=q, joint_vel=t.zeros_like(q), body_link_jacobian_w=t.zeros(1, 1, 6, 43),
+                               body_quat_w=t.tensor([[[0., 0, 0, 1], [0., 0, 0, 1]]]), body_pos_w=t.zeros(1, 2, 3))
+        fake = SimpleNamespace(_control_probe_enabled=True, num_envs=1, device="cpu", _palm_id=1,
+            _palm_local=t.tensor([[.14, 0, 0]]), _palm_local_rotation=t.tensor([[0., 0, 0, 1]]),
+            robot=SimpleNamespace(data=data, num_bodies=2, joint_names=["joint"+str(i) for i in range(43)]),
+            cube=SimpleNamespace(data=SimpleNamespace(root_pos_w=t.zeros(1, 3), root_quat_w=t.tensor([[0., 0, 0, 1]]))),
+            _action_ids=list(range(14)), _tip_ids=[0, 1, 0], _velocity=t.full((14,), .5), step_dt=.066,
+            _targets=t.full((1, 43), .2), _limits=t.tensor([[[-1., 1.]]*43]), _last_metrics=metrics,
+            episode_length_buf=t.tensor([0]), _episode_ids=t.tensor([8]), _grip_locked=t.tensor([False]),
+            _unsafe=t.tensor([False]), _probe_overshoot=t.tensor([False]), _control_probe_profile={"name": "test"},
+            sim=SimpleNamespace(get_physics_step_count=lambda: 3003))
+        method = self.method("control_diagnostic_state", quat_apply=lambda q, offset: offset,
+            quat_mul=lambda first, second: first, offset_point_jacobian=offset_point_jacobian,
+            preload_contact_ready=preload_contact_ready, ACTION_JOINT_NAMES=ACTION_JOINT_NAMES,
+            config={"rl_teacher": {"action_scale_rad": .08}})
+        result = method(fake)
+        self.assertEqual(result["palm_point_jacobian_w"].shape, (1, 6, 7))
+        self.assertEqual(result["joint_limits_action_rad"].shape, (1, 14, 2))
+        self.assertEqual(result["episode_id"].item(), 8)
+        self.assertFalse(result["preload_contact_ready"].any())
+        self.assertFalse(result["group_normal_force_n"].any())
+        result["q_action_rad"].zero_()
+        self.assertTrue((q == .1).all())
+        fake.episode_length_buf[:] = 1
+        fake._grip_locked[:] = True
+        self.assertTrue(method(fake)["preload_contact_ready"].all())
+
+    def test_profile_cannot_change_with_an_unrecorded_terminal_snapshot(self):
+        fake = SimpleNamespace(_control_probe_enabled=True, _pending_physics_sample=False,
+                               _control_transition_snapshot={"command_id": 1})
+        with self.assertRaises(RLEnvironmentError):
+            self.method("configure_control_probe")(fake, {"name": "next"})
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "Torch-free host; run sparse contact tests in the native runtime")

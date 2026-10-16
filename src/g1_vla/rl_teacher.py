@@ -25,7 +25,7 @@ def windows_to_wsl(value):
     return Path("/mnt") / path.drive[0].lower() / Path(*path.parts[1:])
 
 
-def _snapshot_release(config, run_dir, assets):
+def _snapshot_release(config, run_dir, assets, diagnostic=False):
     from .config import load_config
 
     root = Path(config["paths"]["root"]).resolve()
@@ -37,6 +37,9 @@ def _snapshot_release(config, run_dir, assets):
     asset_root = Path(config["rl_teacher"]["asset_manifest_path"]).parent
     files += [asset_root / item["path"] for item in assets["manifest"]["files"]]
     files += [Path(config["rl_teacher"]["asset_manifest_path"])]
+    if diagnostic:
+        from .rl_probe_protocol import reference_snapshot_files
+        files += reference_snapshot_files(config)
     selected = config["rl_teacher"]
     if selected["checkpoint_path"]:
         checkpoint = Path(selected["checkpoint_path"])
@@ -135,8 +138,10 @@ def _native_script(stage, config, win_release, win_output, run_id, release_sha25
         "cfg['rl_teacher']['seed_state_path']=str(asset_root/'seed_state.json')",
         "cfg['rl_teacher']['asset_manifest_path']=str(asset_root/'asset_manifest.json')",
         "verify_rl_assets(cfg)",
-        "from g1_vla.rl_ppo import run_native_stage",
-        "run_native_stage(" + repr(stage) + ",cfg,output)",
+        "from g1_vla.rl_diagnostics import run_native_diagnostics" if stage == "rl-diagnose" else
+            "from g1_vla.rl_ppo import run_native_stage",
+        "run_native_diagnostics(cfg,output)" if stage == "rl-diagnose" else
+            "run_native_stage(" + repr(stage) + ",cfg,output)",
     ])
 
 
@@ -169,6 +174,35 @@ def _package_eval_videos(output, run_dir):
             row.update(encoded=True, path=str(target), sha256=file_hash(target),
                        bytes=target.stat().st_size, decoded_frames=int(stream["nb_read_frames"]),
                        encoded_fps=stream["r_frame_rate"])
+            native_report = Path(output) / "native_report.json"
+            report = json.loads(native_report.read_text()) if native_report.is_file() else {}
+            if report.get("stage") == "rl-diagnose":
+                row["profile_clips"] = []
+                for profile in report.get("profiles", []):
+                    name = profile["profile"]["name"]
+                    if not name or any(c not in "abcdefghijklmnopqrstuvwxyz_0123456789" for c in name):
+                        raise ValueError("invalid diagnostic video profile name")
+                    first, last = profile["first_video_frame"], profile["last_video_frame_exclusive"]
+                    if not 0 <= first < last <= len(paths):
+                        raise ValueError("diagnostic video frame range is invalid")
+                    clip = frames.parent / ("evaluation_env0_" + name + ".mp4")
+                    with (Path(run_dir) / "logs/native_video_encoding.log").open("ab") as log:
+                        subprocess.run(["ffmpeg", "-nostdin", "-n", "-v", "error", "-framerate", "500/33",
+                            "-start_number", str(first), "-i", str(frames / "frame_%06d.png"),
+                            "-frames:v", str(last-first), "-c:v", "libx264", "-crf", "20",
+                            "-pix_fmt", "yuv420p", str(clip)], stdout=log, stderr=subprocess.STDOUT,
+                            check=True, timeout=60)
+                    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                        "-count_frames", "-show_entries", "stream=nb_read_frames,r_frame_rate", "-of", "json",
+                        str(clip)], capture_output=True, text=True, check=True, timeout=15)
+                    clip_stream = json.loads(probe.stdout)["streams"][0]
+                    if int(clip_stream["nb_read_frames"]) != last-first:
+                        raise ValueError("diagnostic profile video has incomplete frames")
+                    row["profile_clips"].append({"profile": name, "path": str(clip),
+                        "first_source_frame": first, "last_source_frame_exclusive": last,
+                        "decoded_frames": int(clip_stream["nb_read_frames"]),
+                        "encoded_fps": clip_stream["r_frame_rate"], "sha256": file_hash(clip),
+                        "bytes": clip.stat().st_size, "raw_RGB_pixels_unchanged": True})
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             row["error"] = str(exc)
         videos.append(row)
@@ -177,8 +211,29 @@ def _package_eval_videos(output, run_dir):
     return videos
 
 
+def _diagnostic_video_delivery(videos, native):
+    """Require every declared physical profile's actual complete RGB clip."""
+    if native.get("video_evidence_complete") is not True or len(videos) != 1:
+        return False
+    video = videos[0]
+    profiles = native.get("profiles", [])
+    clips = video.get("profile_clips", [])
+    if video.get("encoded") is not True or len(clips) != 4 or len(profiles) != 4:
+        return False
+    previous = 0
+    for clip, profile in zip(clips, profiles):
+        first, last = profile["first_video_frame"], profile["last_video_frame_exclusive"]
+        if (clip.get("profile") != profile["profile"]["name"] or
+                clip.get("first_source_frame") != first or clip.get("last_source_frame_exclusive") != last or
+                first != previous or last-first != profile["control_steps"] or
+                clip.get("decoded_frames") != last-first or clip.get("encoded_fps") != "500/33"):
+            return False
+        previous = last
+    return video.get("decoded_frames") == previous
+
+
 def run_rl_teacher_stage(stage, config, run_dir):
-    if stage not in ("rl-audit", "rl-smoke", "rl-train", "rl-eval"):
+    if stage not in ("rl-audit", "rl-smoke", "rl-train", "rl-eval", "rl-diagnose"):
         raise ValueError("unsupported privileged RL stage")
     assets = verify_rl_assets(config)
     run_dir = Path(run_dir)
@@ -189,7 +244,15 @@ def run_rl_teacher_stage(stage, config, run_dir):
     cmd = Path("/mnt/c/Windows/System32/cmd.exe")
     if not cmd.is_file():
         raise ValueError("the declared Windows Isaac runtime is unavailable from this host")
-    release_sha, win_release, local_release = _snapshot_release(config, run_dir, assets)
+    if stage == "rl-diagnose":
+        from .rl_probe_protocol import verify_probe_reference
+        verify_probe_reference(config)
+        if config["rl_diagnostics"]["enabled"] is not True:
+            raise ValueError("rl-diagnose requires an explicit enabled diagnostic configuration")
+    if stage == "rl-diagnose":
+        release_sha, win_release, local_release = _snapshot_release(config, run_dir, assets, diagnostic=True)
+    else:
+        release_sha, win_release, local_release = _snapshot_release(config, run_dir, assets)
     win_assets = _snapshot_runtime_assets(config, assets)
     admission = _smoke_admission(config, release_sha) if stage == "rl-train" else None
     if stage == "rl-eval":
@@ -215,8 +278,9 @@ def run_rl_teacher_stage(stage, config, run_dir):
             stdout=stream, stderr=subprocess.STDOUT)
         timed_out = False
         try:
-            process.communicate(script.encode("utf-8"), timeout=(config["rl_teacher"]["max_wall_time_s"] + 180
-                if stage == "rl-train" else 900))
+            timeout = (config["rl_diagnostics"]["max_wall_time_s"] + 180 if stage == "rl-diagnose" else
+                       config["rl_teacher"]["max_wall_time_s"] + 180 if stage == "rl-train" else 900)
+            process.communicate(script.encode("utf-8"), timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             pid_file = local_output / "process_pid.json"
@@ -231,7 +295,7 @@ def run_rl_teacher_stage(stage, config, run_dir):
     native = json.loads(native_report_path.read_text(encoding="utf-8")) if native_report_path.is_file() else {
         "passed": False, "training_started": None, "optimizer_steps": None,
         "error": "native process ended without its authoritative native_report.json; optimization status unknown"}
-    videos = _package_eval_videos(local_output, run_dir) if stage == "rl-eval" else []
+    videos = _package_eval_videos(local_output, run_dir) if stage in ("rl-eval", "rl-diagnose") else []
     if local_output.exists():
         shutil.copytree(local_output, run_dir / "native", dirs_exist_ok=False)
     result = {"stage": stage, "passed": process.returncode == 0 and not timed_out and native.get("passed") is True,
@@ -245,5 +309,9 @@ def run_rl_teacher_stage(stage, config, run_dir):
         "optimizer_steps": native.get("optimizer_steps", 0), "formal_original20_evaluated": False,
         "original_mujoco_teacher_modified": False, "old_ACT_test_accessed": False,
         "scope": config["rl_teacher"]["scope"]}
+    if stage == "rl-diagnose":
+        result["video_evidence_complete"] = _diagnostic_video_delivery(videos, native)
+        result["source_identical_trained_eval"] = False
+        result["passed"] = result["passed"] and result["video_evidence_complete"]
     write_new_json(run_dir / "reports/rl_teacher.json", result)
     return result

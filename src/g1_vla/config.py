@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from .rl_protocol import RL_TEACHER_DEFAULTS, validate_rl_settings
+from .rl_probe_protocol import RL_PROBE_DEFAULTS, validate_probe_settings
 
 
 class ConfigError(ValueError):
@@ -307,7 +308,15 @@ def _rl_teacher_settings(value, path):
         _error(path, str(exc))
 
 
+def _rl_diagnostics_settings(value, path):
+    try:
+        validate_probe_settings(value)
+    except (ValueError, TypeError) as exc:
+        _error(path, str(exc))
+
+
 SCHEMA = {
+    "rl_diagnostics": _rl_diagnostics_settings,
     "rl_teacher": _rl_teacher_settings,
     "contact_calibration": _pinned_calibration,
     "schema_version": _literal(1),
@@ -626,6 +635,12 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         config = {**config, "contact_calibration": copy.deepcopy(CONTACT_CALIBRATION_DEFAULTS)}
     if isinstance(config, dict) and "rl_teacher" not in config:
         config = {**config, "rl_teacher": copy.deepcopy(RL_TEACHER_DEFAULTS)}
+    if isinstance(config, dict):
+        try:
+            diagnostic = validate_probe_settings(config.get("rl_diagnostics", copy.deepcopy(RL_PROBE_DEFAULTS)))
+        except (ValueError, TypeError) as exc:
+            _error("config.rl_diagnostics", str(exc))
+        config = {**config, "rl_diagnostics": diagnostic}
     _object(config, SCHEMA, "config")
     unknown_fields = set(config["observation"]["fields"]) - OBSERVATION_FIELDS
     if unknown_fields:
@@ -833,6 +848,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _PATH_FIELDS = {
+    "rl_diagnostics": ("reference_manifest_path", "reference_environment_audit_path", "reference_checkpoint_path"),
     "rl_teacher": ("asset_path", "seed_state_path", "asset_manifest_path", "checkpoint_path"),
     "scene": ("asset_path",), "action": ("joint_metadata_path",),
     "data": ("registry_path", "build_dir"),
