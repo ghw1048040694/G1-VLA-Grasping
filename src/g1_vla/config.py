@@ -231,12 +231,13 @@ SCHEMA = {
         },
         "contact_diagnostics": {"enabled": _boolean},
         "hand_control": {
-            "backend": _choice("fixed_closure_v1", "contact_normal_position_v1"),
+            "backend": _choice("fixed_closure_v1", "contact_normal_position_v2"),
             "normal_force_target_n": _positive, "maximum_group_force_n": _positive,
             "maximum_penetration_m": _positive, "relief_step_rad": _positive,
             "takeup_velocity_rad_s": _positive, "maximum_recovery_drift_m": _positive,
             "minimum_loaded_force_n": _positive, "maximum_closing_scale": _positive,
-            "force_feedback_gain": _fraction, "posture_gain": _fraction,
+            "normal_adjustment_rate_rad_n_s": _positive,
+            "maximum_force_step_rad": _positive, "posture_gain": _fraction,
             "maximum_posture_delta_rad": _positive,
         },
         "labels": {"backend": _literal("native_causal_prefix_v1"), "source_run_ids": _strings},
@@ -495,7 +496,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.expert.hand_control", "normal setpoint must be below the unload limit")
     if hand_control["minimum_loaded_force_n"] >= hand_control["normal_force_target_n"]:
         _error("config.expert.hand_control", "loaded detection must be below the normal setpoint")
-    if hand_control["backend"] == "contact_normal_position_v1" and teacher["profile"] != "green_right_cartesian_feedback_v4":
+    if hand_control["backend"] == "contact_normal_position_v2" and teacher["profile"] != "green_right_cartesian_feedback_v4":
         _error("config.expert.hand_control", "contact control requires the actual Cartesian grip-lock teacher")
     if (teacher["profile"] in ("green_right_cavity_feedback_v3", "green_right_cartesian_feedback_v4")
             and any(value != 0 for value in teacher["contact_compensation_m"])):

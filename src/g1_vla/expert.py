@@ -567,7 +567,7 @@ def run_teacher_episode(config, spec, run_dir):
         object_body = api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, "green_cube")
         if object_body < 0:
             raise ExpertError("green object is missing")
-        if config["expert"].get("hand_control", {}).get("backend") == "contact_normal_position_v1":
+        if config["expert"].get("hand_control", {}).get("backend") == "contact_normal_position_v2":
             from .hand_control import ContactHandControl
             nominal_hand = baseline.copy()
             for i, name in enumerate(names):
