@@ -165,7 +165,7 @@
       "enabled": true
     },
     "lift_start": {
-      "backend": "measured_cube_slow_start_v1",
+      "backend": "original_progress_v1",
       "cube_rise_m": 0.01,
       "progress_scale": 0.1
     },
@@ -176,7 +176,7 @@
       ]
     },
     "hand_control": {
-      "backend": "contact_normal_position_v2",
+      "backend": "fixed_closure_v1",
       "normal_force_target_n": 0.6,
       "maximum_group_force_n": 1.5,
       "maximum_penetration_m": 0.003,

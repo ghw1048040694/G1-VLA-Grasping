@@ -986,8 +986,9 @@ def run_teacher_episode(config, spec, run_dir):
                 for index, name in enumerate(names):
                     if name.startswith("right_hand_"):
                         target[index] = hand_request[index]
-            # Teacher plans at every actual observation. The eventual data chunk
-            # is built from eight next real control commands by the shared codec.
+            # Emit one real command per observed interval. Legacy pairing keeps
+            # its original diagnostics; labels-audit separately exports only
+            # legal causal prefixes with explicit padding, never invented truth.
             controller.execute_target(target.tolist(), joint_names=names,
                                       observer=observer, substep_observer=substep_observer)
             if cartesian_profile and latest_tracking.get("arm_limiter_delta_rad", 0.) > 1e-9:
