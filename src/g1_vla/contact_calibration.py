@@ -407,6 +407,11 @@ def score_trial(records, initial, settings, timestep_s, *, complete, video_compl
                 "actual_generalized_force_zero": np.max(np.abs(s["qfrc_applied"])) == 0.,
                 "gravity_position": released is not None and abs(s["COM_world_m"][2] - predicted_z) <= g["COM_vertical_prediction_error_max_m"],
                 "gravity_velocity": released is not None and abs(s["COM_velocity_world_m_s"][2] - predicted_v) <= g["vertical_velocity_prediction_error_max_m_s"]}})
+    # NumPy comparisons can produce np.bool_. Keep the declared Boolean
+    # result exactly, but make every persisted gate a native JSON Boolean.
+    for rows in checks_by_phase.values():
+        for row in rows:
+            row["checks"] = {name: bool(value) for name, value in row["checks"].items()}
     phase_passed = {phase: bool(rows) and all(all(r["checks"].values()) for r in rows)
                     for phase, rows in checks_by_phase.items()}
     numeric = all(r["finite"] for r in records)

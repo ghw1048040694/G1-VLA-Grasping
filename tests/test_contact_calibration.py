@@ -145,6 +145,18 @@ class ContactCalibrationTests(unittest.TestCase):
             score = score_trial(rows, initial, self.settings, dt, complete=True, video_complete=True)
             self.assertTrue(score["passed"], score["phase_passed"])
             self.assertEqual(score["actual_release_reference"]["COM_velocity_world_m_s"][2], .02)
+            # Persist the full recovery/freefall report, not merely all(checks).
+            # In particular np.linalg.norm(... )<=limit must serialize as a
+            # JSON Boolean without a default=str escape hatch.
+            encoded = json.dumps(score, allow_nan=False)
+            restored = json.loads(encoded)
+            self.assertTrue(restored["passed"])
+            self.assertTrue(restored["checks_by_phase"]["recovery"])
+            self.assertTrue(restored["checks_by_phase"]["free_fall"])
+            for phase_rows in score["checks_by_phase"].values():
+                for row in phase_rows:
+                    for value in row["checks"].values():
+                        self.assertIs(type(value), bool)
             continuous = copy.deepcopy(rows)
             end = phase_boundaries(self.settings)["opening_end"]
             for r in continuous:
@@ -153,6 +165,7 @@ class ContactCalibrationTests(unittest.TestCase):
                     r["state"]["COM_world_m"][2] = .25 + .02 * elapsed - .5 * 9.81 * elapsed ** 2
             bad = score_trial(continuous, initial, self.settings, dt, complete=True, video_complete=True)
             self.assertFalse(bad["phase_passed"]["free_fall"])
+            self.assertFalse(json.loads(json.dumps(bad, allow_nan=False))["phase_passed"]["free_fall"])
 
     def test_recovery_reference_cannot_hide_global_drift_or_floor_support(self):
         rows, initial = self.ideal_records()
