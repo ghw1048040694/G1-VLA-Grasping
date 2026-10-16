@@ -119,9 +119,9 @@
         0.0
       ],
       "grasp_center_in_palm_m": [
-        0.0,
-        0.05,
-        0.0
+        -0.008693663154670348,
+        0.0714565556684663,
+        -0.010940941872972454
       ],
       "pregrasp_height_m": 0.12,
       "pregrasp_lateral_m": 0.015,
@@ -189,6 +189,85 @@
       "maximum_force_step_rad": 0.005,
       "posture_gain": 0.05,
       "maximum_posture_delta_rad": 0.003
+    },
+    "opposition": {
+      "backend": "side_opposition_preload_v1",
+      "hand_joint_names": [
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint"
+      ],
+      "preshape_rad": [
+        1.045,
+        -0.5272541338003638,
+        -0.0337661932113641,
+        0.496618874082758,
+        1.1757259792001349,
+        0.2942076949212421,
+        1.131802967460296
+      ],
+      "closure_keyframes": [
+        {
+          "fraction": 0.0,
+          "joint_target_rad": [
+            1.045,
+            -0.5272541338003638,
+            -0.0337661932113641,
+            0.496618874082758,
+            1.1757259792001349,
+            0.2942076949212421,
+            1.131802967460296
+          ]
+        },
+        {
+          "fraction": 1.0,
+          "joint_target_rad": [
+            0.9489709316667446,
+            -0.5272541338003638,
+            -0.0337661932113641,
+            0.576618874082758,
+            1.3357259792001348,
+            0.3342076949212421,
+            1.2118029674602961
+          ]
+        }
+      ],
+      "object_rotation_in_palm_quat_wxyz": [
+        0.6264938967303944,
+        0.7062328542963225,
+        0.16068470852843145,
+        -0.28796002729053705
+      ],
+      "planning_taskpoint_tolerance_m": 0.0005,
+      "planning_orientation_tolerance_rad": 0.005,
+      "minimum_group_force_n": 0.02,
+      "maximum_abs_normal_up": 0.6,
+      "maximum_opposition_dot": -0.5,
+      "maximum_penetration_m": 0.003,
+      "maximum_group_force_n": 1.5,
+      "relief_step_rad": 0.01,
+      "transfer_height_m": 0.006,
+      "carry_maximum_grip_drift_m": 0.005,
+      "carry_maximum_rotation_rad": 0.15,
+      "preload": {
+        "minimum_bottom_clearance_m": 0.002,
+        "maximum_table_support_fraction": 0.05,
+        "hand_weight_ratio_min": 0.8,
+        "hand_weight_ratio_max": 1.2,
+        "max_linear_speed_m_s": 0.02,
+        "max_angular_speed_rad_s": 0.2,
+        "max_grip_drift_m": 0.003,
+        "stable_window_s": 0.198,
+        "required_groups": [
+          "thumb",
+          "index",
+          "middle"
+        ]
+      }
     }
   },
   "data": {

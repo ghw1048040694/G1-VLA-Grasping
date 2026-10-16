@@ -1,5 +1,7 @@
 """Teacher suite accounting and frozen external identity without any physics."""
 
+import copy
+import csv
 import json
 import tempfile
 import unittest
@@ -12,7 +14,9 @@ from g1_vla.artifacts import sha256_file
 from g1_vla.config import load_config
 from g1_vla.contracts import canonical_sha256, read_joint_order
 from g1_vla.data_pairing import build_paired_episode
-from g1_vla.teacher_acceptance import TeacherAcceptanceError, read_layout_manifest, run_teacher_acceptance
+from g1_vla.teacher_acceptance import (TeacherAcceptanceError, _load_transfer_summary, _summary,
+                                     _write_scores, read_layout_manifest, run_teacher_acceptance)
+from g1_vla.teacher_evidence import PHASES
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -95,6 +99,114 @@ def fake_teacher(config, spec, episode_dir, *, sensors=True, safe=True, finite=T
             "scene": scene, "layout_fingerprint": spec["layout_fingerprint"]}
 
 
+def measured_transfer():
+    """Synthetic recorded evidence for reporting tests, without physics."""
+    lock = {"timestamp_s": 1., "object_in_palm_frame_m": [0., .05, 0.]}
+    signature = canonical_sha256(lock)
+    return {"fixed_pretransfer_grip_lock": lock, "main_lift_started": True,
+            "approval": {"timestamp_s": 1.2, "support_window_status": {"ready": True}},
+            "support_samples": [
+                {"phase": "contact", "timestamp_s": .5, "grip_reference_sha256": None,
+                 "side_contact_status": {"checks": {"actual_side_normals": False, "opposing_thumb_fingers": False}}},
+                {"phase": "grasp", "timestamp_s": 1.002, "grip_reference_sha256": signature,
+                 "side_contact_status": {"checks": {"actual_side_normals": True, "opposing_thumb_fingers": True}}},
+                {"phase": "lift", "timestamp_s": 2.002, "grip_reference_sha256": signature,
+                 "side_contact_status": {"checks": {"actual_side_normals": False, "opposing_thumb_fingers": True}}}],
+            "contiguous_support_window": [
+                {"contiguous_valid_s": 0., "maximum_contiguous_valid_s": 0.,
+                 "checks": {"fixed_grip_drift_bounded": False}, "failure_reasons": ["fixed_grip_drift_bounded"]},
+                {"contiguous_valid_s": .198, "maximum_contiguous_valid_s": .198,
+                 "checks": {"fixed_grip_drift_bounded": True}, "failure_reasons": []},
+                {"contiguous_valid_s": 0., "maximum_contiguous_valid_s": .198,
+                 "checks": {}, "failure_reasons": ["sample_cadence_gap"]}],
+            "carry_ledger": [
+                {"phase": "lift", "timestamp_s": 2.002, "fixed_pretransfer_reference_sha256": signature,
+                 "grip_relative_drift_m": .004, "raw_relative_rotation_error_rad": .1,
+                 "checks": {"fixed_grip_drift_bounded": True}, "failure_reasons": []},
+                {"phase": "lift", "timestamp_s": 2.004, "fixed_pretransfer_reference_sha256": signature,
+                 "grip_relative_drift_m": .006, "raw_relative_rotation_error_rad": .16,
+                 "checks": {"fixed_grip_drift_bounded": False}, "failure_reasons": ["fixed_grip_drift_bounded"]}]}
+
+
+class TeacherScoreReportingTests(unittest.TestCase):
+    def write_row(self, root, teacher):
+        path = root / "scores.csv"
+        _write_scores(path, [{"layout_id": "diagnostic", "passed": False,
+                              "teacher": teacher, "pairing": None, "exception": None,
+                              "evidence": None, "phase_scores": {"home": {"completed": True, "entered": True}}}])
+        with path.open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            return reader.fieldnames, next(reader)
+
+    def test_old_or_exception_report_keeps_old_scores_and_empty_new_measurements(self):
+        for report in ({"passed": True, "failure": "old failure", "maximum_lift_m": .2}, None):
+            with self.subTest(report=report), tempfile.TemporaryDirectory() as directory:
+                teacher = _summary(report) if report is not None else None
+                fields, row = self.write_row(Path(directory), teacher)
+                self.assertEqual(fields[:4 + len(PHASES)], ["layout_id", "passed", "failure", "exception"] + list(PHASES))
+                self.assertEqual(row["passed"], "False")
+                self.assertEqual(row["home"], "completed")
+                self.assertEqual(row["contact"], "not_entered")
+                self.assertEqual(row["maximum_lift_m"], "0.2" if report else "")
+                for key in ("enabled", "probe_started", "approved", "main_lift_started"):
+                    self.assertEqual(row["load_transfer_" + key], "False")
+                for key in ("maximum_contiguous_valid_s", "maximum_carry_grip_drift_m",
+                            "maximum_carry_rotation_error_rad", "failed_side_checks", "failed_support_checks", "failed_carry_checks"):
+                    self.assertEqual(row["load_transfer_" + key], "")
+
+    def test_measured_diagnostics_aggregate_without_promoting_failure_or_mutating_report(self):
+        report = {"passed": False, "failure": "actual carry slipped", "maximum_lift_m": .12,
+                  "load_transfer": measured_transfer()}
+        original = copy.deepcopy(report)
+        teacher = _summary(report)
+        self.assertEqual(report, original)
+        self.assertFalse(teacher["passed"])
+        transfer = teacher["load_transfer"]
+        self.assertTrue(transfer["probe_started"])
+        self.assertTrue(transfer["approved"])
+        self.assertTrue(transfer["main_lift_started"])
+        self.assertEqual(transfer["maximum_contiguous_valid_s"], .198)
+        self.assertEqual(transfer["maximum_carry_grip_drift_m"], .006)
+        self.assertEqual(transfer["maximum_carry_rotation_error_rad"], .16)
+        self.assertEqual(transfer["failed_side_checks"], {"actual_side_normals": 2, "opposing_thumb_fingers": 1})
+        # checks and failure_reasons repeat the same evidence, not two failures.
+        self.assertEqual(transfer["failed_support_checks"], {"fixed_grip_drift_bounded": 1, "sample_cadence_gap": 1})
+        self.assertEqual(transfer["failed_carry_checks"], {"fixed_grip_drift_bounded": 1})
+        with tempfile.TemporaryDirectory() as directory:
+            fields, row = self.write_row(Path(directory), teacher)
+        self.assertEqual(row["passed"], "False")
+        self.assertEqual(row["failure"], "actual carry slipped")
+        self.assertEqual(row["maximum_lift_m"], "0.12")
+        self.assertEqual(row["load_transfer_approved"], "True")
+        self.assertEqual(json.loads(row["load_transfer_failed_support_checks"]), transfer["failed_support_checks"])
+
+    def test_locks_planning_flags_or_wrong_reference_do_not_claim_executed_motion(self):
+        transfer = measured_transfer()
+        transfer.update(support_samples=[], carry_ledger=[], approval=None)
+        summary = _load_transfer_summary({"load_transfer": transfer})
+        self.assertFalse(summary["probe_started"])
+        self.assertFalse(summary["main_lift_started"])
+        self.assertFalse(summary["approved"])
+        transfer = measured_transfer()
+        for row in transfer["support_samples"]:
+            row["grip_reference_sha256"] = "0" * 64
+        for row in transfer["carry_ledger"]:
+            row["fixed_pretransfer_reference_sha256"] = "0" * 64
+        summary = _load_transfer_summary({"load_transfer": transfer})
+        self.assertFalse(summary["probe_started"])
+        self.assertFalse(summary["main_lift_started"])
+
+    def test_missing_or_nonfinite_telemetry_does_not_invent_zero_measurements(self):
+        transfer = measured_transfer()
+        transfer["support_samples"] = [{"side_contact_status": None}]
+        transfer["contiguous_support_window"] = [{"contiguous_valid_s": float("nan")}]
+        transfer["carry_ledger"] = [{"grip_relative_drift_m": float("nan"), "raw_relative_rotation_error_rad": True}]
+        summary = _load_transfer_summary({"load_transfer": transfer})
+        self.assertIsNone(summary["maximum_contiguous_valid_s"])
+        self.assertIsNone(summary["maximum_carry_grip_drift_m"])
+        self.assertIsNone(summary["maximum_carry_rotation_error_rad"])
+
+
 class TeacherManifestTests(unittest.TestCase):
     def test_invalid_count_duplicate_id_duplicate_pose_and_nonfinite_fail(self):
         for mode in ("count", "id", "position", "nan", "extra_object", "unsafe_id"):
@@ -127,6 +239,24 @@ class TeacherManifestTests(unittest.TestCase):
 
 
 class TeacherAcceptanceTests(unittest.TestCase):
+    def test_approved_load_diagnostics_cannot_promote_a_failed_teacher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = configuration(root)
+            def teacher(configuration, spec, episode_dir):
+                report = fake_teacher(configuration, spec, episode_dir, report_passed=False)
+                report["load_transfer"] = measured_transfer()
+                return report
+            with patch("g1_vla.teacher_acceptance.run_teacher_episode", side_effect=teacher):
+                report = run_teacher_acceptance(config, root / "runs/smoke", smoke=True)
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["summary"]["successes"], 0)
+            self.assertTrue(report["layouts"][0]["teacher"]["load_transfer"]["approved"])
+            with Path(report["scores_csv"]).open(newline="") as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row["passed"], "False")
+            self.assertEqual(row["load_transfer_approved"], "True")
+
     def test_focus_uses_original_ids_and_never_claims_formal_gate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

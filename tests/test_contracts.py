@@ -35,8 +35,32 @@ def contract_fixture():
 
 
 class ConfigTests(unittest.TestCase):
+    def test_opposition_settings_cannot_silently_change_source_physics_or_closure_clock(self):
+        config = config_fixture()
+        config["expert"]["opposition"]["backend"] = "side_opposition_preload_v1"
+        validate_config(config)
+        for owner, key, value in (("opposition", "transfer_height_m", .011),
+                                  ("opposition", "maximum_opposition_dot", 0.),
+                                  ("opposition", "planning_taskpoint_tolerance_m", .016),
+                                  ("opposition", "planning_orientation_tolerance_rad", .051),
+                                  ("hand_control", "backend", "contact_normal_position_v2"),
+                                  ("lift_start", "backend", "measured_cube_slow_start_v1")):
+            changed = copy.deepcopy(config)
+            changed["expert"][owner][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ConfigError):
+                validate_config(changed)
+        changed = copy.deepcopy(config)
+        changed["expert"]["opposition"]["closure_keyframes"][0]["joint_target_rad"][0] += .1
+        with self.assertRaises(ConfigError):
+            validate_config(changed)
+        changed = copy.deepcopy(config)
+        changed["scene"]["contact_model"] = {"backend": "right_hand_green_compliance_v2", "time_constant_s": .006, "damping_ratio": 1.}
+        with self.assertRaises(ConfigError):
+            validate_config(changed)
+
     def test_contact_model_identity_cannot_silently_reuse_the_original_contract(self):
         config = config_fixture()
+        config["expert"]["opposition"]["backend"] = "disabled"  # Isolate the separate compliance-contract hypothesis.
         original = {"backend": "source_default_v1", "time_constant_s": .02, "damping_ratio": 1.}
         self.assertEqual(scene_protocol_for_contact_model(None), scene_protocol_for_contact_model(original))
         candidate = {"backend": "right_hand_green_compliance_v2", "time_constant_s": .006, "damping_ratio": 1.}

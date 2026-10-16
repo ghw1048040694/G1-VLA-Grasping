@@ -127,6 +127,32 @@ def _triple(value: Any, path: str) -> None:
         _finite(item, "{}[{}]".format(path, index))
 
 
+def _seven(value: Any, path: str) -> None:
+    if not isinstance(value, list) or len(value) != 7:
+        _error(path, "must contain seven explicit right-hand joint targets")
+    for index, item in enumerate(value):
+        _finite(item, "{}[{}]".format(path, index))
+
+
+def _quaternion(value: Any, path: str) -> None:
+    if not isinstance(value, list) or len(value) != 4:
+        _error(path, "must contain a normalized wxyz quaternion")
+    for item in value:
+        _finite(item, path)
+    if not math.isclose(sum(item * item for item in value), 1., abs_tol=1e-7):
+        _error(path, "must contain a normalized wxyz quaternion")
+
+
+def _hand_keyframes(value: Any, path: str) -> None:
+    if not isinstance(value, list) or not 2 <= len(value) <= 8:
+        _error(path, "requires two to eight declared closure keyframes")
+    for index, item in enumerate(value):
+        _object(item, {"fraction": _probability, "joint_target_rad": _seven}, "{}[{}]".format(path, index))
+    fractions = [item["fraction"] for item in value]
+    if fractions[0] != 0 or fractions[-1] != 1 or any(a >= b for a, b in zip(fractions, fractions[1:])):
+        _error(path, "closure keyframes must strictly increase from zero to one")
+
+
 def _indices(value: Any, path: str) -> None:
     if not isinstance(value, list) or not value or len(value) != len(set(value)):
         _error(path, "must contain unique integer indices")
@@ -234,6 +260,26 @@ SCHEMA = {
             "joint_target_tolerance_rad": _positive, "phase_timeout_scale": _positive,
         },
         "contact_diagnostics": {"enabled": _boolean},
+        "opposition": {
+            "backend": _choice("disabled", "side_opposition_preload_v1"),
+            "hand_joint_names": _strings, "preshape_rad": _seven,
+            "closure_keyframes": _hand_keyframes,
+            "object_rotation_in_palm_quat_wxyz": _quaternion,
+            "planning_taskpoint_tolerance_m": _positive, "planning_orientation_tolerance_rad": _positive,
+            "minimum_group_force_n": _positive, "maximum_abs_normal_up": _fraction,
+            "maximum_opposition_dot": _finite, "maximum_penetration_m": _positive,
+            "maximum_group_force_n": _positive, "relief_step_rad": _positive,
+            "transfer_height_m": _positive,
+            "carry_maximum_grip_drift_m": _positive, "carry_maximum_rotation_rad": _positive,
+            "preload": {
+                "minimum_bottom_clearance_m": _positive,
+                "maximum_table_support_fraction": _fraction,
+                "hand_weight_ratio_min": _positive, "hand_weight_ratio_max": _positive,
+                "max_linear_speed_m_s": _positive, "max_angular_speed_rad_s": _positive,
+                "max_grip_drift_m": _positive, "stable_window_s": _positive,
+                "required_groups": _literal(["thumb", "index", "middle"]),
+            },
+        },
         "lift_start": {
             "backend": _choice("original_progress_v1", "measured_cube_slow_start_v1"),
             "cube_rise_m": _positive, "progress_scale": _fraction,
@@ -500,6 +546,31 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.train", "resume_checkpoint and warm_start_checkpoint are mutually exclusive")
     teacher = config["expert"]["teacher"]
     hand_control = config["expert"]["hand_control"]
+    opposition = config["expert"]["opposition"]
+    expected_hand = ["right_hand_{}_{}_joint".format(finger, index)
+        for finger, count in (("thumb", 3), ("index", 2), ("middle", 2)) for index in range(count)]
+    if opposition["hand_joint_names"] != expected_hand:
+        _error("config.expert.opposition.hand_joint_names", "requires the explicit source right seven-joint order")
+    if opposition["closure_keyframes"][0]["joint_target_rad"] != opposition["preshape_rad"]:
+        _error("config.expert.opposition", "the first closure keyframe must be the declared preshape")
+    if not -1 <= opposition["maximum_opposition_dot"] < 0:
+        _error("config.expert.opposition", "side contacts must oppose by a negative unit-normal dot product")
+    preload = opposition["preload"]
+    if (opposition["planning_taskpoint_tolerance_m"] > config["expert"]["trajectory"]["taskpoint_tolerance_m"]
+            or opposition["planning_orientation_tolerance_rad"] > config["expert"]["trajectory"]["closed_orientation_tolerance_rad"]):
+        _error("config.expert.opposition", "geometric planning precision cannot relax the original taskpoint/orientation bounds")
+    if not 0 < opposition["transfer_height_m"] <= .01:
+        _error("config.expert.opposition", "load transfer is a bounded probe of at most ten millimetres")
+    if not 0 < preload["hand_weight_ratio_min"] <= 1 <= preload["hand_weight_ratio_max"]:
+        _error("config.expert.opposition.preload", "hand support must bound the actual object weight")
+    if preload["stable_window_s"] > teacher["grasp_hold_s"] or preload["minimum_bottom_clearance_m"] >= opposition["transfer_height_m"]:
+        _error("config.expert.opposition.preload", "support proof must fit the original grasp budget and transfer height")
+    if opposition["backend"] == "side_opposition_preload_v1" and (
+            teacher["profile"] != "green_right_cartesian_feedback_v4"
+            or hand_control["backend"] != "fixed_closure_v1"
+            or config["expert"]["lift_start"]["backend"] != "original_progress_v1"
+            or config["scene"]["contact_model"]["backend"] != "source_default_v1"):
+        _error("config.expert.opposition", "opposition design retains the original physical model and sole declared closure controller")
     lift_start = config["expert"]["lift_start"]
     if lift_start["progress_scale"] <= 0:
         _error("config.expert.lift_start", "progress scale must be positive and at most one")

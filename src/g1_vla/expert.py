@@ -487,6 +487,45 @@ def measured_lift_start_budget(settings, phase, grip_lock, object_z_m, period_s)
         "phase_deadline_unchanged": True, "contact_preservation_guaranteed": False}
 
 
+SIDE_REQUIRED_CHECKS = frozenset(("actual_side_normals", "opposing_thumb_fingers", "penetration_bounded"))
+
+
+def opposition_contact_status(sample, object_rotation, settings):
+    """Check real loaded normals in current cube/world frames, not a static grasp design."""
+    import numpy as np
+    rotation = np.asarray(object_rotation, dtype=float)
+    if (rotation.shape != (3, 3) or not np.isfinite(rotation).all()
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6)
+            or not np.isclose(np.linalg.det(rotation), 1., atol=1e-6)):
+        raise ExpertError("side-contact test requires the current finite object rotation")
+    sides, normal_details = True, []
+    for name in ("thumb", "index", "middle"):
+        group = sample["groups"][name]
+        contacts = [c for c in sample["contacts"] if c["kind"] == "hand" and c["group"] == name and c["loaded"]]
+        sides &= bool(contacts and group["normal_force_n"] >= settings["minimum_group_force_n"])
+        for contact in contacts:
+            normal = np.asarray(contact["normal_on_object_world"], dtype=float)
+            if normal.shape != (3,) or not np.isfinite(normal).all() or not np.isclose(np.linalg.norm(normal), 1., atol=1e-6):
+                raise ExpertError("native side contact normal must be a finite unit vector")
+            local_up, world_up = float((rotation.T @ normal)[2]), float(normal[2])
+            passed = max(abs(local_up), abs(world_up)) <= settings["maximum_abs_normal_up"]
+            sides &= passed
+            normal_details.append({"contact_index": contact["contact_index"], "group": name,
+                "normal_local_cube_z": local_up, "normal_world_z": world_up, "side_passed": bool(passed)})
+    opposition = sample["opposition_dot_diagnostic"]
+    if set(opposition) != {"index", "middle"}:
+        raise ExpertError("both measured thumb-to-finger opposition directions are required")
+    opposed = all(value is not None and math.isfinite(value) and value <= settings["maximum_opposition_dot"]
+                  for value in opposition.values())
+    depth = max((max(0., -c["distance_m"]) for c in sample["contacts"] if c["kind"] == "hand"), default=0.)
+    checks = {"actual_side_normals": bool(sides), "opposing_thumb_fingers": bool(opposed),
+              "penetration_bounded": bool(depth <= settings["maximum_penetration_m"])}
+    if set(checks) != SIDE_REQUIRED_CHECKS or any(not isinstance(value, bool) for value in checks.values()):
+        raise ExpertError("all three physical side-contact checks must be explicitly measured")
+    return {"checks": checks, "ready": all(checks.values()), "contacts": normal_details,
+            "maximum_hand_penetration_m": float(depth), "opposition_dot": dict(sample["opposition_dot_diagnostic"])}
+
+
 def run_teacher_episode(config, spec, run_dir):
     """Run exactly one predeclared layout and persist true control-step pairs.
 
@@ -510,6 +549,8 @@ def run_teacher_episode(config, spec, run_dir):
         raise ExpertError("teacher layout must contain only green_cube")
     layout_fingerprint = spec.get("layout_fingerprint") or canonical_sha256(spec["positions_m"])
     cartesian_profile = profile["profile"] == "green_right_cartesian_feedback_v4"
+    opposition_settings = config["expert"].get("opposition", {})
+    opposition_enabled = opposition_settings.get("backend") == "side_opposition_preload_v1"
     report = {"schema_version": 2,
               "teacher_protocol": ("green_right_strict_shared_pd_cartesian_v4" if cartesian_profile else "green_right_strict_shared_pd_cavity_v3"
                                    if profile["profile"] == "green_right_cavity_feedback_v3"
@@ -540,6 +581,8 @@ def run_teacher_episode(config, spec, run_dir):
     closure_start_event = None
     hand_contact_rows = []
     hand_controller = None
+    support_window, load_lock, load_approval = None, None, None
+    support_samples, carry_ledger = [], []
     current_phase, planned_next_phase = None, None
     maximum_joint_overrun, pending = {}, {}
     planner, active_plan, path_progress, path_status, grip_lock = None, None, None, {}, None
@@ -593,7 +636,11 @@ def run_teacher_episode(config, spec, run_dir):
         object_body = api.mj_name2id(model, api.mjtObj.mjOBJ_BODY, "green_cube")
         if object_body < 0:
             raise ExpertError("green object is missing")
-        if config["expert"].get("hand_control", {}).get("backend") == "contact_normal_position_v2":
+        if opposition_enabled:
+            from .hand_control import OppositionHandControl
+            hand_controller = OppositionHandControl(model, data, controller, object_body,
+                opposition_settings, baseline, api)
+        elif config["expert"].get("hand_control", {}).get("backend") == "contact_normal_position_v2":
             from .hand_control import ContactHandControl
             nominal_hand = baseline.copy()
             for i, name in enumerate(names):
@@ -651,7 +698,8 @@ def run_teacher_episode(config, spec, run_dir):
             return np.asarray(green_target_from_position(data.xpos[object_body], profile,
                               height=height, lateral=lateral, compensate=compensate))
 
-        def refresh_phase_pose(phase, key, target, *, target_relation="current_object_center"):
+        def refresh_phase_pose(phase, key, target, *, target_relation="current_object_center",
+                               transfer_lock=None, remaining_phase_budget_s=None):
             nonlocal planned_next_phase, active_plan, path_progress, path_status, grip_lock
             planned_next_phase = phase
             visited_seed = data.qpos[ids].copy()
@@ -672,11 +720,19 @@ def run_teacher_episode(config, spec, run_dir):
                     if phase == "lift":
                         if grip_lock is not None:
                             raise ExpertError("actual post-grasp grip may only be locked once")
-                        grip_lock = planner.latch_grip(data)
+                        if opposition_enabled:
+                            if load_lock is None or load_approval is None or not support_window.ready:
+                                raise ExpertError("main lift requires the current measured contiguous load-transfer proof")
+                            # Reuse the pre-probe reference. Re-latching here
+                            # would hide any relative motion during the probe.
+                            grip_lock = dict(load_lock)
+                        else:
+                            grip_lock = planner.latch_grip(data)
                         trajectory["grip_lock"] = grip_lock
                     next_plan = planner.plan_phase(phase, data,
                         np.asarray(controller.previous_target)[arm_indices],
-                        grip_lock=grip_lock, previous_plan=active_plan)
+                        grip_lock=grip_lock, previous_plan=active_plan,
+                        transfer_lock=transfer_lock, remaining_phase_budget_s=remaining_phase_budget_s)
                     active_plan, path_status = next_plan, {}
                     trajectory["plans"].append(next_plan)
                     values = np.asarray(next_plan["q_waypoints"][-1])
@@ -782,6 +838,45 @@ def run_teacher_episode(config, spec, run_dir):
             safe = all(value is not None and value <= tolerance for value in excesses.values())
             return finite, bool(safe)
 
+        def record_opposition_sample(finite, safe):
+            if opposition_enabled and current_phase in ("contact", "grasp", "lift", "hold"):
+                from .grasp_support import native_grasp_support
+                sample = native_grasp_support(model, data, object_body, palms[1], load_lock,
+                    joint_safe=safe, mujoco_api=api)
+                sample["phase"] = current_phase
+                sample["actual_palm_position_world_m"] = np.asarray(data.site_xpos[palms[1]]).tolist()
+                sample["actual_palm_R_world"] = np.asarray(data.site_xmat[palms[1]]).reshape(3, 3).tolist()
+                sample["actual_object_R_world"] = np.asarray(data.xmat[object_body]).reshape(3, 3).tolist()
+                side = opposition_contact_status(sample, np.asarray(data.xmat[object_body]).reshape(3, 3), opposition_settings)
+                sample["side_contact_status"] = side
+                sample["additional_required_checks"] = dict(side["checks"])
+                if set(sample["additional_required_checks"]) != SIDE_REQUIRED_CHECKS:
+                    raise ExpertError("every support sample requires all actual side-contact checks")
+                support_samples.append(sample)
+                if current_phase == "grasp" and support_window is not None:
+                    support_window.update(sample)
+                if current_phase in ("lift", "hold"):
+                    if load_approval is None or load_lock is None:
+                        raise ExpertError("carry cannot precede measured load approval")
+                    from .teacher_trajectory import rotation_error
+                    object_R = np.asarray(data.xmat[object_body]).reshape(3, 3)
+                    palm_R = np.asarray(data.site_xmat[palms[1]]).reshape(3, 3)
+                    angle = rotation_error(load_lock["object_rotation_in_palm_frame"], palm_R.T @ object_R)
+                    drift = sample["grip_relative_drift_m"]
+                    checks = dict(side["checks"], finite=finite, joint_safe=safe,
+                        fixed_grip_translation_bounded=bool(drift <= opposition_settings["carry_maximum_grip_drift_m"]),
+                        fixed_grip_rotation_bounded=bool(angle <= opposition_settings["carry_maximum_rotation_rad"]))
+                    passed = all(checks.values())
+                    carry_ledger.append({"timestamp_s": float(data.time), "phase": current_phase,
+                        "fixed_pretransfer_reference_sha256": sample["grip_reference_sha256"],
+                        "grip_relative_drift_m": drift, "raw_relative_rotation_error_rad": angle,
+                        "actual_object_rotation_in_palm_frame": (palm_R.T @ object_R).tolist(),
+                        "checks": checks, "passed": passed, "failure_reasons": [key for key, value in checks.items() if not value],
+                        "rotation_scope": "actual SO3 difference; no cube symmetry reduction"})
+                    if not passed:
+                        raise ControlError("carry lost required side geometry or fixed pre-transfer grip: {}".format(
+                            carry_ledger[-1]["failure_reasons"]))
+
         def substep_observer(**event):
             finite, safe = finite_and_safe()
             interval_safe.append(safe)
@@ -834,6 +929,7 @@ def run_teacher_episode(config, spec, run_dir):
             physics_warning_counts[:] = warnings.tolist()
             if np.any(warnings > warnings_initial):
                 raise ControlError("MuJoCo warning detected during teacher execution")
+            record_opposition_sample(finite, safe)
 
         def observer(**event):
             nonlocal hold_seconds
@@ -885,6 +981,12 @@ def run_teacher_episode(config, spec, run_dir):
                     "right_hand_requested_error_rad": max(abs(pending["requested"][i] - after[i]) for i, name in enumerate(names) if name.startswith("right_hand_")),
                     "command_limiter_delta_rad": float(np.max(np.abs(np.asarray(pending["requested"]) - pending["command"]))),
                 })
+                if opposition_enabled:
+                    actual_hand = np.asarray(after)[hand_controller.indices]
+                    latest_tracking["opposition_preshape_error_rad"] = float(np.max(np.abs(
+                        actual_hand - np.asarray(opposition_settings["preshape_rad"]))))
+                    latest_tracking["opposition_closed_keyframe_error_rad"] = float(np.max(np.abs(
+                        actual_hand - np.asarray(opposition_settings["closure_keyframes"][-1]["joint_target_rad"]))))
                 if cartesian_profile and active_plan is not None:
                     from .teacher_trajectory import rotation_error
                     actual_pose = planner.actual_pose(data)
@@ -940,7 +1042,9 @@ def run_teacher_episode(config, spec, run_dir):
         while not completed:
             elapsed = float(data.time) - phase_start
             if (close_start_s is None and contact_closure_ready(current_phase, elapsed, latest_tracking, profile)
-                    and (not cartesian_profile or latest_tracking.get("cartesian_path_executed", False))):
+                    and (not cartesian_profile or latest_tracking.get("cartesian_path_executed", False))
+                    and (not opposition_enabled or latest_tracking.get("opposition_preshape_error_rad", math.inf)
+                         <= profile["joint_target_tolerance_rad"])):
                 close_start_s = float(data.time)
                 closure_start_event = {
                     "timestamp_s": close_start_s, "phase": current_phase,
@@ -982,7 +1086,7 @@ def run_teacher_episode(config, spec, run_dir):
                 if name.startswith("right_hand_"):
                     target[index] = (1 - close) * baseline[index] + close * hand_target(name, profile)
             if hand_controller is not None:
-                hand_request = hand_controller.target(close, current_phase, grip_lock)
+                hand_request = hand_controller.target(close, current_phase, load_lock if opposition_enabled else grip_lock)
                 for index, name in enumerate(names):
                     if name.startswith("right_hand_"):
                         target[index] = hand_request[index]
@@ -1002,6 +1106,28 @@ def run_teacher_episode(config, spec, run_dir):
                 reached = reached and closure_complete(float(data.time), close_start_s, profile)
             if cartesian_profile and current_phase != "home":
                 reached = reached and latest_tracking.get("cartesian_path_executed", False)
+            if opposition_enabled and current_phase == "grasp":
+                if (load_lock is None and reached and closure_complete(float(data.time), close_start_s, profile)
+                        and latest_tracking.get("opposition_closed_keyframe_error_rad", math.inf) <= profile["joint_target_tolerance_rad"]
+                        and support_samples and support_samples[-1]["side_contact_status"]["ready"]):
+                    from .grasp_support import SupportWindow
+                    load_lock = planner.latch_grip(data)
+                    load_lock["source"] = "actual attained side closure before bounded load-transfer probe; reference never reset"
+                    support_window = SupportWindow(opposition_settings["preload"], model.opt.timestep)
+                    remaining = duration["grasp"] * profile["phase_timeout_scale"] - elapsed
+                    refresh_phase_pose("grasp", "grasp", active_cartesian_target,
+                        target_relation="fixed_pretransfer_C_plus_declared_probe_within_original_grasp_deadline",
+                        transfer_lock=load_lock, remaining_phase_budget_s=remaining)
+                    planned_next_phase = None
+                    reached = False
+                reached = reached and support_window is not None and support_window.ready
+                if reached and elapsed >= duration["grasp"]:
+                    load_approval = {"timestamp_s": float(data.time), "original_phase_start_s": phase_start,
+                        "original_phase_elapsed_s": elapsed, "original_phase_clock_reset": False,
+                        "fixed_pretransfer_grip_lock": load_lock, "full_state": planner.state_snapshot(data),
+                        "support_window_status": support_window.last_status,
+                        "main_lift_target_C": (np.asarray(load_lock["C"]) + (0., 0., profile["lift_height_m"])).tolist(),
+                        "probe_included_in_original_lift_height": True}
             if elapsed >= duration[current_phase] and reached:
                 phase_records.append({"phase": current_phase, "start_s": phase_start,
                                       "end_s": float(data.time), "tracking": dict(latest_tracking),
@@ -1049,6 +1175,14 @@ def run_teacher_episode(config, spec, run_dir):
                                       "geometry": _geometry_evidence(model, data, object_body, palms[1], api),
                                       "closure_started": close_start_s is not None,
                                       "closure_complete": closure_complete(float(data.time), close_start_s, profile)})
+                if opposition_enabled and current_phase == "grasp":
+                    report["failure_phase"] = current_phase
+                    report["failure_kind"] = "side_grasp_load_transfer_timeout"
+                    report["load_transfer_failure"] = {
+                        "reason": "actual_side_closure_not_ready" if load_lock is None else "contiguous_actual_load_transfer_not_ready",
+                        "last_side_contact_status": support_samples[-1]["side_contact_status"] if support_samples else None,
+                        "last_support_window_status": support_window.last_status if support_window is not None else None,
+                        "original_phase_deadline_s": duration[current_phase] * profile["phase_timeout_scale"]}
                 raise ExpertError("{} timeout: actual palm/joint/contact/lift gate did not pass".format(current_phase))
         gate = physical_gate(evidence, lift_height_m=config["eval"]["lift_height_m"], hold_duration_s=config["eval"]["hold_duration_s"])
         report.update(gate)
@@ -1133,6 +1267,21 @@ def run_teacher_episode(config, spec, run_dir):
     report["hand_control"] = {"settings": config["expert"].get("hand_control"),
         "original_gates_unchanged": True, "requests": hand_controller.rows if hand_controller is not None else [],
         "scope": "candidate equivalent position requests, not achieved normal force or force closure; shared PD and original limits retained"}
+    if opposition_enabled:
+        report["hand_control"]["settings"] = opposition_settings
+        report["hand_control"]["scope"] = "declared geometric side-closure requests with native-normal unload guard; unchanged shared limiter and PD"
+        report["load_transfer"] = {"settings": opposition_settings, "fixed_pretransfer_grip_lock": load_lock,
+            "approval": load_approval, "support_samples": support_samples,
+            "contiguous_support_window": support_window.rows if support_window is not None else [],
+            "carry_ledger": carry_ledger, "main_lift_started": bool(carry_ledger),
+            "main_lift_planning_started": grip_lock is not None,
+            "probe_started": any(row["phase"] == "grasp" and row["grip_reference_sha256"] is not None for row in support_samples),
+            "original_gate_and_phase_deadlines_unchanged": True,
+            "scope": "measured post-refresh 2ms evidence; bounded probe counted in original 22cm goal; no relatch/attachment/state reset"}
+        if load_approval is None or not carry_ledger or not all(row["passed"] for row in carry_ledger):
+            report["passed"] = False
+            if report["failure"] is None:
+                report["failure"] = "side-contact load-transfer proof or fixed-reference carry gate failed"
     report["contact_penetration_diagnostic_scope"] = "actual every-substep green/right-hand and green/calibration-table contacts; inherited mesh/capsule overlap retained; depth does not modify the original acceptance gate"
     report["phase_planning"] = "home initialization only before control/video; future poses solved once their phase is entered from actual object state and visited right-arm seed; rejected entry records latest_phase_planning_attempt; hold preserves completed lift reference"
     report["phases"] = phase_records

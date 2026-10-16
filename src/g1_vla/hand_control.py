@@ -193,3 +193,103 @@ class ContactHandControl:
                           "control_period_s": float(self.controller.cadence.period_s),
                           "fixed_grip_relative_drift_m": drift, "groups": details})
         return result
+
+
+def keyframe_hand_target(keyframes, fraction):
+    """Interpolate the declared seven-joint geometric closure, without feedback state."""
+    if not np.isfinite(fraction) or not 0 <= fraction <= 1:
+        raise ValueError("hand closure fraction must be finite in [0,1]")
+    times = np.asarray([item["fraction"] for item in keyframes], dtype=float)
+    values = np.asarray([item["joint_target_rad"] for item in keyframes], dtype=float)
+    if (times.ndim != 1 or len(times) < 2 or values.shape != (len(times), 7)
+            or not np.isfinite(times).all() or not np.isfinite(values).all()
+            or times[0] != 0 or times[-1] != 1 or np.any(np.diff(times) <= 0)):
+        raise ValueError("closure requires finite seven-joint keyframes strictly spanning [0,1]")
+    return np.asarray([np.interp(fraction, times, values[:, index]) for index in range(7)])
+
+
+class OppositionHandControl:
+    """Follow explicit side-pinch keyframes through the unchanged shared limiter/PD.
+
+    Native excessive force/depth can only request a bounded unload. First touch
+    does not terminate the geometric closure. No force target, pressure
+    integrator, grasp attachment or live-state write is used.
+    """
+    def __init__(self, model, data, controller, object_body, settings, baseline, api):
+        if settings.get("backend") != "side_opposition_preload_v1":
+            raise ValueError("opposition closure requires its explicit declared backend")
+        self.model, self.data, self.controller = model, data, controller
+        self.object_body, self.settings, self.api = object_body, settings, api
+        self.baseline = np.asarray(baseline, dtype=float).copy()
+        names = controller.contract.joint_names
+        self.indices = [names.index(name) for name in settings["hand_joint_names"]]
+        if (self.baseline.shape != (len(names),) or not np.isfinite(self.baseline).all()
+                or len(self.indices) != 7 or len(set(self.indices)) != 7):
+            raise ValueError("opposition target must use seven unique shared-contract joints")
+        self.lower = np.array([model.jnt_range[controller.bindings[i]["joint_id"]][0] for i in self.indices])
+        self.upper = np.array([model.jnt_range[controller.bindings[i]["joint_id"]][1] for i in self.indices])
+        for frame in settings["closure_keyframes"]:
+            q = np.asarray(frame["joint_target_rad"], dtype=float)
+            if q.shape != (7,) or not np.isfinite(q).all() or np.any(q < self.lower) or np.any(q > self.upper):
+                raise ValueError("declared opposition keyframe exceeds a source mechanical bound")
+        if not np.array_equal(keyframe_hand_target(settings["closure_keyframes"], 0.), settings["preshape_rad"]):
+            raise ValueError("opposition closure must start at its declared preshape")
+        self.groups = {finger: [j for j, name in enumerate(settings["hand_joint_names"])
+                               if name.startswith("right_hand_" + finger + "_")]
+                       for finger in ("thumb", "index", "middle")}
+        if any(not indices for indices in self.groups.values()):
+            raise ValueError("opposition closure requires thumb, index and middle groups")
+        self.rows = []
+
+    def target(self, close, phase, grip_lock):
+        model, data, api, opts = self.model, self.data, self.api, self.settings
+        nominal = keyframe_hand_target(opts["closure_keyframes"], close)
+        previous = np.asarray(self.controller.previous_target, dtype=float)
+        if previous.shape != self.baseline.shape or not np.isfinite(previous).all():
+            raise ValueError("opposition unload requires the actual previous applied command")
+        sample = native_hand_contacts(model, data, self.object_body, api)
+        result, details = self.baseline.copy(), {}
+        for finger, local_indices in self.groups.items():
+            indices = [self.indices[j] for j in local_indices]
+            bindings = [self.controller.bindings[i] for i in indices]
+            actual = np.array([data.qpos[b["qpos_id"]] for b in bindings])
+            force = float(sample["groups"][finger]["normal_force_n"])
+            depth = float(sample["groups"][finger]["maximum_penetration_m"])
+            if not np.isfinite(actual).all() or not np.isfinite([force, depth]).all() or min(force, depth) < 0:
+                raise ValueError("opposition native measurements must be finite and nonnegative")
+            rows = []
+            # Include geometrically overlapping native rows even if unloaded:
+            # deep mesh overlap must not evade the unload guard.
+            contacts = [c for c in sample["contacts"] if c["group"] == finger and c["distance_m"] <= 0]
+            for contact in contacts:
+                object_index = contact["object_geom_index"]
+                hand_geom = contact["geom_ids"][1 - object_index]
+                jp, jr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+                api.mj_jac(model, data, jp, jr, np.asarray(contact["position_world_m"]), int(model.geom_bodyid[hand_geom]))
+                into_object = np.asarray(contact["frame_rows_world"])[0] * (1. if object_index == 1 else -1.)
+                rows.append(into_object @ jp[:, [b["qvel_id"] for b in bindings]])
+            matrix = np.asarray(rows, dtype=float).reshape(-1, len(indices))
+            if not np.isfinite(matrix).all():
+                raise ValueError("opposition normal Jacobian must be finite")
+            net = matrix.sum(axis=0)
+            norm = float(np.linalg.norm(net))
+            direction = net / norm if norm > NORMAL_DIRECTION_EPS_M_PER_RAD else np.zeros(len(indices))
+            guarded = depth > opts["maximum_penetration_m"] or force > opts["maximum_group_force_n"]
+            if guarded and norm > NORMAL_DIRECTION_EPS_M_PER_RAD:
+                wanted, mode = actual - direction * opts["relief_step_rad"], "native_normal_bounded_unload"
+            elif guarded:
+                wanted, mode = previous[indices].copy(), "unload_direction_cancelled_hold_applied"
+            else:
+                wanted, mode = nominal[local_indices].copy(), "declared_geometric_closure"
+            bounded = np.clip(wanted, self.lower[local_indices], self.upper[local_indices])
+            result[indices] = bounded
+            details[finger] = {"mode": mode, "measured_force_n": force, "maximum_native_penetration_m": depth,
+                "actual_q": actual.tolist(), "previous_applied_q": previous[indices].tolist(),
+                "nominal_q": nominal[local_indices].tolist(), "raw_requested_q": wanted.tolist(),
+                "bounded_requested_q": bounded.tolist(), "normal_jacobian_rows_m_per_rad": matrix.tolist(),
+                "net_normal_direction": direction.tolist(), "net_normal_jacobian_norm_m_per_rad": norm,
+                "guard_triggered": guarded}
+        self.rows.append({"time_s": float(data.time), "phase": phase, "close_fraction": float(close),
+                          "backend": opts["backend"], "groups": details,
+                          "guard_scope": "next shared-limited position request; not a per-physics-step force/depth cap"})
+        return result

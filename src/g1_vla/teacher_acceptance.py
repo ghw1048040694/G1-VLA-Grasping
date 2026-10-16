@@ -85,6 +85,81 @@ def _exception(error):
     return {"error_type": type(error).__name__, "message": str(error)}
 
 
+def _load_transfer_summary(report):
+    """Summarize recorded evidence without upgrading an episode's success.
+
+    A lock or a planning attempt alone does not establish an executed probe or
+    main lift. False check counts include pre-admission observations and do not
+    identify an episode's causal failure by themselves.
+    """
+    result = {"enabled": False, "probe_started": False, "approved": False,
+              "maximum_contiguous_valid_s": None, "main_lift_started": False,
+              "maximum_carry_grip_drift_m": None, "maximum_carry_rotation_error_rad": None,
+              "failed_side_checks": None, "failed_support_checks": None, "failed_carry_checks": None}
+    transfer = report.get("load_transfer")
+    if not isinstance(transfer, dict) or not transfer:
+        return result
+
+    def rows(value):
+        return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+    def number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(value) and value >= 0 else None
+
+    def maximum(values):
+        measured = [value for value in (number(value) for value in values) if value is not None]
+        return max(measured) if measured else None
+
+    def failures(records):
+        counts = {}
+        for row in records:
+            if not isinstance(row, dict):
+                continue
+            checks = row.get("checks")
+            failed = {key for key, value in checks.items() if isinstance(key, str) and value is False} if isinstance(checks, dict) else set()
+            reasons = row.get("failure_reasons")
+            if isinstance(reasons, list):
+                failed.update(reason for reason in reasons if isinstance(reason, str))
+            for key in failed:
+                counts[key] = counts.get(key, 0) + 1
+        return dict(sorted(counts.items()))
+
+    samples = rows(transfer.get("support_samples"))
+    window = rows(transfer.get("contiguous_support_window"))
+    carry = rows(transfer.get("carry_ledger"))
+    lock = transfer.get("fixed_pretransfer_grip_lock")
+    lock_time, signature = None, None
+    if isinstance(lock, dict):
+        lock_time = number(lock.get("timestamp_s"))
+        relative = lock.get("object_in_palm_frame_m")
+        if (lock_time is not None and isinstance(relative, list) and len(relative) == 3
+                and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                        and math.isfinite(value) for value in relative)):
+            signature = canonical_sha256({"timestamp_s": lock_time, "object_in_palm_frame_m": [float(value) for value in relative]})
+    executed_probe = any(row.get("phase") == "grasp" and signature is not None
+                         and row.get("grip_reference_sha256") == signature
+                         and number(row.get("timestamp_s")) is not None
+                         and row["timestamp_s"] > lock_time for row in samples)
+    approval = transfer.get("approval")
+    approval_status = approval.get("support_window_status") if isinstance(approval, dict) else None
+    result.update(enabled=True, probe_started=bool(executed_probe),
+                  approved=isinstance(approval_status, dict) and approval_status.get("ready") is True,
+                  maximum_contiguous_valid_s=maximum(row.get("maximum_contiguous_valid_s", row.get("contiguous_valid_s")) for row in window),
+                  main_lift_started=any(row.get("phase") == "lift" and signature is not None
+                                        and row.get("fixed_pretransfer_reference_sha256") == signature
+                                        and number(row.get("timestamp_s")) is not None
+                                        and row["timestamp_s"] > lock_time for row in carry),
+                  maximum_carry_grip_drift_m=maximum(row.get("grip_relative_drift_m") for row in carry),
+                  maximum_carry_rotation_error_rad=maximum(row.get("raw_relative_rotation_error_rad") for row in carry),
+                  failed_side_checks=failures([row.get("side_contact_status", {}) for row in samples]),
+                  failed_support_checks=failures(window), failed_carry_checks=failures(carry))
+    result["check_count_scope"] = "recorded false observations, including pre-admission; not episode failure causality"
+    result["approval_scope"] = "reported explicit ready decision; does not replace the original episode acceptance gates"
+    return result
+
+
 def _summary(report):
     keys = ("passed", "failure", "control_steps", "physics_steps", "maximum_lift_m",
             "physical_contact_substeps", "maximum_contact_normal_force_n",
@@ -103,6 +178,7 @@ def _summary(report):
         if isinstance(trajectory, dict) else None)
     if result["trajectory"] is not None:
         result["trajectory"]["planning_failed"] = trajectory.get("planning_failure") is not None
+    result["load_transfer"] = _load_transfer_summary(report)
     return result
 
 
@@ -115,6 +191,10 @@ def _write_scores(path, layouts):
         "pairing_eligible", "sensor_complete", "raw_videos_complete", "diagnostic_videos_complete",
         "trajectory_backend", "trajectory_progress_blocked_count", "trajectory_limiter_mismatch_count",
         "trajectory_planning_failed", "maximum_closed_rotation_error_rad", "maximum_taskpoint_tracking_error_m"]
+    transfer_fields = ("enabled", "probe_started", "approved", "maximum_contiguous_valid_s", "main_lift_started",
+                       "maximum_carry_grip_drift_m", "maximum_carry_rotation_error_rad",
+                       "failed_side_checks", "failed_support_checks", "failed_carry_checks")
+    fields += ["load_transfer_" + key for key in transfer_fields]
     with Path(path).open("x", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -133,6 +213,10 @@ def _write_scores(path, layouts):
                 row["trajectory_" + key] = trajectory.get(key)
             for key in ("maximum_closed_rotation_error_rad", "maximum_taskpoint_tracking_error_m"):
                 row[key] = trajectory.get(key)
+            transfer = teacher.get("load_transfer") or _load_transfer_summary({})
+            for key in transfer_fields:
+                value = transfer.get(key)
+                row["load_transfer_" + key] = json.dumps(value, sort_keys=True, ensure_ascii=False) if isinstance(value, dict) else value
             for phase in PHASES:
                 score = (layout["phase_scores"] or {}).get(phase, {})
                 row[phase] = "completed" if score.get("completed") else "failed" if score.get("entered") else "not_entered"

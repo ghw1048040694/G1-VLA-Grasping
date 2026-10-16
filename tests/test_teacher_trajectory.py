@@ -175,6 +175,36 @@ class TrajectoryTests(unittest.TestCase):
             np.testing.assert_array_equal(value, original)
         self.assertAlmostEqual(rotation_error(np.eye(3), R), np.pi / 2)
 
+    def test_side_orientation_is_strict_without_permitting_open_object_collisions(self):
+        planner = self.planner()
+        planner.strict_open_orientation = True
+        contacts = planner._contacts()
+        contacts["generated_hand_object_contacts"] = [{"distance_m": -.0001}]
+        planner._contacts = lambda: contacts
+        with self.assertRaises(TrajectoryError) as rejected:
+            planner._solve([0., 0., 0.], np.eye(3), [0.])
+        self.assertTrue(rejected.exception.detail["strict_orientation"])
+        self.assertFalse(rejected.exception.detail["native_contact_checks_passed"])
+        contacts["generated_hand_object_contacts"] = []
+        with self.assertRaises(TrajectoryError) as rotated:
+            planner._solve([0., 0., 0.], Rotation.from_euler("x", .051).as_matrix(), [0.])
+        self.assertFalse(rotated.exception.detail["mathematical_constraints_passed"])
+
+    def test_geometric_precision_is_stronger_than_the_original_bounds(self):
+        for C, R in (([.0006, 0., 0.], np.eye(3)), ([0., 0., 0.], Rotation.from_euler("x", .006).as_matrix())):
+            planner = self.planner()
+            planner.strict_open_orientation = True
+            planner.opposition = {"planning_taskpoint_tolerance_m": .0005, "planning_orientation_tolerance_rad": .005}
+            planner.reference_pose = lambda q: {"C": np.zeros(3), "R": np.eye(3), "palm": np.zeros(3)}
+            with self.assertRaises(TrajectoryError) as rejected:
+                planner._solve(C, R, [0.])
+            detail = rejected.exception.detail
+            self.assertFalse(detail["mathematical_constraints_passed"])
+            self.assertEqual(detail["planning_taskpoint_tolerance_m"], .0005)
+            self.assertEqual(detail["planning_orientation_tolerance_rad"], .005)
+            self.assertEqual(planner.settings["taskpoint_tolerance_m"], .003)
+            self.assertEqual(planner.settings["closed_orientation_tolerance_rad"], .05)
+
     def test_dense_knots_share_one_continuous_reference_budget(self):
         points = np.linspace(0., .1, 101)[:, None]
         result = path_velocity_budget(points, [.5], .066, .08, .1, .5, closure_s=.2)
@@ -436,6 +466,7 @@ class TrajectoryTests(unittest.TestCase):
         planner._copy_visited = lambda data: None
         planner.state_snapshot = lambda data: {"time_s": data.time, "qpos": data.qpos.tolist()}
         planner.profile.update(lift_height_m=.22, lift_duration_s=2., final_hold_s=1., phase_timeout_scale=3.)
+        planner.profile["grasp_hold_s"] = .8
         planner.settings["waypoint_spacing_m"] = .01
         planner.actual_pose = lambda data: {"C": data.qpos.copy(), "R": R.copy(),
             "palm": data.qpos - R @ planner.center, "arm": data.qpos.copy()}
@@ -449,6 +480,17 @@ class TrajectoryTests(unittest.TestCase):
         planner.validate_chord = lambda *args, **kwargs: {"passed": True}
         data = SimpleNamespace(time=6., xpos=np.array([[99., 99., 99.]]), qpos=locked_C.copy())
         lock = {"C": locked_C.tolist(), "R": R.tolist()}
+        planner.strict_open_orientation = True
+        planner.opposition = {"transfer_height_m": .006}
+        probe = planner.plan_phase("grasp", data, data.qpos, transfer_lock=lock, remaining_phase_budget_s=1.2)
+        np.testing.assert_allclose(probe["target_C"], locked_C + [0., 0., .006])
+        self.assertEqual(probe["budget"]["original_timeout_s"], 1.2)
+        self.assertEqual(probe["budget"]["minimum_nominal_time_s"], 0.)
+        self.assertFalse(probe["load_transfer"]["original_phase_clock_reset"])
+        self.assertEqual(probe["load_transfer"]["fixed_pretransfer_lock"], lock)
+        with self.assertRaises(TrajectoryError):
+            planner.plan_phase("grasp", data, data.qpos, transfer_lock=lock, remaining_phase_budget_s=.01)
+        data.qpos = np.asarray(probe["q_waypoints"][-1])
         lifted = planner.plan_phase("lift", data, data.qpos, grip_lock=lock)
         np.testing.assert_allclose(lifted["target_C"], locked_C + [0., 0., .22])
         np.testing.assert_allclose(lifted["target_R"], R)
@@ -471,7 +513,7 @@ class TrajectoryTests(unittest.TestCase):
         np.testing.assert_array_equal(data.qpos, locked_C)
 
     def test_open_orientation_changes_geodesically_from_applied_reference_but_closed_is_fixed(self):
-        for phase in ("pregrasp", "contact", "lift"):
+        for phase in ("pregrasp", "contact", "lift", "high_approach"):
             planner = self.planner()
             start_R = Rotation.from_euler("z", .1).as_matrix()
             goal_R = Rotation.from_euler("z", .12 if phase == "lift" else .8).as_matrix()
@@ -486,7 +528,12 @@ class TrajectoryTests(unittest.TestCase):
             planner.state_snapshot = lambda data: {"time_s": data.time, "qpos": data.qpos.tolist()}
             planner.profile.update(pregrasp_lateral_m=.015, pregrasp_height_m=.12,
                 pregrasp_s=.8, contact_approach_s=.9, close_duration_s=.6,
+                high_approach_s=1.8, high_pregrasp_height_m=.28,
                 lift_height_m=.22, lift_duration_s=2., phase_timeout_scale=3.)
+            if phase == "high_approach":
+                planner.strict_open_orientation = True
+                quat = Rotation.from_matrix(goal_R.T).as_quat()
+                planner.opposition = {"object_rotation_in_palm_quat_wxyz": [quat[3], *quat[:3]]}
             planner.settings["waypoint_spacing_m"] = .01
             # Measured R differs slightly from the applied-reference FK. The
             # orientation and C path must use the same independent q0 frame.
@@ -504,15 +551,19 @@ class TrajectoryTests(unittest.TestCase):
             planner._solve = solve
             planner.validate_chord = lambda *args, **kwargs: {"passed": True}
             q0 = np.array([.3, -.005, 1.08 if phase == "pregrasp" else .92])
-            data = SimpleNamespace(time=3., xpos=np.array([[.3, .01, .8]]), qpos=q0.copy())
+            data = SimpleNamespace(time=3., xpos=np.array([[.3, .01, .8]]), xmat=np.eye(3)[None], qpos=q0.copy())
             lock = {"C": q0.tolist(), "R": goal_R.tolist()} if phase == "lift" else None
             plan = planner.plan_phase(phase, data, q0, grip_lock=lock)
-            self.assertGreater(len(targets), 1)
+            if phase == "high_approach":
+                self.assertEqual(len(targets), 1)  # Explicit R needs no future-contact fit with a still-moving preshape.
+                self.assertEqual(plan["orientation_schedule"], "audited_joint_transit")
+            else:
+                self.assertGreater(len(targets), 1)
             np.testing.assert_allclose(targets[-1], goal_R, atol=1e-12)
             if phase == "lift":
                 for R in targets:
                     np.testing.assert_allclose(R, goal_R, atol=1e-12)
-            else:
+            elif phase != "high_approach":
                 total = rotation_error(start_R, goal_R)
                 self.assertAlmostEqual(rotation_error(start_R, targets[0]), total / len(targets))
                 self.assertLess(rotation_error(start_R, targets[0]), total)

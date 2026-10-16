@@ -192,6 +192,8 @@ class CartesianTeacherPlanner:
         from .expert import arm_ik_contract, arm_torso_collision_pairs
         self.api, self.model, self.config, self.contract = _api(mujoco_api), model, config, contract
         self.profile, self.settings = config["expert"]["teacher"], config["expert"]["trajectory"]
+        self.opposition = config["expert"].get("opposition", {})
+        self.strict_open_orientation = self.opposition.get("backend") == "side_opposition_preload_v1"
         self.names, self.ids, self.lower, self.upper = arm_ik_contract(model, hand="right", mujoco_api=self.api)
         self.action_indices = [contract.joint_names.index(name) for name in self.names]
         self.velocity = np.asarray(contract.max_velocity_rad_s)[self.action_indices]
@@ -269,7 +271,13 @@ class CartesianTeacherPlanner:
         from scipy.optimize import least_squares
         from scipy.spatial.transform import Rotation
         target, orientation = np.asarray(target), np.asarray(orientation)
-        orientation_weight = (self.settings["closed_orientation_weight"] if closed
+        strict_orientation = closed or getattr(self, "strict_open_orientation", False)
+        geometric_settings = getattr(self, "opposition", {}) if getattr(self, "strict_open_orientation", False) else {}
+        position_tolerance = min(self.settings["taskpoint_tolerance_m"],
+            geometric_settings.get("planning_taskpoint_tolerance_m", self.settings["taskpoint_tolerance_m"]))
+        angle_tolerance = min(self.settings["closed_orientation_tolerance_rad"],
+            geometric_settings.get("planning_orientation_tolerance_rad", self.settings["closed_orientation_tolerance_rad"]))
+        orientation_weight = (self.settings["closed_orientation_weight"] if strict_orientation
                               else self.profile["ik_orientation_weight"])
         collision_weight = self.profile["ik_collision_weight"] * self.settings["collision_cost_scale"]
         continuity_reference = np.clip(np.asarray(seed, dtype=float), self.lower, self.upper).copy()
@@ -298,16 +306,18 @@ class CartesianTeacherPlanner:
             position_error = float(np.linalg.norm(pose["C"] - target))
             angle_error = rotation_error(orientation, pose["R"])
             mathematical = bool(np.all(values >= self.lower) and np.all(values <= self.upper)
-                and position_error <= self.settings["taskpoint_tolerance_m"]
+                and position_error <= position_tolerance
                 and min(contacts["self_pair_distances_m"]) >= 0.
-                and (not closed or angle_error <= self.settings["closed_orientation_tolerance_rad"]))
+                and (not strict_orientation or angle_error <= angle_tolerance))
             native = bool(not contacts["generated_robot_self_contacts"]
                           and (closed or not contacts["generated_hand_object_contacts"]))
             return dict(contacts, taskpoint_error_m=position_error, orientation_error_rad=angle_error,
                 q=values.tolist(), C=pose["C"].tolist(), R=pose["R"].tolist(), palm=pose["palm"].tolist(),
                 target_C=target.tolist(), target_R=orientation.tolist(), optimizer_converged=bool(optimizer_converged),
-                closed=closed, position_weight=self.settings["position_weight"], collision_weight=collision_weight,
+                closed=closed, strict_orientation=strict_orientation,
+                position_weight=self.settings["position_weight"], collision_weight=collision_weight,
                 orientation_weight=orientation_weight, mathematical_constraints_passed=mathematical,
+                planning_taskpoint_tolerance_m=position_tolerance, planning_orientation_tolerance_rad=angle_tolerance if strict_orientation else None,
                 native_contact_checks_passed=native, passed=bool(mathematical and native),
                 continuity_reference_q=continuity_reference.tolist(), joint_continuity_weight=float(continuity_weight),
                 soft_ik_jacobian={"method": "bound_aware_absolute_central_or_one_sided",
@@ -327,8 +337,8 @@ class CartesianTeacherPlanner:
                     "self_pair_distances_m": contacts["self_pair_distances_m"]}
 
             projection = project_pose_feasibility(candidate, self.lower, self.upper, projection_residual,
-                position_tolerance_m=self.settings["taskpoint_tolerance_m"],
-                orientation_tolerance_rad=self.settings["closed_orientation_tolerance_rad"] if closed else None,
+                position_tolerance_m=position_tolerance,
+                orientation_tolerance_rad=angle_tolerance if strict_orientation else None,
                 position_weight=self.settings["position_weight"], orientation_weight=orientation_weight,
                 distance_scale_m=self.profile["ik_collision_margin_m"],
                 max_iterations=self.settings["solver_max_nfev"],
@@ -405,7 +415,8 @@ class CartesianTeacherPlanner:
                 "object_rotation_in_palm_frame": (pose["R"].T @ obj_rotation).tolist(),
                 "object_state_modified": False, "source": "actual attained post-closure grasp; free object remains dynamic"}
 
-    def plan_phase(self, phase, data, previous_arm_command, *, grip_lock=None, previous_plan=None):
+    def plan_phase(self, phase, data, previous_arm_command, *, grip_lock=None, previous_plan=None,
+                   transfer_lock=None, remaining_phase_budget_s=None):
         from scipy.spatial.transform import Rotation
         started = time.monotonic()
         self._copy_visited(data)
@@ -418,6 +429,11 @@ class CartesianTeacherPlanner:
         start = self.reference_pose(q0)
         object_position = np.asarray(data.xpos[self.object_body], dtype=float).copy()
         closed = phase in ("grasp", "lift", "hold")
+        transfer = transfer_lock is not None
+        if transfer and (phase != "grasp" or not getattr(self, "strict_open_orientation", False)
+                         or remaining_phase_budget_s is None or not np.isfinite(remaining_phase_budget_s)
+                         or remaining_phase_budget_s <= 0):
+            raise TrajectoryError("load transfer requires the fixed grasp lock and remaining original grasp deadline")
         high_solution, lookahead = None, []
         waypoints, details = [q0], []
         target, goal_R = None, None
@@ -448,16 +464,32 @@ class CartesianTeacherPlanner:
         if phase == "high_approach":
             # High transit may use a shorter audited joint route, away from
             # contact. Descending pre/contact phases retain Cartesian paths.
-            nominal_R = Rotation.from_euler("z", self.profile["grasp_yaw_deg"], degrees=True).as_matrix()
+            if getattr(self, "strict_open_orientation", False):
+                # R_object_in_palm = R_palm.T @ R_object. The declared
+                # relative orientation determines a real strict palm goal.
+                w, x, y, z = self.opposition["object_rotation_in_palm_quat_wxyz"]
+                relative_R = Rotation.from_quat([x, y, z, w]).as_matrix()
+                object_R = np.asarray(data.xmat[self.object_body]).reshape(3, 3)
+                nominal_R = object_R @ relative_R.T
+            else:
+                nominal_R = Rotation.from_euler("z", self.profile["grasp_yaw_deg"], degrees=True).as_matrix()
             target = object_position + (0., 0., self.profile["high_pregrasp_height_m"])
             high_seed, high_initial = checked_solve(target, nominal_R, actual["arm"])
             lookahead.append(high_initial)
-            _, final = checked_solve(object_position, nominal_R, high_seed)
-            lookahead.append(final)
-            self.contact_rotation = np.asarray(final["R"])
-            goal_R = self.contact_rotation
-            high_solution, high_final = checked_solve(target, goal_R, high_seed)
-            lookahead.append(high_final)
+            if getattr(self, "strict_open_orientation", False):
+                # The orientation is explicit; no future-contact soft fit is
+                # needed to choose it. At high entry the real fingers may still
+                # be attaining preshape. Solve contact only on its own entry,
+                # from the actual then-attained hand/base/object state.
+                self.contact_rotation = nominal_R.copy()
+                goal_R, high_solution = self.contact_rotation, high_seed
+            else:
+                _, final = checked_solve(object_position, nominal_R, high_seed)
+                lookahead.append(final)
+                self.contact_rotation = np.asarray(final["R"])
+                goal_R = self.contact_rotation
+                high_solution, high_final = checked_solve(target, goal_R, high_seed)
+                lookahead.append(high_final)
         elif phase == "pregrasp":
             if self.contact_rotation is None:
                 raise TrajectoryError("contact orientation was not admitted at the high approach")
@@ -465,7 +497,12 @@ class CartesianTeacherPlanner:
         elif phase == "contact":
             target, goal_R = object_position, self.contact_rotation
         elif phase == "grasp":
-            target, goal_R = actual["C"], actual["R"]
+            if transfer:
+                target = np.asarray(transfer_lock["C"]) + (0., 0., self.opposition["transfer_height_m"])
+                goal_R = np.asarray(transfer_lock["R"])
+                orientation_schedule = "fixed_pretransfer_grip_rotation_bounded_load_transfer"
+            else:
+                target, goal_R = actual["C"], actual["R"]
         elif phase == "lift":
             if grip_lock is None:
                 raise TrajectoryError("lift requires a recorded actual post-grasp grip lock")
@@ -507,8 +544,13 @@ class CartesianTeacherPlanner:
         key = {"high_approach": "high_approach_s", "pregrasp": "pregrasp_s", "contact": "contact_approach_s",
                "grasp": "grasp_hold_s", "lift": "lift_duration_s", "hold": "final_hold_s"}[phase]
         nominal = self.profile[key]
+        timeout = nominal * self.profile["phase_timeout_scale"]
+        if transfer:
+            # This replaces the grasp hold reference in the same original
+            # phase. It neither resets the phase clock nor adds a new budget.
+            nominal, timeout = 0., float(remaining_phase_budget_s)
         budget = path_velocity_budget(waypoints, self.velocity, self.period, self.anchor, nominal,
-                                      nominal * self.profile["phase_timeout_scale"],
+                                      timeout,
                                       closure_s=self.profile["close_duration_s"] if phase == "contact" else 0.,
                                       tracking_reserve_rad=self.settings["reference_tracking_rad"])
         if not budget["within_original_timeout"]:
@@ -524,6 +566,10 @@ class CartesianTeacherPlanner:
                 "raw_actual_start_q": actual["arm"].tolist(), "last_applied_start_q": q0.tolist(),
                 "waypoint_details": details, "chord_checks": chord_checks, "budget": budget, "closed": closed,
                 "grip_lock": grip_lock, "planning_wall_s": time.monotonic() - started,
+                "strict_orientation": closed or getattr(self, "strict_open_orientation", False),
+                "load_transfer": {"enabled": transfer, "fixed_pretransfer_lock": transfer_lock,
+                    "remaining_original_phase_budget_s": remaining_phase_budget_s,
+                    "original_phase_clock_reset": False, "included_in_main_lift_height": True},
                 "object_qpos_copied_from_actual": True, "live_state_modified": False,
                 "pair_count": len(self.pairs), "center_local_m": self.center.tolist(),
                 "collision_pairs": self.pair_evidence, "collision_pair_signature_sha256": self.pair_signature,
@@ -545,5 +591,5 @@ class CartesianTeacherPlanner:
         return bool(np.max(np.abs(pose["arm"] - np.asarray(plan["q_waypoints"][-1]))) <= self.settings["reference_tracking_rad"]
                     and np.linalg.norm(pose["C"] - np.asarray(plan["target_C"])) <= self.settings["taskpoint_tolerance_m"]
                     and np.linalg.norm(pose["C"] - endpoint_reference["C"]) <= self.settings["reference_tracking_m"]
-                    and (not plan["closed"] or rotation_error(plan["target_R"], pose["R"])
+                    and (not plan.get("strict_orientation", plan["closed"]) or rotation_error(plan["target_R"], pose["R"])
                          <= self.settings["closed_orientation_tolerance_rad"]))
