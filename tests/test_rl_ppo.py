@@ -2,6 +2,7 @@
 
 import copy
 import contextlib
+import importlib.metadata
 import importlib.util
 import json
 import math
@@ -731,6 +732,139 @@ class TorchOptimizerTests(unittest.TestCase):
             finally:
                 for stream in streams.values():
                     stream.close()
+
+
+RSL_CPU_AVAILABLE = (TORCH_AVAILABLE and importlib.util.find_spec("rsl_rl") is not None and
+                     importlib.util.find_spec("tensordict") is not None)
+
+
+@unittest.skipUnless(RSL_CPU_AVAILABLE, "Installed RSL-RL and TensorDict required; no Isaac simulator needed")
+class RealRslCpuIntegrationTests(unittest.TestCase):
+    def test_production_training_loop_with_real_rsl5_cpu_optimizer_and_checkpoints(self):
+        """Toy API integration only: synthetic state/timing is not G1 learning."""
+        import torch
+        from tensordict import TensorDict
+
+        self.assertEqual(importlib.metadata.version("rsl-rl-lib"), "5.0.1")
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        torch.manual_seed(20261016)
+
+        class ToyVectorEnv:
+            num_envs = 8
+            num_actions = 14
+            device = "cpu"
+            cfg = {"task": "toy_cpu_api_integration_only", "observation_dim": 81, "action_dim": 14}
+
+            def __init__(self):
+                self.unwrapped = self
+                self.state = torch.zeros(self.num_envs, self.num_actions)
+                self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.int64)
+                self.episode_ids = torch.zeros(self.num_envs, dtype=torch.int64)
+                self.samples = 0
+                self.reset_count = 0
+                self.rows = []
+                self.eval_mode = False
+                self.features = torch.linspace(-1, 1, 66)[None].repeat(self.num_envs, 1)
+                self.target = torch.linspace(-0.3, 0.3, self.num_actions)[None]
+                self.reset()
+
+            def set_evaluation_mode(self, enabled, seed=None):
+                self.eval_mode = bool(enabled)
+
+            def reset(self):
+                self.state.zero_()
+                self.episode_length_buf.zero_()
+                self.episode_ids.add_(1)
+                self.reset_count += self.num_envs
+                self.rows = []
+                return self.get_observations()
+
+            def get_observations(self):
+                policy = torch.cat((self.state, self.episode_length_buf[:, None].float(), self.features), dim=1)
+                return TensorDict({"policy": policy}, batch_size=[self.num_envs], device=self.device)
+
+            def state_hold_actions(self):
+                return torch.zeros(self.num_envs, self.num_actions)
+
+            def step(self, actions):
+                # Rebinding persistent state exercises the same no-grad boundary
+                # as the robot environment without importing any simulator.
+                self.state = 0.9*self.state + 0.1*actions.clamp(-1, 1)
+                reward = 1 - (self.state-self.target).square().mean(dim=-1)
+                self.episode_length_buf.add_(1)
+                self.samples += 33  # Synthetic cadence for the runner contract.
+                done = self.episode_length_buf >= 2
+                self.rows = [dict(outcome(index, int(self.episode_ids[index]), False),
+                                  scope="toy_cpu_api_only", unavailable_robot_acceptance=True)
+                             for index in torch.nonzero(done).flatten().tolist()]
+                count = int(done.sum())
+                self.state[done] = 0
+                self.episode_length_buf[done] = 0
+                self.episode_ids[done] += 1
+                self.reset_count += count
+                return self.get_observations(), reward, done.long(), {"time_outs": done}
+
+            def step_audit(self):
+                return {**measurement_audit(), "physics_samples": self.samples,
+                        "sim_time_s": self.samples*0.002, "reset_count": self.reset_count,
+                        "actual_physics_dt_s": 0.002, "nonfinite_state": False,
+                        "clock_is_synthetic": True, "scope": "toy_cpu_no_simulator"}
+
+            def pop_episode_outcomes(self):
+                result, self.rows = self.rows, []
+                return result
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                run_dir = Path(directory)
+                raw = flat_config()
+                raw.update(device="cpu", num_envs=8, max_iterations=1, episode_length_s=0.132)
+                settings = rl_ppo.normalize_settings(raw)
+                settings.update(training_config_sha256="a"*64, source_tree_sha256="b"*64)
+                rl_ppo._validate_settings(settings)
+                env = ToyVectorEnv()
+                self.assertEqual(tuple(env.get_observations()["policy"].shape), (8, 81))
+                contract = {"scope": "toy_cpu_no_simulator", "observation_dim": 81, "action_dim": 14}
+                audit = {"policy_contract": contract, "policy_contract_sha256": rl_ppo.canonical_sha256(contract)}
+                streams = rl_ppo._new_streams(run_dir)
+                try:
+                    # No model/runner/algorithm/optimizer/checkpoint mocks: this
+                    # calls the production factory and complete bounded loop.
+                    result = rl_ppo._train(env, settings, run_dir, streams,
+                        rl_ppo.Deadline(60), torch, audit)
+                finally:
+                    for stream in streams.values():
+                        stream.close()
+                updates = [json.loads(line) for line in (run_dir/"updates.jsonl").read_text().splitlines()]
+                optimizers = [json.loads(line) for line in (run_dir/"optimizer_steps.jsonl").read_text().splitlines()]
+                self.assertEqual(result["completed_updates"], 1)
+                self.assertEqual(result["optimizer_steps"], 16)
+                self.assertEqual(result["training_environment_transitions"], 8*32)
+                self.assertTrue(result["state_hold_validation"]["target_completed"])
+                self.assertTrue(all(row["target_completed"] for row in result["validations"]))
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(len(optimizers), 16)
+                self.assertEqual([row["optimizer_step"] for row in optimizers], list(range(1, 17)))
+                self.assertTrue(all(row["raw_gradients_finite"] and row["post_parameters_finite"] for row in optimizers))
+                self.assertTrue(all(math.isfinite(value) for value in updates[0]["loss"].values()))
+                self.assertGreater(result["actor_total_change"]["changed_elements"], 0)
+                self.assertGreater(result["critic_total_change"]["changed_elements"], 0)
+                checkpoint = result["checkpoints"][-1]
+                self.assertEqual(checkpoint["sha256"], rl_ppo.file_sha256(checkpoint["path"]))
+                saved = torch.load(checkpoint["path"], map_location="cpu", weights_only=False)
+                self.assertEqual(saved["infos"]["completed_updates"], 1)
+                self.assertEqual(saved["infos"]["optimizer_steps"], 16)
+                self.assertFalse(result["budget_exhausted"])
+                print("TOY_RSL_CPU_INTEGRATION=" + json.dumps({"scope": "toy CPU integration only; not G1 learning",
+                    "rsl_version": importlib.metadata.version("rsl-rl-lib"), "torch_version": torch.__version__,
+                    "observations": 81, "actions": 14, "rollout": 32, "epochs": 4, "minibatches": 4,
+                    "completed_updates": 1, "optimizer_steps": len(optimizers), "loss": updates[0]["loss"],
+                    "actor_changed_elements": result["actor_total_change"]["changed_elements"],
+                    "critic_changed_elements": result["critic_total_change"]["changed_elements"],
+                    "final_checkpoint_sha256": checkpoint["sha256"]}), flush=True)
+        finally:
+            torch.set_num_threads(previous_threads)
 
 
 if __name__ == "__main__":
