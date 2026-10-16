@@ -1071,10 +1071,17 @@ def run_teacher_episode(config, spec, run_dir):
                          <= settings["closed_orientation_tolerance_rad"]))
                 advance_cap, start_detail = measured_lift_start_budget(config["expert"]["lift_start"],
                     current_phase, grip_lock, float(data.xpos[object_body, 2]), controller.cadence.period_s)
+                from .teacher_trajectory import transfer_reference_budget
+                transfer_cap, transfer_detail = transfer_reference_budget(active_plan,
+                    path_progress.total_duration_s, controller.cadence.period_s)
+                if transfer_cap is not None:
+                    advance_cap = transfer_cap if advance_cap is None else min(advance_cap, transfer_cap)
                 path_status = path_progress.step(actual_pose["arm"], np.asarray(controller.previous_target)[arm_indices],
                     tracking_ready, maximum_advance_s=advance_cap)
                 if start_detail is not None:
                     path_status["measured_lift_start"] = start_detail
+                if transfer_detail is not None:
+                    path_status["bounded_load_transfer_reference"] = transfer_detail
                 trajectory["progress_blocked_count"] += int(path_status["blocked"])
                 if path_status["reference"] is None:
                     raise ExpertError("Cartesian follower has no legal acknowledged reference: {}".format(path_status["reason"]))

@@ -40,6 +40,7 @@ class ConfigTests(unittest.TestCase):
         config["expert"]["opposition"]["backend"] = "side_opposition_preload_v1"
         validate_config(config)
         for owner, key, value in (("opposition", "transfer_height_m", .011),
+                                  ("opposition", "transfer_reference_duration_s", 3.),
                                   ("opposition", "maximum_opposition_dot", 0.),
                                   ("opposition", "planning_taskpoint_tolerance_m", .016),
                                   ("opposition", "planning_orientation_tolerance_rad", .051),

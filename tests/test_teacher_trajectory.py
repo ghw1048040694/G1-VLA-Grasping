@@ -9,10 +9,84 @@ from scipy.spatial.transform import Rotation
 
 from g1_vla.teacher_trajectory import (CartesianTeacherPlanner, TrajectoryError,
                                        grasp_center, path_velocity_budget, rotation_error,
-                                       project_pose_feasibility, bounded_absolute_jacobian)
+                                       project_pose_feasibility, bounded_absolute_jacobian,
+                                       transfer_reference_budget)
 
 
 class TrajectoryTests(unittest.TestCase):
+    def test_transfer_reference_budget_disabled_preserves_uncapped_legacy_plan(self):
+        for plan in ({"phase": "lift"}, {"load_transfer": {"enabled": False,
+                "reference_duration_s": 0., "original_phase_clock_reset": False}}):
+            original = copy.deepcopy(plan)
+            cap, _ = transfer_reference_budget(plan, .1088220075, .066)
+            self.assertIsNone(cap)
+            self.assertEqual(plan, original)
+
+    def test_transfer_reference_budget_takes_at_least_declared_time_for_any_arc_scale(self):
+        from g1_vla.teacher_path_progress import JointPathProgress
+        # The same short displacement can have different arc-time lengths
+        # under different declared joint velocities. Cap only shared progress;
+        # the follower still checks the original 66ms command limits and ACK.
+        period, duration, displacement = .066, .6, .006
+        for total_arc in (.006, .1088220075, .3, .6, 1.2):
+            with self.subTest(total_arc=total_arc):
+                plan = {"phase": "grasp", "original_phase_start_s": 6.864,
+                    "load_transfer": {"enabled": True, "reference_duration_s": duration,
+                        "remaining_original_phase_budget_s": 2.334,
+                        "original_phase_clock_reset": False}}
+                original = copy.deepcopy(plan)
+                velocity = displacement / total_arc
+                follower = JointPathProgress([[0.], [displacement]], [velocity], period, [-1.], [1.])
+                cap, _ = transfer_reference_budget(plan, follower.total_duration_s, period)
+                self.assertAlmostEqual(cap, period * min(1., total_arc / duration))
+                self.assertLessEqual(cap, period)
+                previous, elapsed, last_u = (0.,), 0., 0.
+                for _ in range(100):
+                    row = follower.step(previous, previous, True, maximum_advance_s=cap)
+                    self.assertFalse(row["blocked"])
+                    self.assertLessEqual(row["u_s"] - last_u, cap + 1e-12)
+                    self.assertLessEqual(abs(row["reference"][0] - previous[0]), velocity * period + 1e-12)
+                    previous, last_u = row["reference"], row["u_s"]
+                    elapsed += period
+                    if row["end_reference_reached"]:
+                        self.assertFalse(row["complete"])
+                        break
+                else:
+                    self.fail("bounded transfer reference did not reach its endpoint")
+                self.assertGreaterEqual(elapsed + 1e-12, duration)
+                np.testing.assert_allclose(previous, [displacement])
+                acknowledged = follower.step(previous, previous, True, maximum_advance_s=cap)
+                self.assertTrue(acknowledged["complete"])
+                self.assertEqual(plan, original)  # No phase-clock reset or budget extension.
+
+    def test_transfer_reference_budget_zero_arc_is_explicit_zero_hold(self):
+        plan = {"phase": "grasp", "phase_start_s": 6.864,
+            "load_transfer": {"enabled": True, "reference_duration_s": .6,
+                "remaining_original_phase_budget_s": 2.334,
+                "original_phase_clock_reset": False}}
+        original = copy.deepcopy(plan)
+        cap, _ = transfer_reference_budget(plan, 0., .066)
+        self.assertEqual(cap, 0.)
+        self.assertEqual(plan, original)
+
+    def test_transfer_reference_budget_rejects_invalid_arc_period_or_duration(self):
+        valid = {"load_transfer": {"enabled": True, "reference_duration_s": .6}}
+        for invalid in (-.001, float("nan"), float("inf"), True, ".1"):
+            with self.subTest(arc=invalid), self.assertRaises((ValueError, TypeError, KeyError)):
+                transfer_reference_budget(copy.deepcopy(valid), invalid, .066)
+        for invalid in (0., -.001, float("nan"), float("inf"), True, ".066"):
+            with self.subTest(period=invalid), self.assertRaises((ValueError, TypeError, KeyError)):
+                transfer_reference_budget(copy.deepcopy(valid), .1, invalid)
+        for invalid in (0., -.6, float("nan"), float("inf"), True, None):
+            plan = {"load_transfer": {"enabled": True, "reference_duration_s": invalid}}
+            original = copy.deepcopy(plan)
+            with self.subTest(duration=invalid), self.assertRaises((ValueError, TypeError, KeyError)):
+                transfer_reference_budget(plan, .1, .066)
+            # NaN does not compare equal to a copy, so compare the unchanged
+            # declaration by identity/value instead of rewriting bad input.
+            self.assertIs(plan["load_transfer"]["reference_duration_s"], invalid)
+            self.assertEqual(set(plan), set(original))
+
     def test_absolute_jacobian_respects_bounds_actual_intervals_and_restores_workspace(self):
         q = np.array([.2, 0., 1., .000005])
         low, high = np.array([-1., 0., 0., 0.]), np.array([1., 1., 1., .00001])
@@ -481,11 +555,16 @@ class TrajectoryTests(unittest.TestCase):
         data = SimpleNamespace(time=6., xpos=np.array([[99., 99., 99.]]), qpos=locked_C.copy())
         lock = {"C": locked_C.tolist(), "R": R.tolist()}
         planner.strict_open_orientation = True
-        planner.opposition = {"transfer_height_m": .006}
+        planner.opposition = {"transfer_height_m": .006, "transfer_reference_duration_s": .6,
+                              "preload": {"stable_window_s": .198}}
         probe = planner.plan_phase("grasp", data, data.qpos, transfer_lock=lock, remaining_phase_budget_s=1.2)
         np.testing.assert_allclose(probe["target_C"], locked_C + [0., 0., .006])
         self.assertEqual(probe["budget"]["original_timeout_s"], 1.2)
-        self.assertEqual(probe["budget"]["minimum_nominal_time_s"], 0.)
+        self.assertEqual(probe["budget"]["minimum_nominal_time_s"], .6)
+        self.assertAlmostEqual(probe["budget"]["reference_plus_support_required_s"], .798)
+        with self.assertRaises(TrajectoryError):
+            planner.plan_phase("grasp", data, data.qpos, transfer_lock=lock, remaining_phase_budget_s=.7)
+        self.assertEqual(probe["load_transfer"]["reference_duration_s"], .6)
         self.assertFalse(probe["load_transfer"]["original_phase_clock_reset"])
         self.assertEqual(probe["load_transfer"]["fixed_pretransfer_lock"], lock)
         with self.assertRaises(TrajectoryError):

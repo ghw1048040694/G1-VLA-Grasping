@@ -185,6 +185,33 @@ def path_velocity_budget(waypoints, velocity, period_s, anchor_delta, nominal_s,
             "scope": "reference feasibility only; actual tracking, contact and settling may still timeout"}
 
 
+def transfer_reference_budget(plan, total_arc_s, period_s):
+    """Stretch only the bounded load-transfer reference inside its original phase.
+
+    The follower's true arc-time uses the unchanged joint speed limits. Capping
+    its increment cannot increase any physical speed/anchor allowance, change
+    the actual control period or extend the caller's phase deadline.
+    """
+    transfer = plan.get("load_transfer", {}) if isinstance(plan, dict) else {}
+    if not isinstance(transfer, dict):
+        raise TrajectoryError("load-transfer reference metadata must be an object")
+    enabled = transfer.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise TrajectoryError("load-transfer enabled flag must be boolean")
+    if not enabled:
+        return None, None
+    duration = transfer.get("reference_duration_s")
+    if (any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+            for v in (total_arc_s, period_s, duration))
+            or total_arc_s < 0 or period_s <= 0 or duration <= 0):
+        raise TrajectoryError("transfer arc, physical period and reference duration must be finite and valid")
+    scale = min(1., total_arc_s / duration)
+    cap = period_s * scale
+    return cap, {"backend": "bounded_transfer_reference_time_v1", "original_joint_speed_arc_time_s": total_arc_s,
+        "minimum_reference_duration_s": duration, "progress_scale": scale, "maximum_advance_s": cap,
+        "physical_period_s": period_s, "original_phase_deadline_unchanged": True}
+
+
 class CartesianTeacherPlanner:
     """Plan one original phase from its true visited state and prior command."""
 
@@ -548,11 +575,17 @@ class CartesianTeacherPlanner:
         if transfer:
             # This replaces the grasp hold reference in the same original
             # phase. It neither resets the phase clock nor adds a new budget.
-            nominal, timeout = 0., float(remaining_phase_budget_s)
+            nominal, timeout = self.opposition["transfer_reference_duration_s"], float(remaining_phase_budget_s)
         budget = path_velocity_budget(waypoints, self.velocity, self.period, self.anchor, nominal,
                                       timeout,
                                       closure_s=self.profile["close_duration_s"] if phase == "contact" else 0.,
                                       tracking_reserve_rad=self.settings["reference_tracking_rad"])
+        if transfer:
+            reserve = self.opposition["preload"]["stable_window_s"]
+            budget["support_window_reserve_s"] = reserve
+            budget["reference_plus_support_required_s"] = budget["required_reference_time_s"] + reserve
+            budget["within_original_timeout"] = bool(budget["within_original_timeout"]
+                and budget["reference_plus_support_required_s"] <= timeout + 1e-9)
         if not budget["within_original_timeout"]:
             self.last_failure = {"phase": phase, "budget": budget,
                                  "partial_plan": failure_context("original_budget_rejection", checks=chord_checks, budget=budget)}
@@ -568,6 +601,7 @@ class CartesianTeacherPlanner:
                 "grip_lock": grip_lock, "planning_wall_s": time.monotonic() - started,
                 "strict_orientation": closed or getattr(self, "strict_open_orientation", False),
                 "load_transfer": {"enabled": transfer, "fixed_pretransfer_lock": transfer_lock,
+                    "reference_duration_s": self.opposition["transfer_reference_duration_s"] if transfer else None,
                     "remaining_original_phase_budget_s": remaining_phase_budget_s,
                     "original_phase_clock_reset": False, "included_in_main_lift_height": True},
                 "object_qpos_copied_from_actual": True, "live_state_modified": False,

@@ -251,6 +251,7 @@
       "maximum_group_force_n": 1.5,
       "relief_step_rad": 0.01,
       "transfer_height_m": 0.006,
+      "transfer_reference_duration_s": 0.6,
       "carry_maximum_grip_drift_m": 0.005,
       "carry_maximum_rotation_rad": 0.15,
       "preload": {

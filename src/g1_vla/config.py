@@ -270,6 +270,7 @@ SCHEMA = {
             "maximum_opposition_dot": _finite, "maximum_penetration_m": _positive,
             "maximum_group_force_n": _positive, "relief_step_rad": _positive,
             "transfer_height_m": _positive,
+            "transfer_reference_duration_s": _positive,
             "carry_maximum_grip_drift_m": _positive, "carry_maximum_rotation_rad": _positive,
             "preload": {
                 "minimum_bottom_clearance_m": _positive,
@@ -561,6 +562,8 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _error("config.expert.opposition", "geometric planning precision cannot relax the original taskpoint/orientation bounds")
     if not 0 < opposition["transfer_height_m"] <= .01:
         _error("config.expert.opposition", "load transfer is a bounded probe of at most ten millimetres")
+    if opposition["transfer_reference_duration_s"] + preload["stable_window_s"] > teacher["grasp_hold_s"] * teacher["phase_timeout_scale"]:
+        _error("config.expert.opposition", "transfer reference and support proof must fit the original grasp deadline")
     if not 0 < preload["hand_weight_ratio_min"] <= 1 <= preload["hand_weight_ratio_max"]:
         _error("config.expert.opposition.preload", "hand support must bound the actual object weight")
     if preload["stable_window_s"] > teacher["grasp_hold_s"] or preload["minimum_bottom_clearance_m"] >= opposition["transfer_height_m"]:
