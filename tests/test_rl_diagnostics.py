@@ -66,10 +66,10 @@ class DiagnosticControlTests(unittest.TestCase):
         self.state["target_action_rad"][:, 7:] = torch.tensor(self.seed)
         self.state["q_action_rad"][:, 7:] = torch.tensor(self.seed)
 
-    def staged_controller(self):
+    def staged_controller(self, plan="geometry_pose_only_v2"):
         from g1_vla.rl_diagnostics import GuidedClosure
         cfg = copy.deepcopy(self.cfg)
-        cfg.update(profile_plan="geometry_pose_only_v2", guided_target_lead_max_rad=.006)
+        cfg.update(profile_plan=plan, guided_target_lead_max_rad=.006)
         goals = [[.8, -.2, -.1, .5, .3, .3, .3], [.8, -.4, -.1, .5, .3, .3, .3],
                  [.8, -.4, -.2, .5, .3, .3, .3], [.7, -.4, -.2, .5, .3, .3, .3],
                  cfg["guided_hand_target_rad"]]
@@ -135,6 +135,16 @@ class DiagnosticControlTests(unittest.TestCase):
         _, evidence = controller.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
         self.assertTrue(evidence["closure_paused_for_palm_tracking"].all())
         self.assertFalse(evidence["stage_advance_after_this_request"].any())
+
+    def test_new_model_plan_retains_the_same_staged_controller_requests(self):
+        before, _ = self.staged_controller()
+        after, _ = self.staged_controller("geometry_pose_fixed_cluster_v3")
+        actor = self.t.zeros(2, 14)
+        first, e1 = before.actions(actor, self.state, "guided_hand_pose_hold", .066, 1.5)
+        second, e2 = after.actions(actor, self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertTrue(self.t.equal(first, second))
+        self.assertTrue(self.t.equal(e1["closure_stage_index"], e2["closure_stage_index"]))
+        self.assertEqual(e1["arm_target_reference"], e2["arm_target_reference"])
 
     def test_hand_intervention_preserves_actor_arm_and_closes_declared_directions(self):
         from g1_vla.rl_diagnostics import GuidedClosure

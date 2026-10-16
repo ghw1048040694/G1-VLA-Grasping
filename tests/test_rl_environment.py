@@ -16,6 +16,12 @@ from types import SimpleNamespace
 from g1_vla.rl_environment import (
     ACTION_JOINT_NAMES,
     DEFAULT_SETTINGS,
+    FIXED_PALM_FILTER_ASSET_SHA256,
+    author_fixed_palm_adjacency_filters,
+    fixed_palm_adjacency_filter_contract,
+    fixed_palm_filter_relationships,
+    readback_fixed_palm_adjacency_filters,
+    validate_fixed_palm_filter_relationships,
     RLEnvironmentError,
     TABLE_BODY_PROTOCOL,
     TableContactChannel,
@@ -870,6 +876,213 @@ class NativeSelfPairDiagnosticTests(unittest.TestCase):
         self.assertFalse(row["available"])
         self.assertIsNone(row["values"])
         self.assertIn("integer", row["unavailable_reason"])
+
+
+
+class FixedPalmAdjacencyFilterTest(unittest.TestCase):
+    # The entire independently audited official graph, including the 12 fixed
+    # joints. This fixture is not computed from the incoming filter contract.
+    GRAPH = [('d435_joint', 'PhysicsFixedJoint', 'torso_link', 'd435_link'), ('head_joint', 'PhysicsFixedJoint', 'torso_link', 'head_link'), ('imu_in_pelvis_joint', 'PhysicsFixedJoint', 'pelvis', 'imu_in_pelvis'), ('imu_in_torso_joint', 'PhysicsFixedJoint', 'torso_link', 'imu_in_torso'), ('left_ankle_pitch_joint', 'PhysicsRevoluteJoint', 'left_knee_link', 'left_ankle_pitch_link'), ('left_ankle_roll_joint', 'PhysicsRevoluteJoint', 'left_ankle_pitch_link', 'left_ankle_roll_link'), ('left_elbow_joint', 'PhysicsRevoluteJoint', 'left_shoulder_yaw_link', 'left_elbow_link'), ('left_hand_camera_base_joint', 'PhysicsFixedJoint', 'left_wrist_yaw_link', 'left_hand_camera_base_link'), ('left_hand_index_0_joint', 'PhysicsRevoluteJoint', 'left_hand_palm_link', 'left_hand_index_0_link'), ('left_hand_index_1_joint', 'PhysicsRevoluteJoint', 'left_hand_index_0_link', 'left_hand_index_1_link'), ('left_hand_middle_0_joint', 'PhysicsRevoluteJoint', 'left_hand_palm_link', 'left_hand_middle_0_link'), ('left_hand_middle_1_joint', 'PhysicsRevoluteJoint', 'left_hand_middle_0_link', 'left_hand_middle_1_link'), ('left_hand_palm_joint', 'PhysicsFixedJoint', 'left_wrist_yaw_link', 'left_hand_palm_link'), ('left_hand_thumb_0_joint', 'PhysicsRevoluteJoint', 'left_hand_palm_link', 'left_hand_thumb_0_link'), ('left_hand_thumb_1_joint', 'PhysicsRevoluteJoint', 'left_hand_thumb_0_link', 'left_hand_thumb_1_link'), ('left_hand_thumb_2_joint', 'PhysicsRevoluteJoint', 'left_hand_thumb_1_link', 'left_hand_thumb_2_link'), ('left_hip_pitch_joint', 'PhysicsRevoluteJoint', 'pelvis', 'left_hip_pitch_link'), ('left_hip_roll_joint', 'PhysicsRevoluteJoint', 'left_hip_pitch_link', 'left_hip_roll_link'), ('left_hip_yaw_joint', 'PhysicsRevoluteJoint', 'left_hip_roll_link', 'left_hip_yaw_link'), ('left_knee_joint', 'PhysicsRevoluteJoint', 'left_hip_yaw_link', 'left_knee_link'), ('left_shoulder_pitch_joint', 'PhysicsRevoluteJoint', 'torso_link', 'left_shoulder_pitch_link'), ('left_shoulder_roll_joint', 'PhysicsRevoluteJoint', 'left_shoulder_pitch_link', 'left_shoulder_roll_link'), ('left_shoulder_yaw_joint', 'PhysicsRevoluteJoint', 'left_shoulder_roll_link', 'left_shoulder_yaw_link'), ('left_wrist_pitch_joint', 'PhysicsRevoluteJoint', 'left_wrist_roll_link', 'left_wrist_pitch_link'), ('left_wrist_roll_joint', 'PhysicsRevoluteJoint', 'left_elbow_link', 'left_wrist_roll_link'), ('left_wrist_yaw_joint', 'PhysicsRevoluteJoint', 'left_wrist_pitch_link', 'left_wrist_yaw_link'), ('logo_joint', 'PhysicsFixedJoint', 'torso_link', 'logo_link'), ('mid360_joint', 'PhysicsFixedJoint', 'torso_link', 'mid360_link'), ('pelvis_contour_joint', 'PhysicsFixedJoint', 'pelvis', 'pelvis_contour_link'), ('right_ankle_pitch_joint', 'PhysicsRevoluteJoint', 'right_knee_link', 'right_ankle_pitch_link'), ('right_ankle_roll_joint', 'PhysicsRevoluteJoint', 'right_ankle_pitch_link', 'right_ankle_roll_link'), ('right_elbow_joint', 'PhysicsRevoluteJoint', 'right_shoulder_yaw_link', 'right_elbow_link'), ('right_hand_camera_base_joint', 'PhysicsFixedJoint', 'right_wrist_yaw_link', 'right_hand_camera_base_link'), ('right_hand_index_0_joint', 'PhysicsRevoluteJoint', 'right_hand_palm_link', 'right_hand_index_0_link'), ('right_hand_index_1_joint', 'PhysicsRevoluteJoint', 'right_hand_index_0_link', 'right_hand_index_1_link'), ('right_hand_middle_0_joint', 'PhysicsRevoluteJoint', 'right_hand_palm_link', 'right_hand_middle_0_link'), ('right_hand_middle_1_joint', 'PhysicsRevoluteJoint', 'right_hand_middle_0_link', 'right_hand_middle_1_link'), ('right_hand_palm_joint', 'PhysicsFixedJoint', 'right_wrist_yaw_link', 'right_hand_palm_link'), ('right_hand_thumb_0_joint', 'PhysicsRevoluteJoint', 'right_hand_palm_link', 'right_hand_thumb_0_link'), ('right_hand_thumb_1_joint', 'PhysicsRevoluteJoint', 'right_hand_thumb_0_link', 'right_hand_thumb_1_link'), ('right_hand_thumb_2_joint', 'PhysicsRevoluteJoint', 'right_hand_thumb_1_link', 'right_hand_thumb_2_link'), ('right_hip_pitch_joint', 'PhysicsRevoluteJoint', 'pelvis', 'right_hip_pitch_link'), ('right_hip_roll_joint', 'PhysicsRevoluteJoint', 'right_hip_pitch_link', 'right_hip_roll_link'), ('right_hip_yaw_joint', 'PhysicsRevoluteJoint', 'right_hip_roll_link', 'right_hip_yaw_link'), ('right_knee_joint', 'PhysicsRevoluteJoint', 'right_hip_yaw_link', 'right_knee_link'), ('right_shoulder_pitch_joint', 'PhysicsRevoluteJoint', 'torso_link', 'right_shoulder_pitch_link'), ('right_shoulder_roll_joint', 'PhysicsRevoluteJoint', 'right_shoulder_pitch_link', 'right_shoulder_roll_link'), ('right_shoulder_yaw_joint', 'PhysicsRevoluteJoint', 'right_shoulder_roll_link', 'right_shoulder_yaw_link'), ('right_wrist_pitch_joint', 'PhysicsRevoluteJoint', 'right_wrist_roll_link', 'right_wrist_pitch_link'), ('right_wrist_roll_joint', 'PhysicsRevoluteJoint', 'right_elbow_link', 'right_wrist_roll_link'), ('right_wrist_yaw_joint', 'PhysicsRevoluteJoint', 'right_wrist_pitch_link', 'right_wrist_yaw_link'), ('waist_pitch_joint', 'PhysicsRevoluteJoint', 'waist_roll_link', 'torso_link'), ('waist_roll_joint', 'PhysicsRevoluteJoint', 'waist_yaw_link', 'waist_roll_link'), ('waist_yaw_joint', 'PhysicsRevoluteJoint', 'pelvis', 'waist_yaw_link'), ('root_joint', 'PhysicsFixedJoint', None, 'pelvis')]
+
+    @classmethod
+    def topology(cls, env_id=0):
+        root = "/World/envs/env_"+str(env_id)+"/Robot"
+        return [{"name": n, "type": t, "path": root+("/" if n == "root_joint" else "/joints/")+n,
+                 "body0": [root+"/"+a] if a else [], "body1": [root+"/"+b] if b else [],
+                 "physics:jointEnabled": True, "physics:collisionEnabled": False}
+                for n, t, a, b in cls.GRAPH]
+
+    def test_exact_full_graph_yields_independently_pinned_contract_and_fresh_copy(self):
+        actual = fixed_palm_adjacency_filter_contract(self.topology())
+        self.assertEqual(actual, fixed_palm_adjacency_filter_contract())
+        self.assertEqual(actual["source_graph_sha256"], "1bc9a5d33856280a489137634f3ddcbb84196ef231b6dfa902acbd271eac600c")
+        self.assertEqual(actual["sha256"], "04dd990d50f4632012408b13747313a5504614e47a13d05d9540c31ef66fb770")
+        encoded = json.dumps(actual["contract"], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        self.assertEqual(hashlib.sha256(encoded.encode()).hexdigest(), actual["sha256"])
+        self.assertEqual(len(actual["contract"]["excluded_body_pairs"]), 15)
+        actual["contract"]["excluded_body_pairs"].append(["Cube", "Table"])
+        self.assertEqual(len(fixed_palm_adjacency_filter_contract()["contract"]["excluded_body_pairs"]), 15)
+
+    def test_incomplete_duplicate_wrong_graph_and_joint_flags_are_rejected(self):
+        variants = [self.topology()[:-1], self.topology()+[self.topology()[0]]]
+        for key, value in (("type", "PhysicsFixedJoint"), ("physics:jointEnabled", False),
+                           ("physics:collisionEnabled", True), ("physics:collisionEnabled", 0)):
+            rows = self.topology()
+            rows[4][key] = value
+            variants.append(rows)
+        rows = self.topology()
+        rows[-1] = rows[0]
+        variants.append(rows)
+        rows = self.topology()
+        rows[4]["body0"] = ["/World/envs/env_0/Robot/right_hand_thumb_1_link"]
+        variants.append(rows)
+        for rows in variants:
+            with self.subTest(rows=rows[-1]), self.assertRaises(RLEnvironmentError):
+                fixed_palm_adjacency_filter_contract(rows)
+
+    def test_cross_env_endpoint_and_entire_mixed_root_rows_cannot_hide_in_leaf_hash(self):
+        rows = self.topology()
+        rows[0]["body1"] = ["/World/envs/env_1/Robot/d435_link"]
+        with self.assertRaisesRegex(RLEnvironmentError, "cross"):
+            fixed_palm_adjacency_filter_contract(rows)
+        rows = self.topology()
+        rows[0] = self.topology(1)[0]
+        with self.assertRaises(RLEnvironmentError):
+            fixed_palm_adjacency_filter_contract(rows)
+
+    def test_exact15_per_env_excludes_no_object_or_nonadjacent_thumb(self):
+        relationships = fixed_palm_filter_relationships(8)
+        result = validate_fixed_palm_filter_relationships(relationships, 8)
+        self.assertEqual(result["excluded_pair_count_total"], 120)
+        for path, targets in relationships.items():
+            prefix = path.rsplit("/", 1)[0]+"/"
+            self.assertTrue(all(p.startswith(prefix) for p in targets))
+            self.assertFalse(any(name in path+" "+" ".join(targets)
+                                 for name in ("/Cube", "/Table", "thumb_1", "thumb_2")))
+        for n in (0, True, 513, 8.0):
+            with self.assertRaises(RLEnvironmentError):
+                fixed_palm_filter_relationships(n)
+
+    def test_extra_pair_cross_env_missing_duplicate_and_wrong_readback_are_rejected(self):
+        original = fixed_palm_filter_relationships(2)
+        left = next(iter(original))
+        variants = []
+        for target in ("/World/envs/env_0/Cube", "/World/envs/env_0/Table",
+                       "/World/envs/env_0/Robot/right_hand_thumb_1_link",
+                       "/World/envs/env_1/Robot/right_hand_index_0_link"):
+            changed = copy.deepcopy(original)
+            changed[left].append(target)
+            variants.append(changed)
+        changed = copy.deepcopy(original)
+        del changed[left]
+        variants.append(changed)
+        changed = copy.deepcopy(original)
+        changed[left].append(changed[left][0])
+        variants.append(changed)
+        changed = copy.deepcopy(original)
+        changed["/World/envs/env_0/Cube"] = ["/World/envs/env_0/Table"]
+        variants.append(changed)
+        for value in variants:
+            with self.assertRaises(RLEnvironmentError):
+                validate_fixed_palm_filter_relationships(value, 2)
+
+    @classmethod
+    def fake_native_stage(cls, num_envs):
+        class RigidBodyAPI:
+            pass
+        class ArticulationRootAPI:
+            pass
+        class Relationship:
+            def __init__(self, prim, name):
+                self.prim, self.name = prim, name
+            def GetTargets(self):
+                return self.prim.rels.get(self.name, [])
+            def SetTargets(self, targets):
+                self.prim.rels[self.name] = list(targets)
+                if self.prim.corrupt_target is not None:
+                    self.prim.rels[self.name].append(self.prim.corrupt_target)
+                return True
+        class Prim:
+            def __init__(self, path, kind="", row=None):
+                self.path, self.kind, self.row = path, kind, row
+                self.apis, self.rels = set(), {}
+                self.corrupt_target = None
+                self.self_collisions = True
+            def GetPath(self):
+                return self.path
+            def GetName(self):
+                return self.path.rsplit("/", 1)[-1]
+            def GetTypeName(self):
+                return self.kind
+            def IsA(self, schema):
+                return schema is Joint and self.row is not None
+            def HasAPI(self, schema):
+                return schema in self.apis
+            def GetAttribute(self, name):
+                value = self.self_collisions if name == "physxArticulation:enabledSelfCollisions" else self.row[name]
+                return SimpleNamespace(Get=lambda: value)
+            def IsValid(self):
+                return True
+            def IsInstanceProxy(self):
+                return False
+        class Joint:
+            def __init__(self, prim):
+                self.prim = prim
+            def GetBody0Rel(self):
+                return SimpleNamespace(GetTargets=lambda: self.prim.row["body0"])
+            def GetBody1Rel(self):
+                return SimpleNamespace(GetTargets=lambda: self.prim.row["body1"])
+            def GetJointEnabledAttr(self):
+                return self.prim.GetAttribute("physics:jointEnabled")
+            def GetCollisionEnabledAttr(self):
+                return self.prim.GetAttribute("physics:collisionEnabled")
+        class FilteredPairsAPI:
+            def __init__(self, prim):
+                self.prim = prim
+            @classmethod
+            def Apply(api, prim):
+                prim.apis.add(api)
+                return api(prim)
+            def GetFilteredPairsRel(self):
+                return Relationship(self.prim, "filteredPairs")
+            CreateFilteredPairsRel = GetFilteredPairsRel
+        prims = {}
+        for env_id in range(num_envs):
+            root = "/World/envs/env_"+str(env_id)+"/Robot"
+            for row in cls.topology(env_id):
+                prims[row["path"]] = Prim(row["path"], row["type"], row)
+                for key in ("body0", "body1"):
+                    for path in row[key]:
+                        if path not in prims:
+                            prims[path] = Prim(path)
+                            prims[path].apis.add(RigidBodyAPI)
+            prims[root+"/pelvis"].apis.add(ArticulationRootAPI)
+            for body in ("Cube", "Table"):
+                path = "/World/envs/env_"+str(env_id)+"/"+body
+                prims[path] = Prim(path)
+                prims[path].apis.add(RigidBodyAPI)
+        stage = SimpleNamespace(Traverse=lambda: iter(prims.values()), GetPrimAtPath=lambda path: prims[path])
+        physics = SimpleNamespace(RigidBodyAPI=RigidBodyAPI, ArticulationRootAPI=ArticulationRootAPI,
+                                  Joint=Joint, FilteredPairsAPI=FilteredPairsAPI)
+        return stage, physics, prims
+
+    def test_native_authoring_validates_all8_graphs_and_exact_relationships(self):
+        stage, physics, prims = self.fake_native_stage(8)
+        result = author_fixed_palm_adjacency_filters(stage, physics, 8, FIXED_PALM_FILTER_ASSET_SHA256)
+        self.assertEqual(result["source_graph_verified_env_count"], 8)
+        self.assertEqual(result["excluded_pair_count_total"], 120)
+        self.assertEqual(result["authoring_phase"], "after_clone_before_physics_initialization")
+        self.assertEqual(len(result["global_self_collision_readback"]), 8)
+        for path, prim in prims.items():
+            if physics.FilteredPairsAPI in prim.apis:
+                self.assertIn(path, fixed_palm_filter_relationships(8))
+            if path.endswith(("/Cube", "/Table")):
+                self.assertFalse(prim.HasAPI(physics.FilteredPairsAPI))
+        prims[next(iter(result["relationships"]))].rels["filteredPairs"].append("/World/envs/env_0/Cube")
+        with self.assertRaises(RLEnvironmentError):
+            readback_fixed_palm_adjacency_filters(stage, physics, 8)
+
+    def test_last_env_wrong_graph_rejects_before_authoring_any_relationship(self):
+        stage, physics, prims = self.fake_native_stage(8)
+        prims["/World/envs/env_7/Robot/joints/right_hand_palm_joint"].row["physics:jointEnabled"] = False
+        with self.assertRaises(RLEnvironmentError):
+            author_fixed_palm_adjacency_filters(stage, physics, 8, FIXED_PALM_FILTER_ASSET_SHA256)
+        self.assertFalse(any(prim.HasAPI(physics.FilteredPairsAPI) for prim in prims.values()))
+
+    def test_native_wrong_asset_preexisting_filter_and_readback_corruption_reject(self):
+        for failure in ("asset", "preexisting", "readback", "global_self_collisions"):
+            stage, physics, prims = self.fake_native_stage(2)
+            asset_sha = FIXED_PALM_FILTER_ASSET_SHA256
+            if failure == "asset":
+                asset_sha = "0"*64
+            elif failure == "preexisting":
+                physics.FilteredPairsAPI.Apply(prims["/World/envs/env_0/Cube"])
+            elif failure == "readback":
+                prims[next(iter(fixed_palm_filter_relationships(2)))].corrupt_target = "/World/envs/env_1/Table"
+            else:
+                prims["/World/envs/env_1/Robot/pelvis"].self_collisions = False
+            with self.subTest(failure=failure), self.assertRaises(RLEnvironmentError):
+                author_fixed_palm_adjacency_filters(stage, physics, 2, asset_sha)
 
 
 if __name__ == "__main__":

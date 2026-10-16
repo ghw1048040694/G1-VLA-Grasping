@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .control import LOWER_BODY_JOINT_NAMES
 from .contracts import canonical_sha256, read_joint_order
+from .rl_protocol import RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY
 
 
 ENVIRONMENT_VERSION = "g1_physx_official_precontact_rl_v2"
@@ -92,6 +93,206 @@ class RLEnvironmentError(ValueError):
 
 class ContactEquivalenceError(AssertionError):
     """A same-step native contact-view crosscheck failed; never unsupported."""
+
+
+# This is a new model identity, not a claim that the original mesh is disjoint.
+FIXED_PALM_FILTER_GRAPH_SHA256 = "1bc9a5d33856280a489137634f3ddcbb84196ef231b6dfa902acbd271eac600c"
+FIXED_PALM_FILTER_CONTRACT_SHA256 = "04dd990d50f4632012408b13747313a5504614e47a13d05d9540c31ef66fb770"
+FIXED_PALM_FILTER_ASSET_SHA256 = "d23b9bbc8b59cf20fa1983f55874f855a76e038b9e22eae39542e62be5b4ba3d"
+
+
+def _fixed_palm_canonical_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def fixed_palm_adjacency_filter_contract(joint_topology=None):
+    """Declare the pinned allowlist, or verify a real full official joint graph.
+
+    None is for pure protocol comparison only. The native authoring function
+    always supplies every real USD joint, including enabled/collision flags.
+    Full endpoints must share their joint's robot root; leaf-name hashing never
+    excuses a cross-environment endpoint or an extra/missing/disabled joint.
+    """
+    component = ["right_hand_camera_base_link", "right_hand_palm_link", "right_wrist_yaw_link"]
+    neighbors = ["right_hand_index_0_link", "right_hand_middle_0_link",
+                 "right_hand_thumb_0_link", "right_wrist_pitch_link"]
+    if joint_topology is not None:
+        if not isinstance(joint_topology, (tuple, list)) or len(joint_topology) != 55:
+            raise RLEnvironmentError("fixed-palm filtering requires the complete 55-joint official graph")
+        normalized, roots, names = [], set(), set()
+        for row in joint_topology:
+            if not isinstance(row, dict):
+                raise RLEnvironmentError("joint topology rows must be objects")
+            name, kind, path = row.get("name"), row.get("type"), row.get("path")
+            if not isinstance(name, str) or not name or "/" in name or name in names:
+                raise RLEnvironmentError("invalid or duplicate fixed-palm topology joint name")
+            if kind not in ("PhysicsFixedJoint", "PhysicsRevoluteJoint"):
+                raise RLEnvironmentError("unsupported official topology joint type")
+            endpoints_all = row.get("body0", []) + row.get("body1", []) if (
+                isinstance(row.get("body0"), list) and isinstance(row.get("body1"), list)) else []
+            if not endpoints_all or not isinstance(endpoints_all[0], str) or not endpoints_all[0].startswith("/"):
+                raise RLEnvironmentError("official joint requires an absolute top-level body endpoint")
+            root = endpoints_all[0].rsplit("/", 1)[0]
+            # The world-fixing root_joint is directly under Robot while the
+            # other joints are under Robot/joints. Reference-prefix relocation
+            # is allowed; endpoint root and joint basename remain exact.
+            if (not root or ".." in root.split("/") or not isinstance(path, str)
+                    or not path.startswith(root+"/") or not path.endswith("/"+name)
+                    or ".." in path.split("/")):
+                raise RLEnvironmentError("official joint must belong to its exact body robot root")
+            roots.add(root)
+            names.add(name)
+            for attribute, expected in (("physics:jointEnabled", True), ("physics:collisionEnabled", False)):
+                value = row.get(attribute)
+                if isinstance(value, dict):
+                    value = value.get("value")
+                if type(value) is not bool or value is not expected:
+                    raise RLEnvironmentError("official joint enabled/collision flag changed: "+name)
+            item = {"name": name, "type": kind}
+            for key in ("body0", "body1"):
+                endpoints = row.get(key)
+                if not isinstance(endpoints, (list, tuple)) or len(endpoints) > 1:
+                    raise RLEnvironmentError("official joints require single body endpoints")
+                if not endpoints:
+                    item[key] = None
+                    continue
+                endpoint = endpoints[0]
+                if not isinstance(endpoint, str) or not endpoint.startswith(root+"/"):
+                    raise RLEnvironmentError("cross-root or cross-environment joint endpoint")
+                leaf = endpoint[len(root)+1:]
+                if not leaf or "/" in leaf or leaf in (".", ".."):
+                    raise RLEnvironmentError("official joint endpoint is not an exact top-level body")
+                item[key] = leaf
+            normalized.append(item)
+        normalized.sort(key=lambda item: item["name"])
+        if len(roots) != 1 or _fixed_palm_canonical_hash(normalized) != FIXED_PALM_FILTER_GRAPH_SHA256:
+            raise RLEnvironmentError("official full joint graph differs from the pinned fixed-palm topology")
+        reached = {"right_wrist_yaw_link"}
+        while True:
+            expanded = reached | {other for row in normalized if row["type"] == "PhysicsFixedJoint"
+                                  for own, other in ((row["body0"], row["body1"]), (row["body1"], row["body0"]))
+                                  if own in reached and other is not None}
+            if expanded == reached:
+                break
+            reached = expanded
+        adjacent = {other for row in normalized if row["type"] == "PhysicsRevoluteJoint"
+                    for own, other in ((row["body0"], row["body1"]), (row["body1"], row["body0"]))
+                    if own in reached and other is not None and other not in reached}
+        if sorted(reached) != component or sorted(adjacent) != neighbors:
+            raise RLEnvironmentError("fixed-palm component or direct revolute adjacency differs")
+    pairs = sorted({tuple(sorted((a, b))) for a in component for b in component+neighbors if a != b})
+    contract = {"contract_version": "g1_right_wrist_fixed_component_adjacent_pairs_v1",
+                "asset_sha256": FIXED_PALM_FILTER_ASSET_SHA256,
+                "fixed_component": component, "revolute_adjacent_bodies": neighbors,
+                "excluded_body_pairs": [list(pair) for pair in pairs]}
+    if len(pairs) != 15 or _fixed_palm_canonical_hash(contract) != FIXED_PALM_FILTER_CONTRACT_SHA256:
+        raise RLEnvironmentError("fixed-palm allowlist differs from its audited declaration")
+    return {"contract": contract, "source_graph_sha256": FIXED_PALM_FILTER_GRAPH_SHA256,
+            "sha256": FIXED_PALM_FILTER_CONTRACT_SHA256}
+
+
+def fixed_palm_filter_relationships(num_envs):
+    """Exact one-sided USD relationships; USD filtering itself is symmetric."""
+    if type(num_envs) is not int or not 1 <= num_envs <= 512:
+        raise RLEnvironmentError("fixed-palm filtering requires 1..512 environments")
+    pairs = fixed_palm_adjacency_filter_contract()["contract"]["excluded_body_pairs"]
+    expected = {}
+    for env_id in range(num_envs):
+        prefix = "/World/envs/env_"+str(env_id)+"/Robot/"
+        for left, right in pairs:
+            expected.setdefault(prefix+left, []).append(prefix+right)
+    return {path: sorted(targets) for path, targets in sorted(expected.items())}
+
+
+def validate_fixed_palm_filter_relationships(actual, num_envs):
+    """Reject missing, extra, cross-env, Cube/Table, or duplicate filter targets."""
+    expected = fixed_palm_filter_relationships(num_envs)
+    if not isinstance(actual, dict) or set(actual) != set(expected):
+        raise RLEnvironmentError("fixed-palm filtered relationship prim allowlist mismatch")
+    normalized = {}
+    for path, targets in actual.items():
+        if (not isinstance(targets, (list, tuple)) or any(not isinstance(p, str) for p in targets)
+                or len(set(targets)) != len(targets) or sorted(targets) != expected[path]):
+            raise RLEnvironmentError("fixed-palm filtered relationship target allowlist mismatch: "+str(path))
+        normalized[path] = sorted(targets)
+    return {"available": True, "num_envs": num_envs, "excluded_pair_count_per_env": 15,
+            "excluded_pair_count_total": 15*num_envs, "relationships": normalized,
+            "relationships_sha256": _fixed_palm_canonical_hash(normalized)}
+
+
+def readback_fixed_palm_adjacency_filters(stage, usd_physics, num_envs):
+    """Read all env filter APIs and the unchanged global self-collision flags."""
+    actual, self_collisions = {}, {}
+    roots = {"/World/envs/env_"+str(i)+"/Robot": i for i in range(num_envs)}
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if not path.startswith("/World/envs/"):
+            continue
+        if prim.HasAPI(usd_physics.FilteredPairsAPI):
+            actual[path] = [str(target) for target in usd_physics.FilteredPairsAPI(prim).GetFilteredPairsRel().GetTargets()]
+        if prim.HasAPI(usd_physics.ArticulationRootAPI):
+            root = next((root for root in roots if path == root or path.startswith(root+"/")), None)
+            if root is not None:
+                value = prim.GetAttribute("physxArticulation:enabledSelfCollisions").Get()
+                if type(value) is not bool or value is not True or root in self_collisions:
+                    raise RLEnvironmentError("fixed-palm override must preserve one globally self-colliding articulation per env")
+                self_collisions[root] = {"prim_path": path, "enabled_self_collisions": value}
+    if set(self_collisions) != set(roots):
+        raise RLEnvironmentError("fixed-palm override could not read every environment's self-collision setting")
+    result = validate_fixed_palm_filter_relationships(actual, num_envs)
+    result["global_self_collision_readback"] = self_collisions
+    return result
+
+
+def author_fixed_palm_adjacency_filters(stage, usd_physics, num_envs, asset_sha256):
+    """Author the new model on the session stage after clone, before physics.
+
+    Asset bytes, drive gains/limits, material and every other collision pair are
+    untouched. Native report zeros for these pairs mean deliberately filtered,
+    never proof that the authored meshes are disjoint or of a solved grasp.
+    """
+    if asset_sha256 != FIXED_PALM_FILTER_ASSET_SHA256:
+        raise RLEnvironmentError("fixed-palm model override requires the pinned official USD asset")
+    expected = fixed_palm_filter_relationships(num_envs)
+    roots = {"/World/envs/env_"+str(i)+"/Robot": i for i in range(num_envs)}
+    topology = {root: [] for root in roots}
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if path.startswith("/World/envs/") and prim.HasAPI(usd_physics.FilteredPairsAPI):
+            raise RLEnvironmentError("fixed-palm override refuses unexpected preexisting filtered-pair APIs")
+        if not prim.IsA(usd_physics.Joint):
+            continue
+        root = next((root for root in roots if path.startswith(root+"/")), None)
+        if root is None:
+            continue
+        joint = usd_physics.Joint(prim)
+        topology[root].append({"name": prim.GetName(), "type": prim.GetTypeName(), "path": path,
+                               "body0": [str(p) for p in joint.GetBody0Rel().GetTargets()],
+                               "body1": [str(p) for p in joint.GetBody1Rel().GetTargets()],
+                               "physics:jointEnabled": joint.GetJointEnabledAttr().Get(),
+                               "physics:collisionEnabled": joint.GetCollisionEnabledAttr().Get()})
+    # Check every graph and endpoint before authoring even a single exclusion.
+    for rows in topology.values():
+        fixed_palm_adjacency_filter_contract(rows)
+    for path, targets in expected.items():
+        for body in [path]+targets:
+            prim = stage.GetPrimAtPath(body)
+            if not prim.IsValid() or not prim.HasAPI(usd_physics.RigidBodyAPI) or prim.IsInstanceProxy():
+                raise RLEnvironmentError("fixed-palm filtered endpoint is not a writable exact rigid body: "+body)
+    for path, targets in expected.items():
+        api = usd_physics.FilteredPairsAPI.Apply(stage.GetPrimAtPath(path))
+        if not api or not api.CreateFilteredPairsRel().SetTargets(targets):
+            raise RLEnvironmentError("could not author exact fixed-palm filtered relationship: "+path)
+    result = readback_fixed_palm_adjacency_filters(stage, usd_physics, num_envs)
+    result.update({"model_override_version": "g1_right_wrist_fixed_component_adjacent_pairs_v1",
+                   "authoring_phase": "after_clone_before_physics_initialization",
+                   "source_asset_bytes_unchanged": True,
+                   "source_graph_verified_env_count": num_envs,
+                   "source_graph_sha256": FIXED_PALM_FILTER_GRAPH_SHA256,
+                   "interpretation": "explicit fixed-component adjacency collision exclusions; zero pair force is expected filtering, not disjoint geometry"})
+    return result
+
 
 
 def control_probe_profile(profile):
@@ -842,6 +1043,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     if probe_profile is not None and (not eval_mode or output_dir is None or num_envs > 8):
         raise RLEnvironmentError("control diagnostics require standalone evaluation, output and at most eight environments")
     settings = resolve_settings(config)
+    physics_protocol = config["rl_teacher"]["physics_protocol"]
+    if physics_protocol not in (RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY):
+        raise RLEnvironmentError("unsupported explicit RL physics protocol")
+    fixed_palm_model = physics_protocol == RL_PHYSICS_FIXED_PALM_ADJACENCY
     initial = _seed_state(config)
     actuator_specs = _actuator_specifications(initial)
     asset_path = Path(asset_path).resolve()
@@ -852,6 +1057,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     asset_sha = hashlib.sha256(asset_path.read_bytes()).hexdigest()
     asset_audit = audit_asset_manifest(config, asset_path)
     native_official_asset = asset_path.suffix.lower() in (".usd", ".usda", ".usdc")
+    if fixed_palm_model and (not native_official_asset or asset_sha != FIXED_PALM_FILTER_ASSET_SHA256):
+        raise RLEnvironmentError("physics v4 fixed-palm adjacency requires the pinned official native USD")
     if native_official_asset:
         reference = initial.get("official_native_fk_reference")
         if not reference or reference.get("usd_entry_sha256") != asset_sha:
@@ -1255,6 +1462,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 light = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
                 light.func("/World/RLEvaluationLight", light)
             self.scene.clone_environments(copy_from_source=False)
+            if fixed_palm_model:
+                self._fixed_cluster_filter_readback = author_fixed_palm_adjacency_filters(
+                    stage, UsdPhysics, self.num_envs, asset_sha)
             if self.device == "cpu":
                 self.scene.filter_collisions(global_prim_paths=[])
 
@@ -2298,6 +2508,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "original_main_lift_enabled": False,
                     "main_lift_authorized": False,
                     "observation_cameras": [], "in_episode_object_state_writes": 0, "object_attachments": 0}
+            if fixed_palm_model:
+                audit["policy_contract"]["fixed_cluster_collision_filter"] = fixed_palm_adjacency_filter_contract()
+                audit["fixed_cluster_collision_filter_override"] = {
+                    **self._fixed_cluster_filter_readback,
+                    "current_stage_readback": readback_fixed_palm_adjacency_filters(
+                        get_current_stage(), UsdPhysics, self.num_envs)}
+                audit["physics_differences"].append(
+                    "explicit right wrist fixed-component internal and direct revolute-adjacency 15-pair exclusions; all other self-collisions remain enabled")
             if self._control_probe_enabled:
                 audit["policy_contract"]["control_guard_version"] = self._control_probe_profile["control_guard_version"]
                 audit["control_probe_profile"] = dict(self._control_probe_profile)

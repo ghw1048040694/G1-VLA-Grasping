@@ -21,11 +21,11 @@ def fixture():
         root = Path(directory)
         metadata = root / "joint_metadata.json"
         metadata.write_text('{"joint_order":"fixture"}\n')
-        config = {"paths": {"root": str(root)}, "rl_teacher": {"physics_protocol": "fixture-fixed"},
+        config = {"paths": {"root": str(root)}, "rl_teacher": {"physics_protocol": probe._OLD_PHYSICS},
                   "action": {"joint_metadata_path": str(metadata)},
                   "control": {"physics_dt_s": .002, "physics_substeps": 33, "max_anchor_delta_rad": .08},
                   "expert": {"pd": {"effort_limit_nm": 1.4}}}
-        policy = {"observation_dim": 81, "action_dim": 14, "quaternion_order": "xyzw",
+        policy = {"physics_protocol": probe._OLD_PHYSICS, "observation_dim": 81, "action_dim": 14, "quaternion_order": "xyzw",
                   "physics_dt_s": .002, "control_period_s": .066,
                   "action_joint_names": ["right_joint_" + str(i) for i in range(14)],
                   "action_units": "normalized joint target velocity; rad/s after source limit scaling",
@@ -413,6 +413,115 @@ class GeometryPlanTests(unittest.TestCase):
         for key in ("candidate_path", "candidate_sha256", "candidate_id"):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 probe.validate_probe_settings({key: "unexpected"})
+
+
+
+@contextmanager
+def fixed_cluster_fixture():
+    """Synthetic asset pin; real allowlist topology retained, no simulator."""
+    with fixture() as (config, infos, current, manifest, pins):
+        candidate, _, _ = geometry_fixture(config, infos, current, pins)
+        expected = probe._declared_fixed_filter_contract()
+        expected["contract"]["asset_sha256"] = infos["policy_contract"]["asset_sha256"]
+        expected["sha256"] = probe._canonical(expected["contract"])
+        config["rl_diagnostics"].update(profile_plan="geometry_pose_fixed_cluster_v3",
+            backend="g1_control_physics_diagnostics_v3")
+        candidate_sha = config["rl_diagnostics"]["candidate_sha256"]
+        config["rl_teacher"]["physics_protocol"] = probe._FIXED_PHYSICS
+        current["physics_version"] = probe._FIXED_PHYSICS
+        current["policy_contract"].update(physics_protocol=probe._FIXED_PHYSICS,
+            fixed_cluster_collision_filter=copy.deepcopy(expected))
+        current["policy_contract_sha256"] = probe._canonical(current["policy_contract"])
+        with mock.patch.object(probe, "_V3_CANDIDATE_SHA256", candidate_sha), \
+                mock.patch.object(probe, "_declared_fixed_filter_contract", return_value=expected):
+            yield config, infos, current, expected
+
+
+class FixedClusterModelPlanTests(unittest.TestCase):
+    def test_official_expected_contract_is_independent_fifteen_pair_graph_pin(self):
+        expected = probe._declared_fixed_filter_contract()
+        self.assertEqual(expected["sha256"], "04dd990d50f4632012408b13747313a5504614e47a13d05d9540c31ef66fb770")
+        self.assertEqual(probe._canonical(expected["contract"]), expected["sha256"])
+        self.assertEqual(len(expected["contract"]["excluded_body_pairs"]), 15)
+        self.assertEqual(expected["source_graph_sha256"], "1bc9a5d33856280a489137634f3ddcbb84196ef231b6dfa902acbd271eac600c")
+        for pair in expected["contract"]["excluded_body_pairs"]:
+            self.assertEqual(pair, sorted(pair))
+            self.assertFalse(any(x in ("Cube", "Table") or x.startswith("left_") for x in pair))
+        expected["contract"]["excluded_body_pairs"].clear()
+        self.assertEqual(len(probe._declared_fixed_filter_contract()["contract"]["excluded_body_pairs"]), 15)
+
+    def test_v3_preserves_candidate_and_exact_declared_plan(self):
+        v = {"backend": "g1_control_physics_diagnostics_v3", "profile_plan": "geometry_pose_fixed_cluster_v3",
+             "candidate_path": "candidate.json", "candidate_id": "declared", "candidate_sha256": probe._V3_CANDIDATE_SHA256,
+             "guided_target_lead_max_rad": .006, "guided_hand_target_rad": [0.] * 7}
+        result = probe.validate_probe_settings(v)
+        self.assertEqual(result["profiles"], [probe.RL_PROBE_DEFAULTS["profiles"][3]])
+        for field, value in (("candidate_sha256", "0"*64), ("backend", "g1_control_physics_diagnostics_v2"),
+                             ("guided_target_lead_max_rad", .007), ("profiles", probe.RL_PROBE_DEFAULTS["profiles"])):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                probe.validate_probe_settings({**v, field: value})
+
+    def test_exact_new_model_bridge_preserves_true_current_and_old_rest_semantics(self):
+        with fixed_cluster_fixture() as (config, infos, current, expected):
+            before = copy.deepcopy((config, infos, current))
+            result = probe.verify_probe_reference(config, infos, current)
+            self.assertTrue(result["ready_for_physical_probe"])
+            self.assertFalse(result["source_identical_trained_eval"])
+            self.assertTrue(result["physics_model_comparison"]["model_changed"])
+            self.assertEqual(result["physics_model_comparison"]["fixed_cluster_collision_filter"], expected)
+            self.assertEqual(result["current_config_semantic_sha256"], probe._semantic_training_identity(config))
+            self.assertNotEqual(result["current_config_semantic_sha256"], result["reference_training_config_sha256"])
+            self.assertEqual(result["reference_rest_config_comparison_sha256"], result["reference_training_config_sha256"])
+            self.assertEqual(infos["policy_contract"]["physics_protocol"], probe._OLD_PHYSICS)
+            self.assertEqual((config, infos, current), before)
+
+    def test_v3_rejects_unapproved_pairs_hash_graph_asset_or_extra_model_keys(self):
+        for change in ("cube", "graph", "hash", "asset", "extra", "missing"):
+            with self.subTest(change=change), fixed_cluster_fixture() as (config, infos, current, _):
+                declaration = current["policy_contract"]["fixed_cluster_collision_filter"]
+                if change == "cube":
+                    declaration["contract"]["excluded_body_pairs"].append(["Cube", "right_hand_palm_link"])
+                    declaration["sha256"] = probe._canonical(declaration["contract"])
+                elif change == "graph": declaration["source_graph_sha256"] = "0"*64
+                elif change == "hash": declaration["sha256"] = "0"*64
+                elif change == "asset": declaration["contract"]["asset_sha256"] = "0"*64
+                elif change == "extra": declaration["new_unverified_model_override"] = True
+                else: del current["policy_contract"]["fixed_cluster_collision_filter"]
+                current["policy_contract_sha256"] = probe._canonical(current["policy_contract"])
+                with self.assertRaisesRegex(ValueError, "fixed-cluster"):
+                    probe.verify_probe_reference(config, infos, current)
+
+    def test_declared_model_delta_does_not_allow_PD_obs_reward_or_other_config_changes(self):
+        for change in ("pd", "obs", "reward", "unknown", "config_anchor", "config_pd"):
+            with self.subTest(change=change), fixed_cluster_fixture() as (config, infos, current, _):
+                if change == "pd": current["policy_contract"]["actual_pd_specifications"]["joint"]["kp"] += 1
+                elif change == "obs": current["policy_contract"]["observation_dim"] = 82
+                elif change == "reward": current["policy_contract"]["resolved_settings"]["reward_dropped"] = True
+                elif change == "unknown": current["policy_contract"]["allow_extra_collisions"] = True
+                elif change == "config_anchor": config["control"]["max_anchor_delta_rad"] = 1.
+                else: config["expert"]["pd"]["effort_limit_nm"] = 9.
+                current["policy_contract_sha256"] = probe._canonical(current["policy_contract"])
+                with self.assertRaises(ValueError): probe.verify_probe_reference(config, infos, current)
+
+    def test_old_plans_cannot_admit_new_model_and_v3_cannot_claim_old_actual_physics(self):
+        for change in ("v3_oldconfig", "v3_oldpolicy", "v3_oldtop", "v2_newphysics", "v2_extra_filter"):
+            with self.subTest(change=change), fixed_cluster_fixture() as (config, infos, current, _):
+                if change == "v3_oldconfig": config["rl_teacher"]["physics_protocol"] = probe._OLD_PHYSICS
+                elif change == "v3_oldpolicy": current["policy_contract"]["physics_protocol"] = probe._OLD_PHYSICS
+                elif change == "v3_oldtop": current["physics_version"] = probe._OLD_PHYSICS
+                else:
+                    config["rl_diagnostics"].update(profile_plan="geometry_pose_only_v2", backend="g1_control_physics_diagnostics_v2")
+                    if change == "v2_extra_filter":
+                        config["rl_teacher"]["physics_protocol"] = probe._OLD_PHYSICS
+                        current["policy_contract"]["physics_protocol"] = probe._OLD_PHYSICS
+                current["policy_contract_sha256"] = probe._canonical(current["policy_contract"])
+                with self.assertRaises(ValueError): probe.verify_probe_reference(config, infos, current)
+
+    def test_old_checkpoint_metadata_cannot_be_rewritten_as_trained_on_new_physics(self):
+        with fixed_cluster_fixture() as (config, infos, current, _):
+            infos["policy_contract"]["physics_protocol"] = probe._FIXED_PHYSICS
+            with self.assertRaisesRegex(ValueError, "metadata"):
+                probe.verify_probe_reference(config, infos, current)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@ import unittest
 
 from g1_vla.config import validate_config
 from g1_vla.contracts import ActionContract
-from g1_vla.rl_protocol import RL_TEACHER_DEFAULTS, file_hash, validate_rl_settings, verify_rl_assets
+from g1_vla.rl_protocol import (RL_TEACHER_DEFAULTS, RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY,
+                                file_hash, validate_rl_settings, verify_rl_assets)
 from g1_vla.rl_teacher import windows_to_wsl, _smoke_admission
 
 
@@ -14,6 +15,20 @@ PROJECT = Path(__file__).resolve().parents[1]
 
 
 class RLProtocolTests(unittest.TestCase):
+    def test_explicit_fixed_palm_v4_model_is_supported_but_default_retains_v3(self):
+        self.assertEqual(RL_TEACHER_DEFAULTS["physics_protocol"], RL_PHYSICS)
+        self.assertEqual(RL_PHYSICS, "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v3")
+        self.assertEqual(RL_PHYSICS_FIXED_PALM_ADJACENCY,
+                         "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v4_fixed_palm_adjacency")
+        for physics in (RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY):
+            config = copy.deepcopy(RL_TEACHER_DEFAULTS)
+            config["physics_protocol"] = physics
+            validate_rl_settings(config)
+            self.assertEqual(config["physics_protocol"], physics)
+        config["physics_protocol"] += "_unknown"
+        with self.assertRaises(ValueError):
+            validate_rl_settings(config)
+
     def test_legacy_config_is_readable_without_enabling_RL_or_mutating_its_caller(self):
         config = json.loads((PROJECT / "configs/experiment.json").read_text())
         config.pop("rl_teacher")

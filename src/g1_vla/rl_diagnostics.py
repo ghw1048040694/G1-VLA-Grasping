@@ -23,7 +23,7 @@ from pathlib import Path
 from .rl_probe_protocol import validate_probe_settings, verify_probe_reference
 
 
-DIAGNOSTIC_VERSION = "g1_frozen_actor_opposing_closure_control_v2"
+DIAGNOSTIC_VERSION = "g1_frozen_actor_opposing_closure_control_v3"
 POSE_SERVO = {"position_gain_per_s": 4.0, "orientation_gain_per_s": 2.0,
               "dls_regularizer": 0.02, "position_speed_max_m_s": 0.01,
               "angular_speed_max_rad_s": 0.1,
@@ -101,7 +101,7 @@ class GuidedClosure:
         self.rotation = state["palm_quaternion_xyzw"].clone()
         self.ready_count = torch.zeros_like(self.ids)
         self.probe = torch.zeros_like(q[:, 0])
-        self.staged = settings.get("profile_plan") == "geometry_pose_only_v2"
+        self.staged = settings.get("profile_plan") in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3")
         if self.staged:
             if candidate is None:
                 raise ValueError("Staged closure requires its verified geometry candidate")
@@ -261,7 +261,7 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     reference = verify_probe_reference(cfg, checkpoint_infos=saved_infos, current_audit=audit)
     if not reference["ready_for_physical_probe"]:
         raise ValueError("Frozen actor diagnostic bridge did not admit physical execution")
-    if settings.get("profile_plan") == "geometry_pose_only_v2":
+    if settings.get("profile_plan") in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3"):
         load = audit.get("diagnostic_native_joint_load_readback", {})
         pair = audit.get("diagnostic_native_self_pair_readback", {})
         if (load.get("binding", {}).get("verified") is not True or
@@ -272,7 +272,7 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     before = module_state_sha256(actor, torch)
     initial_hand = [audit["initial_state"]["joint_positions_rad"][name] for name in RIGHT_HAND]
     candidate = None
-    if settings.get("profile_plan") == "geometry_pose_only_v2":
+    if settings.get("profile_plan") in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3"):
         payload = Path(settings["candidate_path"]).read_bytes()
         if hashlib.sha256(payload).hexdigest() != settings["candidate_sha256"]:
             raise ValueError("Geometry candidate changed after native reference verification")

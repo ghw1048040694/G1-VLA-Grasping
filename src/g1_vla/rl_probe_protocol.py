@@ -31,7 +31,12 @@ _PROFILES = [
     {"name": "guided_hand_pose_hold", "action_source": "guided_hand_pose_hold", "control_guard_version": "box_halfspace_projected_v2"},
 ]
 _PLANS = {"four_way_v1": ("g1_control_physics_diagnostics_v1", _PROFILES),
-          "geometry_pose_only_v2": ("g1_control_physics_diagnostics_v2", [_PROFILES[3]])}
+          "geometry_pose_only_v2": ("g1_control_physics_diagnostics_v2", [_PROFILES[3]]),
+          "geometry_pose_fixed_cluster_v3": ("g1_control_physics_diagnostics_v3", [_PROFILES[3]])}
+_OLD_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v3"
+_FIXED_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v4_fixed_palm_adjacency"
+_V3_CANDIDATE_SHA256 = "09ee1ae234ab143076c514273d1105b1ee3a939cb7c349a5e3a40901a765e81f"
+
 _HAND_JOINT_ORDER = ["right_hand_" + x + "_joint" for x in
     ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1", "middle_0", "middle_1")]
 
@@ -115,7 +120,7 @@ def validate_probe_settings(value):
         raise ValueError("Diagnostics require exactly the declared profile_plan action/guard profiles in order")
     lead = result["guided_target_lead_max_rad"]
     if ((plan == "four_way_v1" and lead is not None) or
-            (plan == "geometry_pose_only_v2" and (type(lead) not in (int, float) or lead != .006))):
+            (plan in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3") and (type(lead) not in (int, float) or lead != .006))):
         raise ValueError("Diagnostic plan pins guided_target_lead_max_rad: None forv1, .006 forv2")
     if plan == "four_way_v1":
         if (result["candidate_path"] is not None or
@@ -126,7 +131,9 @@ def validate_probe_settings(value):
         if (not isinstance(path, str) or not path or ".." in path.replace("\\", "/").split("/") or
                 not _is_sha(result["candidate_sha256"]) or
                 not isinstance(result["candidate_id"], str) or not result["candidate_id"].strip()):
-            raise ValueError("geometry_pose_only_v2 requires explicit candidate path/SHA256/ID")
+            raise ValueError("Geometry diagnostic plan requires explicit candidate path/SHA256/ID")
+        if plan == "geometry_pose_fixed_cluster_v3" and result["candidate_sha256"] != _V3_CANDIDATE_SHA256:
+            raise ValueError("Fixed-cluster model comparison must preserve the pinned geometry candidate")
     for key, limit in (("max_wall_time_s", 3600), ("guided_closure_ramp_s", 6)):
         number = result[key]
         if type(number) not in (int, float) or not math.isfinite(number) or not 0 < number <= limit:
@@ -216,6 +223,98 @@ def _current_source_identity():
     root = Path(__file__).resolve().parent
     return _canonical({str(path.relative_to(root)): _file_hash(path) for path in sorted(root.rglob("*.py"))})
 
+
+
+
+def _declared_fixed_filter_contract():
+    """Independent fixed expected model declaration, never from current audit.
+
+    Native factory must separately verify the actual55-joint pinned USD graph
+    before applying this15-pair allowlist. This function does not apply physics.
+    """
+    contract = {
+    "contract_version": "g1_right_wrist_fixed_component_adjacent_pairs_v1",
+    "asset_sha256": "d23b9bbc8b59cf20fa1983f55874f855a76e038b9e22eae39542e62be5b4ba3d",
+    "fixed_component": [
+        "right_hand_camera_base_link",
+        "right_hand_palm_link",
+        "right_wrist_yaw_link"
+    ],
+    "revolute_adjacent_bodies": [
+        "right_hand_index_0_link",
+        "right_hand_middle_0_link",
+        "right_hand_thumb_0_link",
+        "right_wrist_pitch_link"
+    ],
+    "excluded_body_pairs": [
+        [
+            "right_hand_camera_base_link",
+            "right_hand_index_0_link"
+        ],
+        [
+            "right_hand_camera_base_link",
+            "right_hand_middle_0_link"
+        ],
+        [
+            "right_hand_camera_base_link",
+            "right_hand_palm_link"
+        ],
+        [
+            "right_hand_camera_base_link",
+            "right_hand_thumb_0_link"
+        ],
+        [
+            "right_hand_camera_base_link",
+            "right_wrist_pitch_link"
+        ],
+        [
+            "right_hand_camera_base_link",
+            "right_wrist_yaw_link"
+        ],
+        [
+            "right_hand_index_0_link",
+            "right_hand_palm_link"
+        ],
+        [
+            "right_hand_index_0_link",
+            "right_wrist_yaw_link"
+        ],
+        [
+            "right_hand_middle_0_link",
+            "right_hand_palm_link"
+        ],
+        [
+            "right_hand_middle_0_link",
+            "right_wrist_yaw_link"
+        ],
+        [
+            "right_hand_palm_link",
+            "right_hand_thumb_0_link"
+        ],
+        [
+            "right_hand_palm_link",
+            "right_wrist_pitch_link"
+        ],
+        [
+            "right_hand_palm_link",
+            "right_wrist_yaw_link"
+        ],
+        [
+            "right_hand_thumb_0_link",
+            "right_wrist_yaw_link"
+        ],
+        [
+            "right_wrist_pitch_link",
+            "right_wrist_yaw_link"
+        ]
+    ]
+}
+    digest = _canonical(contract)
+    if digest != "04dd990d50f4632012408b13747313a5504614e47a13d05d9540c31ef66fb770":
+        raise ValueError("Pinned fixed-cluster collision declaration changed")
+    return {"contract": contract,
+        "source_graph_sha256": "1bc9a5d33856280a489137634f3ddcbb84196ef231b6dfa902acbd271eac600c",
+        "sha256": digest}
 
 
 def _finite_vector(value, length, description):
@@ -367,9 +466,22 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
             len(set(policy.get("action_joint_names", []))) != 14):
         raise ValueError("Source actor observation/action/cadence ABI is invalid")
     candidate_path, candidate = _verify_geometry_candidate(config, settings, policy, reference)
-    semantic_sha = _semantic_training_identity(config)
+    current_semantic_sha = _semantic_training_identity(config)
+    fixed_model = settings["profile_plan"] == "geometry_pose_fixed_cluster_v3"
+    expected_physics = _FIXED_PHYSICS if fixed_model else _OLD_PHYSICS
+    if policy.get("physics_protocol") != _OLD_PHYSICS or config["rl_teacher"].get("physics_protocol") != expected_physics:
+        raise ValueError("Diagnostic plan must use its exact old-v3 or declared new-v4 physics model")
+    # Preserve the actual new-v4 identity above. Only this exact approved
+    # physics field is restored in a copy to verify all remaining old config.
+    comparison_config = copy.deepcopy(config)
+    if fixed_model:
+        comparison_config["rl_teacher"]["physics_protocol"] = policy["physics_protocol"]
+    semantic_sha = _semantic_training_identity(comparison_config)
     if semantic_sha != settings["reference_training_config_sha256"]:
-        raise ValueError("Source-policy config/control/expert/asset semantics changed; a diagnostic guard is the only allowed change")
+        raise ValueError("Source-policy config/control/expert/asset semantics changed beyond the declared model difference")
+    model_declaration = _declared_fixed_filter_contract() if fixed_model else None
+    if model_declaration and model_declaration["contract"]["asset_sha256"] != policy["asset_sha256"]:
+        raise ValueError("Fixed-cluster model declaration does not match the pinned original asset")
     metadata_verified = checkpoint_infos is not None
     if metadata_verified:
         if not isinstance(checkpoint_infos, dict):
@@ -392,6 +504,15 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
         guard = actual.pop("control_guard_version", None)
         if guard not in {profile["control_guard_version"] for profile in settings["profiles"]}:
             raise ValueError("Current diagnostic control_guard_version is not explicitly declared")
+        if fixed_model:
+            if (actual.get("physics_protocol") != _FIXED_PHYSICS or
+                    current_audit.get("physics_version") != _FIXED_PHYSICS or
+                    actual.get("fixed_cluster_collision_filter") != model_declaration):
+                raise ValueError("Current fixed-cluster physics/filter declaration is not exactly the pinned model")
+            # This is not an arbitrary pop/allow_source_mismatch: exact new
+            # contract verified first, and every remaining field stays strict.
+            del actual["fixed_cluster_collision_filter"]
+            actual["physics_protocol"] = policy["physics_protocol"]
         if actual != policy:
             raise ValueError("Unexpected environment/observation/action/physics/PD/reset change in the diagnostic contract")
         if current_audit.get("policy_contract_sha256") != _canonical(current_audit["policy_contract"]):
@@ -409,6 +530,16 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
         "reference_policy_contract_sha256": settings["reference_policy_contract_sha256"],
         "reference_checkpoint_sha256": settings["reference_checkpoint_sha256"],
         "current_source_tree_sha256": current_sha, "control_guard_version": guard,
+        "current_config_semantic_sha256": current_semantic_sha,
+        "reference_rest_config_comparison_sha256": semantic_sha,
+        "physics_model_comparison": {
+            "old_checkpoint_physics_protocol": policy["physics_protocol"],
+            "current_declared_physics_protocol": expected_physics,
+            "old_policy_contract_sha256": settings["reference_policy_contract_sha256"],
+            "model_changed": fixed_model, "fixed_cluster_collision_filter": model_declaration,
+            "old_physics_restored_only_for_rest_config_comparison": fixed_model,
+            "scope": "explicit new-model counterfactual; no old-trained-environment equivalence" if fixed_model else
+                     "original physics retained; control-only counterfactual"},
         "reference_files": [str(manifest_path), str(audit_path), str(checkpoint)] +
             ([str(candidate_path)] if candidate_path is not None else []),
         "scope": "frozen actor counterfactual control diagnostics; no new training or original20 acceptance"}
