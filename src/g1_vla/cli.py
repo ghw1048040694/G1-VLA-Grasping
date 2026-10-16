@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "labels-audit", "teacher-smoke", "teacher", "teacher-focus", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "constant-residual", "normalization-check", "normalization-train", "state-conditioning", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "labels-audit", "teacher-smoke", "teacher", "teacher-focus", "contact-calibration", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "constant-residual", "normalization-check", "normalization-train", "state-conditioning", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -68,6 +68,11 @@ def _protection(inventory):
 
 def execute_stage(stage, config, run):
     report = readiness(config)
+    if stage == "contact-calibration":
+        from .contact_calibration import run_contact_calibration
+        result = run_contact_calibration(config, run.path)
+        report.update(stage=stage, contact_calibration=result, training_started=False, optimizer_steps=0)
+        return report, result.get("passed") is True
     if stage == "state-conditioning":
         from .state_conditioning import run_state_conditioning_audit
         result = run_state_conditioning_audit(config, run.path)

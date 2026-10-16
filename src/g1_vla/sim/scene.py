@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from ..control import FIXED_BASE_EQUALITY
+from ..config import NOSLIP10_CONTACT_BACKEND, NOSLIP10_SOLVER
 
 
 class SceneError(ValueError):
@@ -465,7 +466,7 @@ def _apply_contact_model(root, settings):
     if not isinstance(settings, dict) or set(settings) != {"backend", "time_constant_s", "damping_ratio"}:
         raise SceneError("contact_model requires backend, time_constant_s and damping_ratio")
     backend, time_constant, ratio = settings["backend"], settings["time_constant_s"], settings["damping_ratio"]
-    if (backend not in ("source_default_v1", "right_hand_green_compliance_v2")
+    if (backend not in ("source_default_v1", "right_hand_green_compliance_v2", NOSLIP10_CONTACT_BACKEND)
             or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
                    for value in (time_constant, ratio)) or time_constant <= 0 or ratio != 1.):
         raise SceneError("unsupported contact model or noncritical/nonfinite solver reference")
@@ -476,6 +477,19 @@ def _apply_contact_model(root, settings):
             raise SceneError("source_default_v1 preserves solref 0.02 1")
         return {"backend": backend, "solref": [.02, 1.], "explicit_pairs": [],
                 "scope": "original dynamic geom mixing; XML unchanged"}
+    if backend == NOSLIP10_CONTACT_BACKEND:
+        if time_constant != .02:
+            raise SceneError("Noslip version preserves solref 0.02 1")
+        if option is None:
+            option = ET.SubElement(root, "option")
+        # Do not silently replace a pre-existing nonbaseline solver. The
+        # compiled runtime check also verifies every pinned numeric option.
+        if int(option.get("noslip_iterations", "0")) != 0:
+            raise SceneError("Noslip candidate requires the original zero-iteration source")
+        option.set("noslip_iterations", "10")
+        return {"backend": backend, "solref": [.02, 1.], "explicit_pairs": [],
+                "scope": "global friction postprocessor, all original geoms and materials unchanged",
+                "solver": dict(NOSLIP10_SOLVER), "requires_separate_calibration_and_teacher_acceptance": True}
     if not math.isfinite(timestep) or timestep <= 0 or time_constant < 3. * timestep:
         raise SceneError("compliance candidate time constant must be at least three physics timesteps")
     if root.find("default") is not None:
@@ -652,3 +666,17 @@ def build_scene(source: Path, destination: Path, positions: Mapping[str, Sequenc
         manifest["scene_protocol"] = scene_protocol_for_contact_model(contact_model)
         manifest["contact_model"] = contact_manifest
     return manifest
+
+
+def verify_contact_solver(model, settings, mujoco_api):
+    """Fail closed if the versioned task solver differs after XML compilation."""
+    if not settings or settings.get("backend") != NOSLIP10_CONTACT_BACKEND:
+        return None
+    actual = {"mujoco_version": mujoco_api.__version__}
+    for key, expected in NOSLIP10_SOLVER.items():
+        if key != "mujoco_version":
+            value = getattr(model.opt, key)
+            actual[key] = int(value) if isinstance(expected, int) else float(value)
+    if actual != NOSLIP10_SOLVER or float(model.opt.timestep) != .002:
+        raise SceneError("compiled solver differs from the explicit Noslip10 G1 protocol: " + repr(actual))
+    return actual

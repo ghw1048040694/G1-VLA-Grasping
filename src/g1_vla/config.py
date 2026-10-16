@@ -15,6 +15,86 @@ class ConfigError(ValueError):
     """Configuration cannot be used without correction."""
 
 
+NOSLIP10_CONTACT_BACKEND = "source_default_noslip10_v1"
+# This version changes the global friction postprocessor only. It is a new
+# simulation protocol, not a calibration of material or hardware parameters.
+NOSLIP10_SOLVER = {
+    "mujoco_version": "3.2.5", "cone": 0, "solver": 2, "integrator": 0,
+    "iterations": 100, "tolerance": 1e-8, "impratio": 1.0,
+    "noslip_iterations": 10, "noslip_tolerance": 1e-6,
+}
+
+
+# Fixed, predeclared benchmark protocol. Altering this declaration requires a
+# new fixture version and separate evidence; it never scores a G1 task.
+CONTACT_CALIBRATION_DEFAULTS = {'backend': 'opposed_capsule_free_cube_v2',
+ 'solver_backends': ['source_default_v1', 'source_default_noslip10_v1'],
+ 'physics_timesteps_s': [0.002, 0.001],
+ 'cube_side_m': 0.05,
+ 'cube_mass_kg': 0.08,
+ 'cube_center_z_m': 0.25,
+ 'capsule_radius_m': 0.014,
+ 'capsule_half_length_m': 0.012,
+ 'capsule_center_x_m': 0.0375,
+ 'condim': 3,
+ 'friction': [2.2, 0.05, 0.005],
+ 'cube_friction': [1.4, 0.03, 0.003],
+ 'solref': [0.02, 1.0],
+ 'solimp': [0.9, 0.95, 0.001, 0.5, 2.0],
+ 'hold_s': 1.0,
+ 'disturbance_duration_s': 0.1,
+ 'disturbance_peak_weight_fraction': 0.1,
+ 'recovery_s': 0.5,
+ 'opening_duration_s': 0.1,
+ 'opening_distance_m': 0.02,
+ 'opening_curve': 'smoothstep',
+ 'free_fall_s': 0.08,
+ 'video_period_s': 0.02,
+ 'acceptance': {'hold_every_sample_in_final_half_second': {'global_initial_COM_displacement_max_m': 0.001,
+                                                           'raw_SO3_rotation_max_rad': 0.02,
+                                                           'COM_speed_max_m_s': 0.002,
+                                                           'angular_speed_max_rad_s': 0.05,
+                                                           'each_jaw_loaded_Fn_min_n': 0.02,
+                                                           'each_jaw_Fn_max_n': 1.5,
+                                                           'hand_world_Fz_weight_ratio': [0.98,
+                                                                                          1.02],
+                                                           'floor_other_loaded_contacts': 0,
+                                                           'floor_other_load_force_n_max': 1e-06,
+                                                           'all_jaw_penetration_max_m': 0.003},
+                'perturb_and_recovery': {'global_initial_COM_displacement_max_m': 0.003,
+                                         'global_raw_SO3_max_rad': 0.05,
+                                         'all_jaw_penetration_max_m': 0.003,
+                                         'each_jaw_Fn_max_n': 1.5,
+                                         'recovery_final_window_s': 0.198,
+                                         'recovery_pose_error_vs_fixed_pre_pulse_pose_m_max': 0.001,
+                                         'recovery_raw_rotation_error_rad_max': 0.02,
+                                         'recovery_speed_max_m_s': 0.002,
+                                         'recovery_omega_max_rad_s': 0.05,
+                                         'recovery_Fz_weight_ratio': [0.98, 1.02],
+                                         'recovery_both_jaws_loaded': True,
+                                         'floor_other_loads_zero': True},
+                'release_and_free_fall': {'all_jaw_geometric_contacts': 0,
+                                          'all_jaw_force_abs_max_n': 1e-06,
+                                          'all_external_test_loads': 0,
+                                          'floor_contacts': 0,
+                                          'COM_vertical_prediction_error_max_m': 0.0001,
+                                          'vertical_velocity_prediction_error_max_m_s': 0.001,
+                                          'observation_duration_s': 0.08},
+                'safety_and_completeness': {'finite_state_and_forces': True,
+                                            'no_solver_warnings': True,
+                                            'raw_all_steps_present': True,
+                                            'actual_time_cadence_exact': True,
+                                            'no_cube_state_or_constraint_modification': True,
+                                            'all_phase_results_retained': True}},
+ 'convergence': {'both_timesteps_independently_pass_candidate_required': True,
+                 'stable_score_windows': {'maximum_COM_difference_m': 0.00025,
+                                          'maximum_raw_SO3_difference_rad': 0.005,
+                                          'mean_hand_Fz_difference_n_max': 0.015696},
+                 'entire_trial': {'maximum_COM_difference_m': 0.002,
+                                  'maximum_raw_SO3_difference_rad': 0.02,
+                                  'first_contact_load_transition_time_difference_max_s': 0.01}}}
+
+
 def _error(path: str, message: str) -> None:
     raise ConfigError("{}: {}".format(path, message))
 
@@ -199,7 +279,27 @@ def _object(value: Any, schema: Dict[str, Any], path: str) -> None:
             validator(value[key], child_path)
 
 
+def _pinned_calibration(value, path):
+    def check(actual, expected, where):
+        if type(actual) is not type(expected):
+            _error(where, "type differs from the versioned calibration protocol")
+        if isinstance(expected, dict):
+            if set(actual) != set(expected):
+                _error(where, "keys differ from the versioned calibration protocol")
+            for key in expected:
+                check(actual[key], expected[key], where + "." + key)
+        elif isinstance(expected, list):
+            if len(actual) != len(expected):
+                _error(where, "length differs from the versioned calibration protocol")
+            for index, (a, e) in enumerate(zip(actual, expected)):
+                check(a, e, where + "[" + str(index) + "]")
+        elif actual != expected:
+            _error(where, "differs from the predeclared calibration protocol; use a new version")
+    check(value, CONTACT_CALIBRATION_DEFAULTS, path)
+
+
 SCHEMA = {
+    "contact_calibration": _pinned_calibration,
     "schema_version": _literal(1),
     "paths": {"root": _text},
     "task": {
@@ -211,7 +311,7 @@ SCHEMA = {
         "fixed_stance": _literal(True), "assisted_grasp": _literal(False),
         "seed": _integer,
         "contact_model": {
-            "backend": _choice("source_default_v1", "right_hand_green_compliance_v2"),
+            "backend": _choice("source_default_v1", "right_hand_green_compliance_v2", NOSLIP10_CONTACT_BACKEND),
             "time_constant_s": _positive, "damping_ratio": _literal(1.0),
         },
     },
@@ -511,6 +611,9 @@ OBSERVATION_FIELDS = frozenset({
 
 def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Reject unknown keys, unsafe preparation settings and inconsistent units."""
+    # Saved pre-calibration configs remain readable with explicit baseline defaults.
+    if isinstance(config, dict) and "contact_calibration" not in config:
+        config = {**config, "contact_calibration": copy.deepcopy(CONTACT_CALIBRATION_DEFAULTS)}
     _object(config, SCHEMA, "config")
     unknown_fields = set(config["observation"]["fields"]) - OBSERVATION_FIELDS
     if unknown_fields:
@@ -572,8 +675,8 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
             teacher["profile"] != "green_right_cartesian_feedback_v4"
             or hand_control["backend"] != "fixed_closure_v1"
             or config["expert"]["lift_start"]["backend"] != "original_progress_v1"
-            or config["scene"]["contact_model"]["backend"] != "source_default_v1"):
-        _error("config.expert.opposition", "opposition design retains the original physical model and sole declared closure controller")
+            or config["scene"]["contact_model"]["backend"] not in ("source_default_v1", NOSLIP10_CONTACT_BACKEND)):
+        _error("config.expert.opposition", "opposition requires original material parameters and its sole declared closure controller")
     lift_start = config["expert"]["lift_start"]
     if lift_start["progress_scale"] <= 0:
         _error("config.expert.lift_start", "progress scale must be positive and at most one")
@@ -582,8 +685,10 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
                  or hand_control["backend"] != "contact_normal_position_v2")):
         _error("config.expert.lift_start", "slow start requires the actual Cartesian grip and contact controller")
     contact_model = config["scene"]["contact_model"]
-    if contact_model["backend"] == "source_default_v1" and contact_model["time_constant_s"] != .02:
+    if contact_model["backend"] in ("source_default_v1", NOSLIP10_CONTACT_BACKEND) and contact_model["time_constant_s"] != .02:
         _error("config.scene.contact_model", "source default has the original 0.02 second reference")
+    if contact_model["backend"] == NOSLIP10_CONTACT_BACKEND and control["physics_dt_s"] != .002:
+        _error("config.scene.contact_model", "versioned G1 Noslip protocol retains the original 2ms task timestep")
     if (contact_model["backend"] == "right_hand_green_compliance_v2"
             and (control["physics_dt_s"] is None
                  or contact_model["time_constant_s"] < 3 * control["physics_dt_s"])):

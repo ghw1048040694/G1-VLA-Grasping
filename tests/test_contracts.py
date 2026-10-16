@@ -5,6 +5,7 @@ import json
 import math
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from g1_vla.config import ConfigError, load_config, validate_config
@@ -35,6 +36,40 @@ def contract_fixture():
 
 
 class ConfigTests(unittest.TestCase):
+    def test_noslip_version_changes_only_scene_identity_and_preserves_older_config(self):
+        config = config_fixture()
+        original = ActionContract.from_config(config, metadata=source_metadata())
+        legacy = copy.deepcopy(config)
+        del legacy["contact_calibration"]
+        self.assertEqual(original.contract_sha256, ActionContract.from_config(legacy, metadata=source_metadata()).contract_sha256)
+        self.assertNotIn("contact_calibration", legacy)  # validation has no caller mutation
+        config["scene"]["contact_model"]["backend"] = "source_default_noslip10_v1"
+        candidate = ActionContract.from_config(config, metadata=source_metadata())
+        self.assertNotEqual(candidate.contract_sha256, original.contract_sha256)
+        a, b = original.metadata(), candidate.metadata()
+        self.assertNotEqual(a.pop("scene_protocol"), b.pop("scene_protocol"))
+        self.assertEqual(a, b)
+        with self.assertRaises(ContractError):
+            replace(candidate, scene_protocol="g1_strict_scene_source_default_noslip10_v1_" + "0" * 64)
+        config["scene"]["contact_model"]["time_constant_s"] = .006
+        with self.assertRaises(ConfigError):
+            validate_config(config)
+
+    def test_calibration_protocol_is_predeclared_without_nested_boolean_or_parameter_overrides(self):
+        for mutation in ("friction", "nested_bool", "threshold", "unknown"):
+            config = config_fixture()
+            block = config["contact_calibration"]
+            if mutation == "friction":
+                block["friction"][0] += .1
+            elif mutation == "nested_bool":
+                block["solref"][1] = True
+            elif mutation == "threshold":
+                block["acceptance"]["hold_every_sample_in_final_half_second"]["global_initial_COM_displacement_max_m"] = .01
+            else:
+                block["silent_best_of_trials"] = True
+            with self.subTest(mutation=mutation), self.assertRaises(ConfigError):
+                validate_config(config)
+
     def test_opposition_settings_cannot_silently_change_source_physics_or_closure_clock(self):
         config = config_fixture()
         config["expert"]["opposition"]["backend"] = "side_opposition_preload_v1"
@@ -428,6 +463,12 @@ class CheckpointTests(unittest.TestCase):
         for index, (metadata, vocabulary, stats) in enumerate(cases):
             with self.subTest(case=index), self.assertRaisesRegex(ContractError, "mismatch"):
                 validate_checkpoint_metadata(metadata, self.contract, vocabulary, stats, observation_spec=self.spec)
+
+    def test_original_checkpoint_cannot_cross_the_versioned_global_friction_solver(self):
+        candidate = replace(self.contract, scene_protocol=scene_protocol_for_contact_model({
+            "backend": "source_default_noslip10_v1", "time_constant_s": .02, "damping_ratio": 1.}))
+        with self.assertRaises(ContractError):
+            validate_checkpoint_metadata(self.metadata, candidate, self.vocabulary, self.stats, observation_spec=self.spec)
 
     def test_missing_metadata_and_boolean_schema_rejected(self):
         with self.assertRaisesRegex(ContractError, "envelope"):

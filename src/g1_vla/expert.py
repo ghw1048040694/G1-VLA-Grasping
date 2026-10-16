@@ -602,6 +602,10 @@ def run_teacher_episode(config, spec, run_dir):
                                       preserve_source_camera=False, include_blue_box=False,
                                       contact_model=config["scene"].get("contact_model"))
         model = api.MjModel.from_xml_path(report["scene"]["scene"])
+        from .sim.scene import verify_contact_solver
+        solver_identity = verify_contact_solver(model, config["scene"].get("contact_model"), api)
+        if solver_identity is not None:
+            report["scene"]["compiled_solver"] = solver_identity
         data, workspace = api.MjData(model), api.MjData(model)
         api.mj_forward(model, data)
         workspace.qpos[:] = data.qpos

@@ -16,7 +16,8 @@ from g1_vla.control import (
     action_joint_bindings, apply_regularized_dynamics, controlled_joints,
     map_action_targets, pd_torque, unitree_gains,
 )
-from g1_vla.sim.scene import SceneError, build_scene, migrate_actuator_force_ranges
+from g1_vla.sim.scene import SceneError, build_scene, migrate_actuator_force_ranges, verify_contact_solver
+from g1_vla.config import NOSLIP10_SOLVER
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -215,6 +216,40 @@ class SceneTests(unittest.TestCase):
             self.assertEqual(second["scene_protocol"], first["scene_protocol"])
             self.assertNotIn("contact_model", first)
             self.assertEqual(second["contact_model"]["explicit_pairs"], [])
+
+    def test_noslip_candidate_xml_diff_is_one_global_option_only(self):
+        source = PROJECT / "resources" / "g1_warehouse_pregrasp.xml"
+        before = source.read_bytes()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = {"backend": "source_default_noslip10_v1", "time_constant_s": .02, "damping_ratio": 1.}
+            baseline = build_scene(source, root / "baseline.xml", {"green_cube": [.36, -.1, .795]}, run_dir=root)
+            candidate = build_scene(source, root / "candidate.xml", {"green_cube": [.36, -.1, .795]}, run_dir=root, contact_model=settings)
+            tree = ET.parse(root / "candidate.xml").getroot()
+            self.assertEqual(tree.find("option").attrib.pop("noslip_iterations"), "10")
+            if ET.parse(root / "baseline.xml").getroot().find("option") is None:
+                self.assertEqual(len(tree.find("option")), 0)
+                self.assertEqual(tree.find("option").attrib, {})
+                tree.remove(tree.find("option"))
+            self.assertEqual(ET.tostring(tree), (root / "baseline.xml").read_bytes())
+            self.assertEqual(candidate["contact_model"]["explicit_pairs"], [])
+            self.assertIn("global", candidate["contact_model"]["scope"])
+            self.assertNotEqual(candidate["scene_protocol"], baseline["scene_protocol"])
+            self.assertEqual(candidate["actuator_force_transfers"], baseline["actuator_force_transfers"])
+        self.assertEqual(source.read_bytes(), before)
+
+    def test_versioned_solver_rejects_wrong_compiled_parameters_and_engine(self):
+        settings = {"backend": "source_default_noslip10_v1", "time_constant_s": .02, "damping_ratio": 1.}
+        values = {k: v for k, v in NOSLIP10_SOLVER.items() if k != "mujoco_version"}
+        values["timestep"] = .002
+        api = SimpleNamespace(__version__="3.2.5")
+        self.assertEqual(verify_contact_solver(SimpleNamespace(opt=SimpleNamespace(**values)), settings, api), NOSLIP10_SOLVER)
+        for key, value in (("noslip_iterations", 0), ("impratio", 2.), ("timestep", .001)):
+            changed = dict(values, **{key: value})
+            with self.subTest(key=key), self.assertRaises(SceneError):
+                verify_contact_solver(SimpleNamespace(opt=SimpleNamespace(**changed)), settings, api)
+        with self.assertRaises(SceneError):
+            verify_contact_solver(SimpleNamespace(opt=SimpleNamespace(**values)), settings, SimpleNamespace(__version__="3.3.0"))
 
     def test_candidate_changes_only_fifteen_original_hand_green_pair_solrefs(self):
         source = PROJECT / "resources" / "g1_warehouse_pregrasp.xml"

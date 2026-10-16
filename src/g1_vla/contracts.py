@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from .config import OBSERVATION_FIELDS, validate_config
+from .config import OBSERVATION_FIELDS, validate_config, NOSLIP10_CONTACT_BACKEND, NOSLIP10_SOLVER
 
 
 class ContractError(ValueError):
@@ -48,6 +48,12 @@ def scene_protocol_for_contact_model(settings) -> str:
         if time_constant != .02:
             raise ContractError("source default contact model has a 0.02 second reference")
         return original
+    if settings["backend"] == NOSLIP10_CONTACT_BACKEND:
+        if time_constant != .02:
+            raise ContractError("Noslip version retains the original 0.02 second contact reference")
+        declaration = {"backend": NOSLIP10_CONTACT_BACKEND, "solref": [.02, 1.],
+                       "scope": "global_friction_postprocessor", "solver": NOSLIP10_SOLVER}
+        return "g1_strict_scene_" + NOSLIP10_CONTACT_BACKEND + "_" + canonical_sha256(declaration)
     if settings["backend"] != "right_hand_green_compliance_v2":
         raise ContractError("unknown contact model protocol")
     declaration = {"backend": settings["backend"], "time_constant_s": float(time_constant),
@@ -145,10 +151,15 @@ class ActionContract:
         actual = (self.protocol, self.history_steps, self.chunk_steps, self.execute_steps, self.anchor)
         if actual != expected or any(isinstance(getattr(self, key), bool) for key in ("history_steps", "chunk_steps", "execute_steps")):
             raise ContractError("rebuild contract requires history=4, chunk=8, execute=4 and one qpos_at_plan anchor")
-        candidate_prefix = "g1_strict_scene_right_hand_green_compliance_v2_"
-        candidate_digest = self.scene_protocol[len(candidate_prefix):] if isinstance(self.scene_protocol, str) and self.scene_protocol.startswith(candidate_prefix) else ""
+        candidate_prefixes = ("g1_strict_scene_right_hand_green_compliance_v2_",
+                              "g1_strict_scene_" + NOSLIP10_CONTACT_BACKEND + "_")
+        candidate_digest = next((self.scene_protocol[len(prefix):] for prefix in candidate_prefixes
+                                if isinstance(self.scene_protocol, str) and self.scene_protocol.startswith(prefix)), "")
         valid_scene = self.scene_protocol == "g1_strict_scene_force_transfer_v1" or (
             len(candidate_digest) == 64 and all(character in "0123456789abcdef" for character in candidate_digest))
+        if isinstance(self.scene_protocol, str) and self.scene_protocol.startswith(candidate_prefixes[1]):
+            valid_scene = self.scene_protocol == scene_protocol_for_contact_model({
+                "backend": NOSLIP10_CONTACT_BACKEND, "time_constant_s": .02, "damping_ratio": 1.})
         if (self.dynamics_profile != "robot_regularized_v1" or not valid_scene
                 or self.controller_protocol != "g1_pd_substep_feedback_v2"):
             raise ContractError("execution dynamics/scene protocol differs from the rebuild controller")
