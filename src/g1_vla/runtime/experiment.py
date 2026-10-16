@@ -81,8 +81,9 @@ class ExperimentRun:
         return self.path
 
     def finish(self, result: Mapping[str, Any], success: bool) -> dict:
+        training = result.get("training_started", False)
         report = {**dict(result), "run_id": self.run_id, "run_dir": str(self.path),
-                  "training_started": bool(result.get("training_started", False))}
+                  "training_started": None if training is None else bool(training)}
         write_new_json(self.path / "summary.json", report)
         write_new_json(self.path / "finished.json", {
             "status": "success" if success else "failed",

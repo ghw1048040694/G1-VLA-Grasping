@@ -575,7 +575,7 @@ def _collect_evaluation(environment: Any, runner: Any, settings: dict, streams: 
                 except BudgetExpired:
                     exhausted = True
                     break
-                actions = (torch.zeros((environment.num_envs, environment.num_actions), device=environment.device)
+                actions = (environment.unwrapped.state_hold_actions()
                            if state_hold else runner.alg.actor(obs))
                 _assert_finite(actions, torch, "evaluation actions")
                 obs, rewards, dones, extras = environment.step(actions.to(environment.device))
@@ -589,7 +589,8 @@ def _collect_evaluation(environment: Any, runner: Any, settings: dict, streams: 
                         "target_episodes": target, "budget_exhausted": exhausted,
                         "optimizer_steps": 0, "deterministic_actions": True,
                         "normalizer_updates": 0, "seed": settings["eval_seed"],
-                        "action_policy": "zero normalized target velocity/state-hold" if state_hold else "checkpoint deterministic actor"})
+                        "action_policy": "measured-state-hold requests through shared velocity/anchor/mechanical limits and probe shield"
+                            if state_hold else "checkpoint deterministic actor"})
         summary.update({"simulated_num_envs": environment.num_envs, "scored_num_envs": scored_envs,
                         "actor_state_sha256_before": before_actor_state,
                         "actor_state_sha256_after": module_state_sha256(runner.alg.actor, torch),
@@ -819,7 +820,7 @@ def _smoke(environment: Any, settings: dict, streams: dict, deadline: Deadline,
         raise NumericalFailure("Smoke did not observe a real terminal reset for every parallel environment")
     return {"num_envs": profile, "control_steps": steps, "environment_transitions": steps * profile,
             "wall_seconds": elapsed, "transitions_per_second": steps * profile / max(elapsed, 1e-9),
-            "optimizer_steps": 0, "actions": "first half zero, second half seeded bounded uniform",
+            "optimizer_steps": 0, "actions": "first half zero target-hold, second half seeded bounded uniform",
             "initial_step_audit": initial, "final_step_audit": final,
             "terminal_reset_observed_for_env_ids": reset_envs,
             "outcomes": summarize_outcomes(outcomes), "gpu_memory": _gpu_memory(torch, settings["device"]),
@@ -890,7 +891,7 @@ def run_native_stage(stage: str, config: dict, run_dir: str | Path) -> dict:
             raise FileNotFoundError(f"Native Git executable not found: {git_path}")
         os.environ["GIT_PYTHON_GIT_EXECUTABLE"] = str(git_path)
         from isaaclab.app import AppLauncher
-        launcher = AppLauncher(headless=True, device=settings["device"], enable_cameras=False)
+        launcher = AppLauncher(headless=True, device=settings["device"], enable_cameras=stage == "rl-eval")
         app = launcher.app
         deadline.check()
         import torch as torch_module

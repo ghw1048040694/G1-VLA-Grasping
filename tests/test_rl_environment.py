@@ -17,6 +17,7 @@ from g1_vla.rl_environment import (
     _actuator_specifications,
     _seed_state,
     audit_asset_manifest,
+    audit_fixed_root_joints,
     consecutive_window_samples,
     minimum_box_clearance,
     migration_pose_errors,
@@ -90,6 +91,14 @@ class PhysicalGeometryTest(unittest.TestCase):
 
 
 class ProtocolInputsTest(unittest.TestCase):
+    def test_imported_world_fix_is_preserved_and_missing_disabled_or_duplicate_fix_rejected(self):
+        fixed = {"path": "/Robot/fix_base_joint", "body0": [], "body1": ["/Robot/Geometry/pelvis"], "enabled": True}
+        self.assertEqual(audit_fixed_root_joints([fixed])["world_fixed_joint_count"], 1)
+        for invalid in ([], [fixed, fixed], [dict(fixed, enabled=False)],
+                        [dict(fixed, body1=["/Robot/Geometry/green_cube"]) ]):
+            with self.assertRaises(RLEnvironmentError):
+                audit_fixed_root_joints(invalid)
+
     def test_action_limits_follow_metadata_names_in_explicit_policy_order(self):
         config = configuration()
         limits = policy_velocity_limits(config)

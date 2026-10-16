@@ -116,7 +116,7 @@ def _smoke_admission(config, release_sha256):
     raise ValueError("RL training requires a passed matching source/config/asset smoke run")
 
 
-def _native_script(stage, config, win_release, win_output, run_id, release_sha256, win_assets):
+def _native_script(stage, config, win_release, win_output, run_id, release_sha256, win_assets, entrypoint):
     return "\n".join([
         "import os,sys,json,pathlib,hashlib",
         "root=pathlib.Path(" + repr(str(win_release)) + ")",
@@ -131,13 +131,50 @@ def _native_script(stage, config, win_release, win_output, run_id, release_sha25
         "from g1_vla.rl_protocol import verify_rl_assets",
         "cfg=load_config(root/'configs/experiment.json')",
         "asset_root=pathlib.Path(" + repr(str(win_assets)) + ")",
-        "cfg['rl_teacher']['asset_path']=str(asset_root/'robot.xml')",
+        "cfg['rl_teacher']['asset_path']=str(asset_root/" + repr(entrypoint) + ")",
         "cfg['rl_teacher']['seed_state_path']=str(asset_root/'seed_state.json')",
         "cfg['rl_teacher']['asset_manifest_path']=str(asset_root/'asset_manifest.json')",
         "verify_rl_assets(cfg)",
         "from g1_vla.rl_ppo import run_native_stage",
         "run_native_stage(" + repr(stage) + ",cfg,output)",
     ])
+
+
+def _package_eval_videos(output, run_dir):
+    """Encode actual native RGB frames, preserving their original frame ledger."""
+    videos = []
+    for frames in sorted(Path(output).glob("environment_*/rgb_frames")):
+        paths = sorted(frames.glob("frame_*.png"))
+        if not paths:
+            continue
+        indices = [int(path.stem.split("_")[-1]) for path in paths]
+        row = {"frames": len(paths), "source": "actual native Camera RGB",
+               "simulation_fps": "500/33", "frame_directory": str(frames),
+               "encoded": False}
+        try:
+            if indices != list(range(indices[0], indices[0] + len(indices))):
+                raise ValueError("RGB evidence contains missing frame indices")
+            target = frames.parent / "evaluation_env0.mp4"
+            with (Path(run_dir) / "logs/native_video_encoding.log").open("ab") as log:
+                subprocess.run(["ffmpeg", "-nostdin", "-n", "-v", "error", "-framerate", "500/33",
+                    "-start_number", str(indices[0]), "-i", str(frames / "frame_%06d.png"),
+                    "-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p", str(target)],
+                    stdout=log, stderr=subprocess.STDOUT, check=True, timeout=60)
+            probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-count_frames", "-show_entries", "stream=nb_read_frames,r_frame_rate",
+                "-of", "json", str(target)], capture_output=True, text=True, check=True, timeout=15)
+            stream = json.loads(probe.stdout)["streams"][0]
+            if int(stream["nb_read_frames"]) != len(paths):
+                raise ValueError("encoded video frame count differs from actual RGB captures")
+            row.update(encoded=True, path=str(target), sha256=file_hash(target),
+                       bytes=target.stat().st_size, decoded_frames=int(stream["nb_read_frames"]),
+                       encoded_fps=stream["r_frame_rate"])
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            row["error"] = str(exc)
+        videos.append(row)
+    write_new_json(Path(run_dir) / "reports/native_eval_videos.json", {"videos": videos,
+        "scope": "env0 actual RGB at native control times; episode boundaries remain in frame ledger"})
+    return videos
 
 
 def run_rl_teacher_stage(stage, config, run_dir):
@@ -165,7 +202,7 @@ def run_rl_teacher_stage(stage, config, run_dir):
     local_output = windows_to_wsl(str(win_output))
     if local_output.exists():
         raise ValueError("native RL runs are immutable; choose a new run id")
-    script = _native_script(stage, config, win_release, win_output, run_id, release_sha, win_assets)
+    script = _native_script(stage, config, win_release, win_output, run_id, release_sha, win_assets, assets["entrypoint"])
     script_path = run_dir / "logs/native_invocation.txt"
     script_path.write_text(script, encoding="utf-8")
     started = datetime.now(timezone.utc).isoformat()
@@ -194,6 +231,7 @@ def run_rl_teacher_stage(stage, config, run_dir):
     native = json.loads(native_report_path.read_text(encoding="utf-8")) if native_report_path.is_file() else {
         "passed": False, "training_started": None, "optimizer_steps": None,
         "error": "native process ended without its authoritative native_report.json; optimization status unknown"}
+    videos = _package_eval_videos(local_output, run_dir) if stage == "rl-eval" else []
     if local_output.exists():
         shutil.copytree(local_output, run_dir / "native", dirs_exist_ok=False)
     result = {"stage": stage, "passed": process.returncode == 0 and not timed_out and native.get("passed") is True,
@@ -202,6 +240,7 @@ def run_rl_teacher_stage(stage, config, run_dir):
         "source_asset_manifest_sha256": assets["manifest_sha256"], "source_seed_sha256": assets["seed_sha256"],
         "native_output_windows_path": str(win_output), "native_report": native,
         "native_shared_asset_path": str(win_assets),
+        "videos": videos,
         "smoke_admission": admission, "training_started": native.get("training_started", False),
         "optimizer_steps": native.get("optimizer_steps", 0), "formal_original20_evaluated": False,
         "original_mujoco_teacher_modified": False, "old_ACT_test_accessed": False,

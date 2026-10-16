@@ -321,6 +321,11 @@ class TorchOptimizerTests(unittest.TestCase):
             def reset(self):
                 self.resets += 2
 
+            def state_hold_actions(self):
+                # Nonzero request proves the runner invokes measured-state-hold
+                # rather than silently substituting zero/previous-target hold.
+                return torch.full((2, 1), 0.25)
+
             def get_observations(self):
                 return Observation(policy=torch.ones(2, 2))
 
@@ -350,7 +355,7 @@ class TorchOptimizerTests(unittest.TestCase):
         streams = rl_ppo._new_streams(Path(directory))
         return environment, runner, settings, streams
 
-    def test_evaluation_state_hold_is_zero_and_freezes_full_normalizer_state(self):
+    def test_evaluation_uses_measured_state_hold_requests_and_freezes_normalizer(self):
         with tempfile.TemporaryDirectory() as directory:
             env, runner, settings, streams = self.evaluation_fixture(directory)
             try:
@@ -360,7 +365,8 @@ class TorchOptimizerTests(unittest.TestCase):
                 self.assertEqual(report["completed_episodes"], 4)
                 self.assertEqual(report["optimizer_steps"], 0)
                 self.assertEqual(report["actor_state_sha256_before"], report["actor_state_sha256_after"])
-                self.assertTrue(all(bool((action == 0).all()) for action in env.actions))
+                self.assertTrue(all(bool((action == 0.25).all()) for action in env.actions))
+                self.assertIn("measured-state-hold", report["action_policy"])
                 self.assertFalse(env.eval)
             finally:
                 for stream in streams.values():

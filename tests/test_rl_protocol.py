@@ -77,7 +77,7 @@ class RLProtocolTests(unittest.TestCase):
             config["rl_teacher"].update(enabled=True, asset_path=str(assets / "different.xml"),
                 seed_state_path=str(seed), asset_manifest_path=str(manifest),
                 seed_state_sha256=file_hash(seed), asset_manifest_sha256=file_hash(manifest))
-            with self.assertRaisesRegex(ValueError, "exact robot.xml"):
+            with self.assertRaisesRegex(ValueError, "exact official USD"):
                 verify_rl_assets(config)
 
 

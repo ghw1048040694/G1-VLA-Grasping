@@ -6,8 +6,8 @@ import math
 from pathlib import Path
 
 
-RL_PROTOCOL = "g1_dex3_fixed_root_pregrasp_privileged_v1"
-RL_PHYSICS = "physx_mjcf_convex_fixed_root_tgs_v1"
+RL_PROTOCOL = "g1_official_dex3_fixed_root_pregrasp_privileged_v2"
+RL_PHYSICS = "physx_unitree_official_usd_fixed_root_tgs_v2"
 RIGHT_ACTION_JOINTS = [
     "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
     "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
@@ -20,9 +20,9 @@ RL_TEACHER_DEFAULTS = {
     "physics_protocol": RL_PHYSICS, "runtime_windows_root": "D:/G1-RL-Teacher",
     "isaac_python_bat": "D:/isaacsim-6.0.1/python.bat", "isaaclab_path": "D:/IsaacLab",
     "git_executable": "D:/tools/MinGit/cmd/git.exe",
-    "asset_path": ".runtime/rebuild/rl_assets/v1/robot.xml",
-    "seed_state_path": ".runtime/rebuild/rl_assets/v1/seed_state.json",
-    "asset_manifest_path": ".runtime/rebuild/rl_assets/v1/asset_manifest.json",
+    "asset_path": ".runtime/rebuild/rl_assets/official_v1/robot.usd",
+    "seed_state_path": ".runtime/rebuild/rl_assets/official_v1/seed_state.json",
+    "asset_manifest_path": ".runtime/rebuild/rl_assets/official_v1/asset_manifest.json",
     "asset_manifest_sha256": None, "seed_state_sha256": None,
     "checkpoint_path": None, "checkpoint_sha256": None,
     "action_joint_names": RIGHT_ACTION_JOINTS, "device": "cuda:0", "num_envs": 32,
@@ -46,7 +46,7 @@ RL_TEACHER_DEFAULTS = {
     "cube_friction": 1.4, "table_friction": 1.0, "qualification_required": True,
     "scope": "local_pregrasp_course_only_not_original20_acceptance",
     "training_authorization": "explicit_user_authorized_20261016",
-    "reset_protocol": "source15_open_closure_entry_small_jitter_v1",
+    "reset_protocol": "source15_joint_seed_official_geometry_jitter_v2",
 }
 
 
@@ -98,7 +98,7 @@ def validate_rl_settings(settings):
     if settings["num_envs"] > 32 or settings["max_iterations"] > 400 or settings["max_wall_time_s"] > 3600:
         raise ValueError("first declared RL budget is at most32 envs,400 updates and3600 seconds")
     if settings["smoke_steps"] * .066 < settings["episode_length_s"]:
-        raise ValueError("smoke must include a natural episode timeout")
+        raise ValueError("smoke step budget must span at least one full episode duration")
     if settings["action_scale_rad"] > .08 or settings["eval_num_envs"] > settings["num_envs"]:
         raise ValueError("action or evaluation selection exceeds its declared bound")
     for key in ("gamma", "lam", "clip_param"):
@@ -159,9 +159,14 @@ def verify_rl_assets(config):
         path.relative_to(asset_root)
         if path.is_symlink() or path.stat().st_size != item["bytes"] or file_hash(path) != item["sha256"]:
             raise ValueError("RL asset file mismatch: " + item["path"])
-    pinned_robot = [item for item in manifest["files"] if item["path"] == "robot.xml"]
-    if len(pinned_robot) != 1 or resolved("asset_path").resolve() != asset_root / "robot.xml":
-        raise ValueError("RL must load the exact robot.xml in its pinned manifest")
+    entrypoint = manifest.get("entrypoint", "robot.xml")
+    pinned_robot = [item for item in manifest["files"] if item["path"] == entrypoint]
+    if (len(pinned_robot) != 1 or resolved("asset_path").resolve() != asset_root / entrypoint
+            or not entrypoint.endswith((".usd", ".usda", ".usdc"))):
+        raise ValueError("RL must load the exact official USD entrypoint in its pinned manifest")
+    if (manifest.get("asset_protocol") != "unitree_official_dex3_fixed_base_usd_v1"
+            or manifest.get("source", {}).get("owner") != "unitreerobotics"):
+        raise ValueError("the active native RL protocol requires its pinned official Unitree provenance")
     seed = json.loads(seed_path.read_text(encoding="utf-8"))
     metadata = Path(config["action"]["joint_metadata_path"])
     if not metadata.is_absolute():
@@ -172,6 +177,7 @@ def verify_rl_assets(config):
     if len(seed["joint_positions_rad"]) != 43 or set(seed["joint_positions_rad"]) != set(seed["actuators"]):
         raise ValueError("the RL robot requires all43 explicitly bound joints")
     return {"manifest": manifest, "seed": seed, "asset_path": str(resolved("asset_path")),
+            "entrypoint": entrypoint,
             "manifest_sha256": opts["asset_manifest_sha256"], "seed_sha256": opts["seed_state_sha256"]}
 
 

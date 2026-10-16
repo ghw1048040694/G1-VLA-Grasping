@@ -16,7 +16,7 @@ from .control import LOWER_BODY_JOINT_NAMES
 from .contracts import canonical_sha256, read_joint_order
 
 
-ENVIRONMENT_VERSION = "g1_physx_precontact_rl_v1"
+ENVIRONMENT_VERSION = "g1_physx_official_precontact_rl_v2"
 OBSERVATION_VERSION = "privileged_state_xyzw_81_v1"
 ACTION_VERSION = "right_arm_hand_velocity_limited_14_v1"
 OBSERVATION_DIM = 81
@@ -276,6 +276,18 @@ def audit_asset_manifest(config, asset_path):
     return {"manifest_sha256": hashlib.sha256(payload).hexdigest(), "verified_file_count": len(seen)}
 
 
+def audit_fixed_root_joints(joints):
+    """Require one enabled world-to-pelvis joint, without creating another."""
+    world_joints = [item for item in joints if bool(item["body0"]) != bool(item["body1"])]
+    if len(world_joints) != 1:
+        raise RLEnvironmentError("robot asset must contain exactly one world-fixed root joint")
+    fixed = world_joints[0]
+    attached = fixed["body0"] or fixed["body1"]
+    if not fixed["enabled"] or len(attached) != 1 or attached[0].rsplit("/", 1)[-1] != "pelvis":
+        raise RLEnvironmentError("world root joint must be enabled and attached only to the pelvis")
+    return {"world_fixed_joint_count": 1, "fixed_joint": fixed}
+
+
 def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_mode=False, output_dir=None):
     """Build the state-only local grasp curriculum after Isaac AppLauncher.
 
@@ -292,6 +304,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         raise RLEnvironmentError("num_envs must be a positive integer")
     asset_sha = hashlib.sha256(asset_path.read_bytes()).hexdigest()
     asset_audit = audit_asset_manifest(config, asset_path)
+    native_official_asset = asset_path.suffix.lower() in (".usd", ".usda", ".usdc")
+    if native_official_asset:
+        reference = initial.get("official_native_fk_reference")
+        if not reference or reference.get("usd_entry_sha256") != asset_sha:
+            raise RLEnvironmentError("the official USD requires its independently computed and asset-pinned native FK reference")
+    palm_site_body = initial["palm_site_body_name"]
+    palm_contact_body = initial.get("palm_contact_body_name", "right_wrist_yaw_link")
+    sensor_body_names = HAND_BODIES + (palm_contact_body,)
+    if len(set(sensor_body_names)) != 8:
+        raise RLEnvironmentError("the seven finger and one palm contact bodies must be distinct")
     output = Path(output_dir).resolve() if output_dir else None
     # These imports intentionally follow AppLauncher, not the project's CLI.
     import torch
@@ -327,7 +349,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     spawn_args = dict(activate_contact_sensors=True, rigid_props=rigid,
                       collision_props=collision,
                       articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                          enabled_self_collisions=True, fix_root_link=True,
+                          # MjcfFileCfg.fix_base already creates a sibling
+                          # fix_base_joint. Geometry is the articulation root,
+                          # not a rigid body: a second generic fixer is invalid.
+                          enabled_self_collisions=True,
                           solver_position_iteration_count=settings["solver_position_iterations"],
                           solver_velocity_iteration_count=settings["solver_velocity_iterations"]))
     if asset_path.suffix.lower() == ".xml":
@@ -375,19 +400,45 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._pending_physics_sample = False
             self._force_unavailable = None
             self._qualification_supported = False
+            self._standalone_video = bool(eval_mode)
+            self._evaluation_camera = None
+            self._video_status = {"requested": bool(eval_mode), "enabled": False,
+                                  "frames": 0, "failure": None, "camera_scope": "fixed external env0 audit view"}
+            self._video_manifest = None
+            self._last_video_native_step = None
+            self._last_camera_frame = None
+            self._next_action_origin = "policy_or_zero_target_hold"
+            self._action_origin = "not_started"
+            self._state_hold_request_clipped = 0
             super().__init__(EnvironmentCfg(), render_mode=None)
+            if not self.robot.is_fixed_base or self.robot.num_base_dofs != 0:
+                raise RLEnvironmentError("native physics did not recognize the imported robot as fixed-root")
+            if self._evaluation_camera is not None:
+                eye = self.scene.env_origins[0] + torch.tensor([1.05, -0.65, 1.30], device=self.device)
+                target = self.scene.env_origins[0] + torch.tensor([0.35, 0.055, 0.80], device=self.device)
+                self._evaluation_camera.set_world_poses_from_view(eye[None], target[None])
+                self._video_status.update(enabled=True, eye_world_m=eye.detach().cpu().tolist(),
+                                          target_world_m=target.detach().cpu().tolist())
             self._action_ids = [self.robot.joint_names.index(name) for name in ACTION_JOINT_NAMES]
             if len(self.robot.joint_names) != 43 or set(self.robot.joint_names) != set(initial["joint_positions_rad"]):
                 raise RLEnvironmentError("converted asset does not contain the exact 43 robot joints")
-            self._palm_id = self.robot.body_names.index("right_wrist_yaw_link")
+            self._palm_id = self.robot.body_names.index(palm_site_body)
             self._tip_ids = [self.robot.body_names.index(name) for name in (
                 "right_hand_thumb_2_link", "right_hand_middle_1_link", "right_hand_index_1_link")]
             self._limits = tensor(self.robot.data.joint_pos_limits)
+            self._source_joint_limit_differences = {}
             for index, name in enumerate(self.robot.joint_names):
-                expected_range = initial["actuators"][name]["joint_range_rad"]
+                source_range = initial.get("original_source_joint_ranges_rad", {}).get(
+                    name, initial["actuators"][name]["joint_range_rad"])
+                expected_range = [math.radians(self._joint_schema_audit[name][key])
+                                  for key in ("lower_limit_degrees", "upper_limit_degrees")]
                 actual_range = self._limits[0, index].detach().cpu().tolist()
                 if any(not math.isclose(a, float(b), abs_tol=1e-5, rel_tol=0) for a, b in zip(actual_range, expected_range)):
-                    raise RLEnvironmentError("converted mechanical joint range differs from source: " + name)
+                    raise RLEnvironmentError("native radian mechanical range differs from USD degree schema: " + name)
+                self._source_joint_limit_differences[name] = [a-float(b) for a, b in zip(actual_range, source_range)]
+                tolerance = float(config["eval"]["joint_limit_tolerance_rad"])
+                if not actual_range[0]-tolerance <= initial["joint_positions_rad"][name] <= actual_range[1]+tolerance:
+                    raise RLEnvironmentError("source joint seed is outside the official asset's mechanical range: " + name)
             self._velocity = torch.tensor(policy_velocity_limits(config), device=self.device, dtype=torch.float32)
             self._initial_q = torch.tensor([initial["joint_positions_rad"][name] for name in self.robot.joint_names],
                                            device=self.device, dtype=torch.float32)
@@ -433,6 +484,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 output.mkdir(parents=True, exist_ok=True)
                 if eval_mode:
                     self._open_evaluation_recording()
+                    self._video_frame_dir = output / "rgb_frames"
+                    self._video_frame_dir.mkdir(exist_ok=False)
+                    self._video_manifest = (output / "video_frames.jsonl").open("x", encoding="utf-8")
+                    self._video_manifest.write(json.dumps({"event": "camera_header", "width": 640, "height": 480,
+                                                          "fps_numerator": 500, "fps_denominator": 33,
+                                                          "scope": "actual env0 pre-reset post-physics external camera; no policy image input",
+                                                          "eye_world_m": self._video_status.get("eye_world_m"),
+                                                          "target_world_m": self._video_status.get("target_world_m")}) + "\n")
 
         def _setup_scene(self):
             self.robot = Articulation(ArticulationCfg(
@@ -461,6 +520,46 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self.scene.articulations["robot"] = self.robot
             self.scene.rigid_objects["cube"] = self.cube
             stage = get_current_stage()
+            fixed_joints = []
+            self._joint_schema_audit = {}
+            task_names = {"floor", "calibration_table", "green_cube", "red_triangle", "yellow_rod", "warehouse_tote"}
+            for prim in stage.Traverse():
+                if not str(prim.GetPath()).startswith("/World/envs/env_0/Robot/"):
+                    continue
+                if prim.GetName() in task_names:
+                    raise RLEnvironmentError("robot-only asset contains an old task entity: " + str(prim.GetPath()))
+                if prim.IsA(UsdPhysics.FixedJoint):
+                    joint = UsdPhysics.FixedJoint(prim)
+                    fixed_joints.append({"path": str(prim.GetPath()).replace("/env_0/", "/env_*/"),
+                                         "body0": [str(path).replace("/env_0/", "/env_*/") for path in joint.GetBody0Rel().GetTargets()],
+                                         "body1": [str(path).replace("/env_0/", "/env_*/") for path in joint.GetBody1Rel().GetTargets()],
+                                         "enabled": bool(joint.GetJointEnabledAttr().Get())})
+                if prim.IsA(UsdPhysics.RevoluteJoint):
+                    joint = UsdPhysics.RevoluteJoint(prim)
+                    def quat_values(value):
+                        return [float(v) for v in value.GetImaginary()] + [float(value.GetReal())]
+                    item = {"axis": str(joint.GetAxisAttr().Get()),
+                            "lower_limit_degrees": float(joint.GetLowerLimitAttr().Get()),
+                            "upper_limit_degrees": float(joint.GetUpperLimitAttr().Get()),
+                            "local_position0_m": [float(v) for v in joint.GetLocalPos0Attr().Get()],
+                            "local_position1_m": [float(v) for v in joint.GetLocalPos1Attr().Get()],
+                            "local_quaternion0_xyzw": quat_values(joint.GetLocalRot0Attr().Get()),
+                            "local_quaternion1_xyzw": quat_values(joint.GetLocalRot1Attr().Get()),
+                            "body0": [str(path).replace("/env_0/", "/env_*/") for path in joint.GetBody0Rel().GetTargets()],
+                            "body1": [str(path).replace("/env_0/", "/env_*/") for path in joint.GetBody1Rel().GetTargets()]}
+                    if item["axis"] not in ("X", "Y", "Z") or not all(math.isfinite(item[key]) for key in ("lower_limit_degrees", "upper_limit_degrees")):
+                        raise RLEnvironmentError("invalid official joint axis or degree-limit schema: " + prim.GetName())
+                    if item["lower_limit_degrees"] >= item["upper_limit_degrees"]:
+                        raise RLEnvironmentError("invalid official mechanical limits: " + prim.GetName())
+                    for key in ("local_quaternion0_xyzw", "local_quaternion1_xyzw"):
+                        q = item[key]
+                        wxyz_to_xyzw((q[3], q[0], q[1], q[2]))
+                    if prim.GetName() in self._joint_schema_audit:
+                        raise RLEnvironmentError("duplicate official revolute joint identity: " + prim.GetName())
+                    self._joint_schema_audit[prim.GetName()] = item
+            self._fixed_root_audit = audit_fixed_root_joints(fixed_joints)
+            if set(self._joint_schema_audit) != set(initial["joint_positions_rad"]):
+                raise RLEnvironmentError("official USD revolute-joint schema differs from the exact 43 source names")
             hand_material = material(settings["hand_friction"])
             hand_material.func("/World/RLHandContactMaterial", hand_material)
             palm_material = material(settings["palm_friction"])
@@ -470,25 +569,25 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 if not str(prim.GetPath()).startswith("/World/envs/env_0/Robot/") or not prim.HasAPI(UsdPhysics.CollisionAPI):
                     continue
                 ancestor = prim
-                while ancestor.IsValid() and ancestor.GetName() not in HAND_SENSOR_BODIES:
+                while ancestor.IsValid() and ancestor.GetName() not in sensor_body_names:
                     ancestor = ancestor.GetParent()
                 if ancestor.IsValid():
-                    material_path = "/World/RLPalmContactMaterial" if ancestor.GetName() == "right_wrist_yaw_link" else "/World/RLHandContactMaterial"
+                    material_path = "/World/RLPalmContactMaterial" if ancestor.GetName() == palm_contact_body else "/World/RLHandContactMaterial"
                     bind_physics_material(str(prim.GetPath()), material_path, stage=stage)
                     self._material_bindings.append({"collider": str(prim.GetPath()).replace("/env_0/", "/env_*/"),
                                                     "body": ancestor.GetName(), "material": material_path})
-            if {item["body"] for item in self._material_bindings} != set(HAND_SENSOR_BODIES):
+            if {item["body"] for item in self._material_bindings} != set(sensor_body_names):
                 raise RLEnvironmentError("explicit physics material binding failed for one or more original right-hand bodies")
             paths = {}
             for prim in stage.Traverse():
                 text = str(prim.GetPath())
-                if text.startswith("/World/envs/env_0/Robot/") and prim.GetName() in HAND_SENSOR_BODIES:
+                if text.startswith("/World/envs/env_0/Robot/") and prim.GetName() in sensor_body_names:
                     paths[prim.GetName()] = text.replace("/env_0/", "/env_.*/")
-            missing = set(HAND_SENSOR_BODIES) - set(paths)
+            missing = set(sensor_body_names) - set(paths)
             if missing:
                 raise RLEnvironmentError("converted robot lacks sensor body paths: " + repr(sorted(missing)))
             self._hand_sensors = []
-            for body in HAND_SENSOR_BODIES:
+            for body in sensor_body_names:
                 sensor = ContactSensor(ContactSensorCfg(
                     prim_path=paths[body], update_period=0.0,
                     filter_prim_paths_expr=["/World/envs/env_.*/Cube"],
@@ -501,6 +600,20 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 filter_prim_paths_expr=["/World/envs/env_.*/Table", "/World/envs/env_.*/Robot/.*"],
                 track_friction_forces=True, max_contact_data_count_per_prim=32))
             self.scene.sensors["cube_table"] = self._cube_sensor
+            if self._standalone_video:
+                from isaaclab.sensors import Camera, CameraCfg
+                from isaaclab_physx.renderers.isaac_rtx_renderer_cfg import IsaacRtxRendererCfg
+                self._evaluation_camera = Camera(CameraCfg(
+                    prim_path="/World/RLEvaluationCamera", update_period=0.066,
+                    width=640, height=480, data_types=["rgb"],
+                    renderer_cfg=IsaacRtxRendererCfg(),
+                    spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, horizontal_aperture=32.0,
+                                                     clipping_range=(0.01, 20.0))))
+                # One global camera is updated explicitly. Registering it in
+                # the N-env scene would pass partial reset IDs > 0 to a camera
+                # with only one instance and corrupt its reset bookkeeping.
+                light = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+                light.func("/World/RLEvaluationLight", light)
             self.scene.clone_environments(copy_from_source=False)
             if self.device == "cpu":
                 self.scene.filter_collisions(global_prim_paths=[])
@@ -509,6 +622,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if tuple(actions.shape) != (self.num_envs, 14) or not bool(torch.isfinite(actions).all()):
                 raise RLEnvironmentError("nonfinite or incorrectly shaped policy action")
             self._previous_actions[:] = self._actions
+            self._action_origin, self._next_action_origin = self._next_action_origin, "policy_or_zero_target_hold"
             self._actions[:] = actions.clamp(-1.0, 1.0)
             per_step = torch.minimum(self._velocity * self.step_dt,
                                      torch.full_like(self._velocity, float(config["rl_teacher"]["action_scale_rad"])))
@@ -561,6 +675,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             force, points, normals, separation, counts, starts = sensor.contact_view.get_contact_data(dt=self.physics_dt)
             force, normals, separation = tensor(force).flatten(), tensor(normals).reshape(-1, 3), tensor(separation).flatten()
             counts, starts = tensor(counts).long().reshape(self.num_envs, -1), tensor(starts).long().reshape(self.num_envs, -1)
+            if counts.shape[1] != len(sensor.cfg.filter_prim_paths_expr):
+                raise RLEnvironmentError("native filter count differs from declared contact-partner expressions")
             if filter_index >= counts.shape[1]:
                 raise RLEnvironmentError("contact filter did not resolve the declared collider")
             counts, starts = counts[:, filter_index], starts[:, filter_index]
@@ -571,6 +687,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             owners = torch.repeat_interleave(torch.arange(self.num_envs, device=self.device), counts)
             repeated_offsets = torch.repeat_interleave(torch.cumsum(counts, 0) - counts, counts)
             indices = torch.repeat_interleave(starts, counts) + torch.arange(len(owners), device=self.device) - repeated_offsets
+            arrays = (normal, friction, force[indices], normals[indices], separation[indices],
+                      tensor(points).reshape(-1, 3)[indices])
+            if not all(bool(torch.isfinite(value).all()) for value in arrays):
+                # Numerical corruption is a hard run failure, never an optional
+                # API capability that training can continue without.
+                raise FloatingPointError("nonfinite native raw contact force/normal/separation/position")
             fn = torch.zeros(self.num_envs, device=self.device)
             depth = torch.zeros_like(fn)
             vertical = torch.zeros_like(fn)
@@ -741,6 +863,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                        "joint_position_rad": tensor(self.robot.data.joint_pos)[:count].detach().cpu().tolist(),
                        "joint_velocity_rad_s": tensor(self.robot.data.joint_vel)[:count].detach().cpu().tolist(),
                        "requested_policy_action": self._actions[:count].detach().cpu().tolist(),
+                       "action_origin": self._action_origin,
                        "applied_joint_position_target_rad": self._targets[:count].detach().cpu().tolist(),
                        "cube_position_world_m": position[:count].detach().cpu().tolist(),
                        "cube_quaternion_xyzw": rotation[:count].detach().cpu().tolist(),
@@ -756,6 +879,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._pending_physics_sample:
                 self._sample_physics()
                 self._pending_physics_sample = False
+            if self._standalone_video:
+                self._capture_evaluation_frame()
             dropped = tensor(self.cube.data.root_pos_w)[:, 2] < 0.70
             terminated = self._unsafe | self._local_success | dropped
             truncated = self.episode_length_buf >= self.max_episode_length
@@ -820,31 +945,54 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             cube = tensor(self.cube.data.root_pos_w).detach().cpu().tolist()
             cube_rotation = tensor(self.cube.data.root_quat_w).detach().cpu().tolist()
             roots = tensor(self.robot.data.root_pos_w).detach().cpu().tolist()
+            root_rotation = tensor(self.robot.data.root_quat_w).detach().cpu().tolist()
+            actual_joints = tensor(self.robot.data.joint_pos).detach().cpu().tolist()
             expected_cube = self._expected_reset_cube.detach().cpu().tolist()
+            official_reference = initial.get("official_native_fk_reference") if native_official_asset else None
             for index in range(self.num_envs):
                 expected_palm = [float(value)+float(origin) for value, origin in
                                  zip(initial["source_palm_world_position_m"], origins[index])]
                 expected_palm[2] += float(initial["reset_vertical_lift_m"])
-                palm_errors = migration_pose_errors(expected_palm, initial["source_palm_rotation_world"],
+                legacy_error = migration_pose_errors(expected_palm, initial["source_palm_rotation_world"],
+                                                       palms[index], rotations[index])
+                expected_palm_rotation = initial["source_palm_rotation_world"]
+                if official_reference:
+                    expected_palm = [value+origin for value, origin in zip(official_reference["palm_world_position_m"], origins[index])]
+                    expected_palm_rotation = official_reference["palm_rotation_world"]
+                palm_errors = migration_pose_errors(expected_palm, expected_palm_rotation,
                                                      palms[index], rotations[index])
                 cube_position_error = math.sqrt(sum((a-b)**2 for a, b in zip(cube[index], expected_cube[index][:3])))
                 dot = abs(sum(a*b for a, b in zip(cube_rotation[index], expected_cube[index][3:])))
                 cube_rotation_error = 2*math.acos(min(1.0, max(-1.0, dot)))
                 expected_root = [value+origin for value, origin in zip(initial["root_pose_xyzw"][:3], origins[index])]
                 root_error = math.sqrt(sum((a-b)**2 for a, b in zip(roots[index], expected_root)))
+                root_dot = abs(sum(a*b for a, b in zip(root_rotation[index], initial["root_pose_xyzw"][3:])))
+                root_rotation_error = 2*math.acos(min(1.0, max(-1.0, root_dot)))
+                joint_error = max(abs(a-float(initial["joint_positions_rad"][name]))
+                                  for a, name in zip(actual_joints[index], self.robot.joint_names))
                 rows.append({"env_id": index, "palm": palm_errors, "cube_position_error_m": cube_position_error,
+                             "legacy_source_palm_difference_diagnostic": legacy_error,
                              "cube_rotation_error_rad": cube_rotation_error, "root_position_error_m": root_error,
+                             "root_rotation_error_rad": root_rotation_error, "reset_joint_position_error_max_rad": joint_error,
                              "actual_palm_world_position_m": palms[index], "actual_palm_world_quaternion_xyzw": rotations[index],
                              "expected_palm_world_position_m": expected_palm,
                              "actual_cube_position_world_m": cube[index], "actual_cube_quaternion_xyzw": cube_rotation[index],
                              "expected_cube_pose_xyzw": expected_cube[index]})
-            position_max = max(max(row["palm"]["position_error_m"], row["cube_position_error_m"], row["root_position_error_m"])
-                               for row in rows)
-            rotation_max = max(max(row["palm"]["rotation_error_rad"], row["cube_rotation_error_rad"]) for row in rows)
+            enforce_palm = not native_official_asset or bool(official_reference)
+            position_max = max(max(row["palm"]["position_error_m"] if enforce_palm else 0,
+                                   row["cube_position_error_m"], row["root_position_error_m"]) for row in rows)
+            rotation_max = max(max(row["palm"]["rotation_error_rad"] if enforce_palm else 0,
+                                   row["cube_rotation_error_rad"], row["root_rotation_error_rad"]) for row in rows)
+            joint_max = max(row["reset_joint_position_error_max_rad"] for row in rows)
             passed = (position_max <= settings["migration_position_tolerance_m"] and
-                      rotation_max <= settings["migration_rotation_tolerance_rad"])
+                      rotation_max <= settings["migration_rotation_tolerance_rad"] and joint_max <= 1e-5)
             self._mechanical_migration = {"passed": passed, "maximum_position_error_m": position_max,
                                           "maximum_rotation_error_rad": rotation_max,
+                                          "maximum_reset_joint_error_rad": joint_max,
+                                          "palm_fk_reference_scope": "official_independent_reference" if official_reference else
+                                              "legacy_source_geometry_diagnostic_only" if native_official_asset else "same_source_conversion_equivalence",
+                                          "official_independent_palm_fk_reference_pending": native_official_asset and not bool(official_reference),
+                                          "legacy_palm_difference_blocks_native_training": False if native_official_asset else True,
                                           "position_tolerance_m": settings["migration_position_tolerance_m"],
                                           "rotation_tolerance_rad": settings["migration_rotation_tolerance_rad"],
                                           "physics_steps_executed_before_check": self._physics_samples, "environments": rows}
@@ -948,10 +1096,75 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                         "declared_cube_pose_xyzw": cube.detach().cpu().tolist(),
                                         "declared_joint_position_rad": q.detach().cpu().tolist(),
                                         "velocity_protocol": "all velocities zero only at episode reset"})
+            if self._video_manifest and bool((env_ids == 0).any()):
+                self._video_manifest.write(json.dumps({"event": "episode_reset", "env_id": 0,
+                                                       "episode_id": int(self._episode_ids[0].item()),
+                                                       "next_frame_index": self._video_status["frames"],
+                                                       "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                                                       "sim_time_s": int(self.sim.get_physics_step_count())*float(self.sim.get_physics_dt())}) + "\n")
+                self._video_manifest.flush()
 
         def pop_episode_outcomes(self):
             result, self._outcomes = self._outcomes, []
             return result
+
+        def state_hold_actions(self):
+            """Request current measured 14-joint positions through the same limiter.
+
+            A zero policy action instead holds the previous position target.
+            This request may be clipped by velocity, anchor and probe guards.
+            """
+            current = tensor(self.robot.data.joint_pos)[:, self._action_ids]
+            per_step = torch.minimum(self._velocity*self.step_dt,
+                                     torch.full_like(self._velocity, float(config["rl_teacher"]["action_scale_rad"])))
+            raw = (current-self._targets[:, self._action_ids])/per_step
+            self._state_hold_request_clipped += int((torch.abs(raw) > 1).any(dim=-1).sum().item())
+            self._next_action_origin = "measured_state_hold_request_through_shared_limits"
+            return raw.clamp(-1.0, 1.0)
+
+        def _capture_evaluation_frame(self):
+            if self._video_status["failure"] or not self._video_manifest:
+                return
+            try:
+                from PIL import Image
+                native_step = int(self.sim.get_physics_step_count())
+                if native_step == self._last_video_native_step:
+                    raise RLEnvironmentError("duplicate native physics step in video frame capture")
+                self._evaluation_camera.update(dt=self.step_dt, force_recompute=True)
+                rgb = tensor(self._evaluation_camera.data.output["rgb"])
+                if rgb.dtype != torch.uint8 or tuple(rgb.shape[:3]) != (1, 480, 640) or rgb.shape[-1] not in (3, 4):
+                    raise RLEnvironmentError("camera did not provide actual 640x480 uint8 RGB(A) pixels")
+                pixels = rgb[0, :, :, :3].detach().cpu().numpy()
+                frame = int(self._video_status["frames"])
+                path = self._video_frame_dir / "frame_{:06d}.png".format(frame)
+                Image.fromarray(pixels, mode="RGB").save(path)
+                payload = path.read_bytes()
+                camera_frame = int(tensor(self._evaluation_camera.frame)[0].item())
+                if self._last_camera_frame is not None and camera_frame <= self._last_camera_frame:
+                    raise RLEnvironmentError("camera measurement counter did not advance")
+                row = {"event": "camera_frame", "frame_index": frame, "path": path.name,
+                       "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+                       "native_physics_step_count": native_step, "physics_samples": self._physics_samples,
+                       "actual_physics_dt_s": float(self.sim.get_physics_dt()),
+                       "sim_time_s": native_step*float(self.sim.get_physics_dt()),
+                       "episode_id": int(self._episode_ids[0].item()),
+                       "episode_control_steps": int(self.episode_length_buf[0].item()),
+                       "camera_frame_counter": camera_frame,
+                       "cube_position_world_m": tensor(self.cube.data.root_pos_w)[0].detach().cpu().tolist(),
+                       "cube_quaternion_xyzw": tensor(self.cube.data.root_quat_w)[0].detach().cpu().tolist(),
+                       "pre_reset": True}
+                self._video_manifest.write(json.dumps(row, allow_nan=False) + "\n")
+                self._video_manifest.flush()
+                self._video_status["frames"] = frame+1
+                self._last_video_native_step = native_step
+                self._last_camera_frame = camera_frame
+            except Exception as exc:
+                self._video_status["failure"] = type(exc).__name__ + ": " + str(exc)
+                self._video_manifest.write(json.dumps({"event": "camera_failure", "failure": self._video_status["failure"]}) + "\n")
+                self._video_manifest.flush()
+                if output:
+                    with (output / "evaluation_video_failure.json").open("x", encoding="utf-8") as stream:
+                        json.dump(self._video_status, stream, indent=2)
 
         def set_evaluation_mode(self, enabled, seed=None):
             if self._record:
@@ -1012,13 +1225,23 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                         "qualification_semantics": "raw per-point distal opposition and normals; source loaded-contact ANDs; 100 consecutive 2ms samples",
                                         "compiled_asset_files": self._compiled_files,
                                         "hand_material_bindings": self._material_bindings,
+                                        "fixed_root_audit": self._fixed_root_audit,
+                                        "native_joint_axis_frame_unit_schema": self._joint_schema_audit,
+                                        "palm_site_body_name": palm_site_body,
+                                        "palm_site_position_m": initial["palm_site_position_m"],
+                                        "palm_site_quaternion_xyzw": initial["palm_site_quaternion_xyzw"],
+                                        "palm_contact_body_name": palm_contact_body,
+                                        "official_native_fk_reference": initial.get("official_native_fk_reference"),
                                         "initial_state_sha256": hashlib.sha256(json.dumps(initial, sort_keys=True).encode()).hexdigest()},
                     "robot_joint_names": list(self.robot.joint_names), "action_joint_indices": list(self._action_ids),
-                    "initial_state": initial, "physics_version": "physx_tgs_fixedroot_convex_v1",
+                    "initial_state": initial, "physics_version": config["rl_teacher"]["physics_protocol"],
+                    "asset_kind": "official_native_usd" if native_official_asset else "historical_mjcf_conversion_control",
                     "physics_differences": ["PhysX TGS, not MuJoCo Noslip10", "hard root fixation, not compliant base weld",
                                             "implicit shared gains without MuJoCo qfrc_bias feedforward",
                                             "explicit max static/dynamic friction, no MuJoCo torsional/rolling friction mapping",
-                                            "PhysX convex collision conversion and 1 mm contact offset"],
+                                            "official USD collision geometry retained with 1 mm contact offset" if native_official_asset else
+                                                "historical PhysX convex collision conversion with 1 mm contact offset"],
+                    "source_joint_limit_differences_rad": self._source_joint_limit_differences,
                     "success_scope": "local precontact-reset curriculum only; original MuJoCo 15/19 and 20 not certified",
                     "contact_data_unavailable_reason": self._force_unavailable,
                     "qualification_supported": self._qualification_supported,
@@ -1032,12 +1255,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             return {"physics_samples": self._physics_samples, "reset_count": self._resets,
                     "interrupted_episode_count": self._interrupted, "evaluation_mode": self._eval_mode,
                     "main_lift_authorized": False, "action_shield_count": self._shield_count,
+                    "action_origin": self._action_origin,
+                    "zero_action_semantics": "previous_target_hold",
+                    "measured_state_hold_request_clipped_count": self._state_hold_request_clipped,
                     "sim_time_s": self._physics_samples*self.physics_dt,
                     "native_physics_step_count": int(self.sim.get_physics_step_count()),
                     "actual_physics_dt_s": float(self.sim.get_physics_dt()),
                     "control_period_s": float(self.step_dt),
                     "contact_data_unavailable_reason": self._force_unavailable,
                     "qualification_supported": self._qualification_supported,
+                    "evaluation_video": dict(self._video_status),
                     "nonfinite_state": bool((~self._last_metrics.get("finite", torch.ones(self.num_envs, dtype=torch.bool, device=self.device))).any()),
                     "success_count_pending": sum(row["success"] is True for row in self._outcomes),
                     "reward_components": {name: float(value.mean().item()) for name, value in self._reward_terms.items()}}
@@ -1046,6 +1273,19 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if getattr(self, "_record", None):
                 self._record.close()
                 self._record = None
+            if getattr(self, "_video_manifest", None):
+                self._video_manifest.close()
+                self._video_manifest = None
+            if output and hasattr(self, "_video_status"):
+                self._video_status["expected_control_frames"] = self._physics_samples // 33
+                self._video_status["all_control_frames_recorded"] = (
+                    self._standalone_video and self._video_status["failure"] is None and
+                    self._video_status["frames"] == self._physics_samples // 33 and self._video_status["frames"] > 0)
+                path = output / "evaluation_video_status.json"
+                if not path.exists():
+                    with path.open("x", encoding="utf-8") as stream:
+                        json.dump(self._video_status, stream, indent=2)
+            self._evaluation_camera = None
             super().close()
 
     return Environment()

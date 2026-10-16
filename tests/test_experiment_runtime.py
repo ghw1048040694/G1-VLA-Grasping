@@ -37,6 +37,16 @@ class RuntimeTests(unittest.TestCase):
     def test_config_hash_is_canonical(self):
         self.assertEqual(canonical_hash({"x": 1, "y": 2}), canonical_hash({"y": 2, "x": 1}))
 
+    def test_crashed_native_process_does_not_turn_unknown_training_into_false(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = ExperimentRun(root, root / "runtime", "rl-train", {}, [], "unknown")
+            run.begin()
+            report = run.finish({"training_started": None, "optimizer_steps": None}, False)
+            self.assertIsNone(report["training_started"])
+            self.assertIsNone(json.loads((run.path / "finished.json").read_text())["training_started"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -815,16 +815,19 @@
   "rl_teacher": {
     "enabled": true,
     "backend": "isaaclab_rsl_ppo_v1",
-    "task_protocol": "g1_dex3_fixed_root_pregrasp_privileged_v1",
-    "physics_protocol": "physx_mjcf_convex_fixed_root_tgs_v1",
+    "task_protocol": "g1_official_dex3_fixed_root_pregrasp_privileged_v2",
+    "physics_protocol": "physx_unitree_official_usd_fixed_root_tgs_v2",
     "runtime_windows_root": "D:/G1-RL-Teacher",
     "isaac_python_bat": "D:/isaacsim-6.0.1/python.bat",
     "isaaclab_path": "D:/IsaacLab",
     "git_executable": "D:/tools/MinGit/cmd/git.exe",
-    "asset_path": ".runtime/rebuild/rl_assets/v1/robot.xml",
-    "seed_state_path": ".runtime/rebuild/rl_assets/v1/seed_state.json",
-    "asset_manifest_path": ".runtime/rebuild/rl_assets/v1/asset_manifest.json",
+    "asset_path": ".runtime/rebuild/rl_assets/official_v1/g1_29dof_with_dex3_base_fix.usd",
+    "seed_state_path": ".runtime/rebuild/rl_assets/official_v1/seed_state.json",
+    "asset_manifest_path": ".runtime/rebuild/rl_assets/official_v1/asset_manifest.json",
+    "asset_manifest_sha256": "96b7cad957cf0c76cfc91687b5effbd449f959b4dd1bc8b496512970161f4566",
+    "seed_state_sha256": "b4b6ed59d18624b5bf45eda9153bc4b86f31eceebbaa30be98d66dee00e75470",
     "checkpoint_path": null,
+    "checkpoint_sha256": null,
     "action_joint_names": [
       "right_shoulder_pitch_joint",
       "right_shoulder_roll_joint",
@@ -911,6 +914,8 @@
       ]
     ],
     "target_lift_height_m": 0.006,
+    "probe_height_cap_m": 0.006,
+    "probe_overshoot_tolerance_m": 0.0005,
     "physics_dt_s": 0.002,
     "decimation": 33,
     "table_top_m": 0.75,
@@ -927,11 +932,6 @@
     "qualification_required": true,
     "scope": "local_pregrasp_course_only_not_original20_acceptance",
     "training_authorization": "explicit_user_authorized_20261016",
-    "reset_protocol": "source15_open_closure_entry_small_jitter_v1",
-    "checkpoint_sha256": null,
-    "probe_height_cap_m": 0.006,
-    "probe_overshoot_tolerance_m": 0.0005,
-    "asset_manifest_sha256": "b66eb915e3a773828095c6f2dc05691d6528913611f9c52ca83651f0d4fccae1",
-    "seed_state_sha256": "22be22cd54b62f80e155fe528ae9a1b9cfd7d7a4383a6a97861a44f49b49c7bf"
+    "reset_protocol": "source15_joint_seed_official_geometry_jitter_v2"
   }
 }
