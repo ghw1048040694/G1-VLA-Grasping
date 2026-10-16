@@ -1,12 +1,29 @@
 # G1 VLA Grasping
 
-G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. The current work targets the original twenty-layout green/right teacher acceptance, with training and world-model optimization disabled. Existing source-native ACT results and data remain separate research evidence.
+G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. The current stage trains a privileged state-based RL teacher in a separately versioned PhysX model. ACT and world-model optimization remain disabled. Existing source-native ACT results, data and the MuJoCo teacher remain separate research evidence.
 
 ## Workspace
 
 The development directory is `/home/ubuntu/VLA-Learning/projects/G1-VLA-Grasping`. Robot meshes remain in the workspace's `frameworks/unitree_lerobot` repository. The exact 31-joint order is read from `resources/g1_action31_train_root_stub/meta/info.json`; this file is a protocol stub, not training data.
 
 All experiment history and new implementation records belong in `../../notes/Lerobot.md`. This README describes operation and boundaries, not a second experiment journal.
+
+## Privileged RL teacher
+
+Run from WSL using the same configuration and entry point. The dispatcher freezes project sources, asset hashes and configuration, then reuses the installed native Windows Isaac runtime. It does not modify IsaacLab or launch legacy experiment scripts.
+
+```sh
+python -m g1_vla.cli experiment --config configs/experiment.json --stage rl-audit
+python -m g1_vla.cli experiment --config configs/experiment.json --stage rl-smoke
+python -m g1_vla.cli experiment --config configs/experiment.json --stage rl-train
+python -m g1_vla.cli experiment --config configs/experiment.json --stage rl-eval
+```
+
+`rl-smoke` checks one, eight and thirty-two environments without an optimizer. `rl-train` requires a passed smoke report for the identical frozen release, then runs at most 400 PPO updates or 3600 seconds, including validation. The initial task uses the original 43-joint robot and a known layout-15 open-hand pregrasp fixture, an 81-dimensional privileged observation and 14 right-arm/hand target increments. Source control limits, the 2ms physics timestep and 33-step command cadence remain explicit. Other joints are held. This curriculum is not independent demonstration data.
+
+The PhysX conversion fixes the root and uses declared convex collisions, TGS, material combination and implicit PD. Its model identity differs from MuJoCo; converted USD and actuator/reset metadata are checkpoint requirements. A continuous 6mm probe cap remains active throughout. Local support qualification requires the original load/contact/stability AND gates and raw evidence; missing contact capability cannot count as success. This stage does not authorize a main lift or count as the original home-start 15/19 or twenty-layout acceptance.
+
+Training preserves optimizer losses, gradients, weight changes, episode failures and immutable checkpoints. Deterministic evaluation retains zero-action state-hold and the step-zero policy, with eight fixed validation offsets and equal episode quotas. Incomplete quotas have no overall success rate. `rl-eval` requires an explicit checkpoint path and full SHA256 and verifies source, task and compiled model identities. No ACT test payload or legacy checkpoint is exported or used for selection. Exporting future ACT labels requires a separate reviewed action/timing bridge.
 
 ## Preparation commands
 

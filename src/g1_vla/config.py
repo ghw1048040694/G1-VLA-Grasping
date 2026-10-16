@@ -10,6 +10,8 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+from .rl_protocol import RL_TEACHER_DEFAULTS, validate_rl_settings
+
 
 class ConfigError(ValueError):
     """Configuration cannot be used without correction."""
@@ -298,7 +300,15 @@ def _pinned_calibration(value, path):
     check(value, CONTACT_CALIBRATION_DEFAULTS, path)
 
 
+def _rl_teacher_settings(value, path):
+    try:
+        validate_rl_settings(value)
+    except (ValueError, TypeError) as exc:
+        _error(path, str(exc))
+
+
 SCHEMA = {
+    "rl_teacher": _rl_teacher_settings,
     "contact_calibration": _pinned_calibration,
     "schema_version": _literal(1),
     "paths": {"root": _text},
@@ -614,6 +624,8 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     # Saved pre-calibration configs remain readable with explicit baseline defaults.
     if isinstance(config, dict) and "contact_calibration" not in config:
         config = {**config, "contact_calibration": copy.deepcopy(CONTACT_CALIBRATION_DEFAULTS)}
+    if isinstance(config, dict) and "rl_teacher" not in config:
+        config = {**config, "rl_teacher": copy.deepcopy(RL_TEACHER_DEFAULTS)}
     _object(config, SCHEMA, "config")
     unknown_fields = set(config["observation"]["fields"]) - OBSERVATION_FIELDS
     if unknown_fields:
@@ -821,6 +833,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _PATH_FIELDS = {
+    "rl_teacher": ("asset_path", "seed_state_path", "asset_manifest_path", "checkpoint_path"),
     "scene": ("asset_path",), "action": ("joint_metadata_path",),
     "data": ("registry_path", "build_dir"),
     "train": ("resume_checkpoint", "warm_start_checkpoint"),

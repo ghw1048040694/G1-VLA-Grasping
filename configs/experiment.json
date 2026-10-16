@@ -811,5 +811,127 @@
       0.03,
       0.003
     ]
+  },
+  "rl_teacher": {
+    "enabled": true,
+    "backend": "isaaclab_rsl_ppo_v1",
+    "task_protocol": "g1_dex3_fixed_root_pregrasp_privileged_v1",
+    "physics_protocol": "physx_mjcf_convex_fixed_root_tgs_v1",
+    "runtime_windows_root": "D:/G1-RL-Teacher",
+    "isaac_python_bat": "D:/isaacsim-6.0.1/python.bat",
+    "isaaclab_path": "D:/IsaacLab",
+    "git_executable": "D:/tools/MinGit/cmd/git.exe",
+    "asset_path": ".runtime/rebuild/rl_assets/v1/robot.xml",
+    "seed_state_path": ".runtime/rebuild/rl_assets/v1/seed_state.json",
+    "asset_manifest_path": ".runtime/rebuild/rl_assets/v1/asset_manifest.json",
+    "checkpoint_path": null,
+    "action_joint_names": [
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint",
+      "right_wrist_pitch_joint",
+      "right_wrist_yaw_joint",
+      "right_hand_thumb_0_joint",
+      "right_hand_thumb_1_joint",
+      "right_hand_thumb_2_joint",
+      "right_hand_index_0_joint",
+      "right_hand_index_1_joint",
+      "right_hand_middle_0_joint",
+      "right_hand_middle_1_joint"
+    ],
+    "device": "cuda:0",
+    "num_envs": 32,
+    "smoke_env_counts": [
+      1,
+      8,
+      32
+    ],
+    "smoke_steps": 128,
+    "seed": 2026101601,
+    "evaluation_seed": 2026101602,
+    "smoke_seed": 2026101603,
+    "episode_length_s": 6.0,
+    "steps_per_env": 32,
+    "max_iterations": 400,
+    "max_wall_time_s": 3600,
+    "eval_interval": 50,
+    "eval_episodes": 32,
+    "eval_num_envs": 8,
+    "save_interval": 50,
+    "hidden_dims": [
+      128,
+      128
+    ],
+    "learning_rate": 0.0003,
+    "num_learning_epochs": 4,
+    "num_mini_batches": 4,
+    "gamma": 0.99,
+    "lam": 0.95,
+    "clip_param": 0.2,
+    "entropy_coef": 0.01,
+    "init_noise_std": 0.5,
+    "max_grad_norm": 1.0,
+    "action_scale_rad": 0.08,
+    "training_position_jitter_m": 0.0002,
+    "training_yaw_jitter_rad": 0.001,
+    "validation_offsets_m": [
+      [
+        -0.0004,
+        -0.0002
+      ],
+      [
+        -0.0004,
+        0.0002
+      ],
+      [
+        -0.0002,
+        -0.0004
+      ],
+      [
+        -0.0002,
+        0.0004
+      ],
+      [
+        0.0002,
+        -0.0004
+      ],
+      [
+        0.0002,
+        0.0004
+      ],
+      [
+        0.0004,
+        -0.0002
+      ],
+      [
+        0.0004,
+        0.0002
+      ]
+    ],
+    "target_lift_height_m": 0.006,
+    "physics_dt_s": 0.002,
+    "decimation": 33,
+    "table_top_m": 0.75,
+    "cube_side_m": 0.05,
+    "cube_mass_kg": 0.08,
+    "position_iterations": 16,
+    "velocity_iterations": 4,
+    "contact_offset_m": 0.001,
+    "rest_offset_m": 0.0,
+    "friction_combine_mode": "max",
+    "hand_friction": 2.2,
+    "cube_friction": 1.4,
+    "table_friction": 1.0,
+    "qualification_required": true,
+    "scope": "local_pregrasp_course_only_not_original20_acceptance",
+    "training_authorization": "explicit_user_authorized_20261016",
+    "reset_protocol": "source15_open_closure_entry_small_jitter_v1",
+    "checkpoint_sha256": null,
+    "probe_height_cap_m": 0.006,
+    "probe_overshoot_tolerance_m": 0.0005,
+    "asset_manifest_sha256": "b66eb915e3a773828095c6f2dc05691d6528913611f9c52ca83651f0d4fccae1",
+    "seed_state_sha256": "22be22cd54b62f80e155fe528ae9a1b9cfd7d7a4383a6a97861a44f49b49c7bf"
   }
 }

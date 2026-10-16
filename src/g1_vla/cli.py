@@ -13,7 +13,7 @@ from .config import ConfigError, load_config
 from .contracts import ActionContract, ContractError, canonical_sha256, read_joint_order
 from .runtime.experiment import ExperimentRun, canonical_hash, write_new_json
 
-STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "labels-audit", "teacher-smoke", "teacher", "teacher-focus", "contact-calibration", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "constant-residual", "normalization-check", "normalization-train", "state-conditioning", "report", "collect", "build", "replay", "train", "eval")
+STAGES = ("plan", "inventory", "registry", "audit", "limits", "pairing", "labels-audit", "teacher-smoke", "teacher", "teacher-focus", "contact-calibration", "rl-audit", "rl-smoke", "rl-train", "rl-eval", "external-fetch", "external-audit", "external-reconcile", "weights-audit", "offline-fetch", "offline-infer", "source-native-fetch", "grasp-memory", "diagnose", "act-diagnose", "act-ablate", "vision-fetch", "vision-ablate", "coverage-audit", "residual-check", "residual-train", "expansion-audit", "expansion-build", "expanded-check", "expanded-train", "constant-residual", "normalization-check", "normalization-train", "state-conditioning", "report", "collect", "build", "replay", "train", "eval")
 
 
 def readiness(config):
@@ -67,6 +67,13 @@ def _protection(inventory):
 
 
 def execute_stage(stage, config, run):
+    if stage in ("rl-audit", "rl-smoke", "rl-train", "rl-eval"):
+        from .rl_teacher import run_rl_teacher_stage
+        result = run_rl_teacher_stage(stage, config, run.path)
+        return {"stage": stage, "rl_teacher": result,
+                "training_started": result.get("training_started", False),
+                "optimizer_steps": result.get("optimizer_steps", 0),
+                "formal_original20_evaluated": False}, result.get("passed") is True
     report = readiness(config)
     if stage == "contact-calibration":
         from .contact_calibration import run_contact_calibration
