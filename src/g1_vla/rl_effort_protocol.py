@@ -117,7 +117,7 @@ _DEFAULTS = {
         "posture_gravity_feedforward": {
             "version": "g1_native_arm7_waist3_gravity_feedforward_v1",
             "joint_order": list(RIGHT_ARM_JOINT_NAMES) + ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
-            "feedforward_caps_nm": [25., 25., 25., 25., 25., 5., 5., 88., 50., 88.],
+            "feedforward_caps_nm": [25., 25., 25., 25., 25., 5., 5., 88., 50., 50.],
             "native_pd_values_unchanged": True,
             "combined_pd_and_ff_total_not_certified_bounded": True,
             "unused_other26_effort_targets_zero": True,

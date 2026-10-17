@@ -238,7 +238,9 @@ class NativeEffortAdapterTests(unittest.TestCase):
         posture_ids = [names.index(n) for n in declaration["joint_order"]]
         caps = t.tensor(declaration["feedforward_caps_nm"])
         gravity = t.arange(86, dtype=t.float32).reshape(2, 43)-30
-        specs = {n: {"effort_limit_nm": float(caps[i])} for i, n in enumerate(declaration["joint_order"])}
+        # Independent native hard04 readback: waist pitch is50, not yaw's88.
+        original_caps = [25., 25., 25., 25., 25., 5., 5., 88., 50., 50.]
+        specs = {n: {"effort_limit_nm": original_caps[i]} for i, n in enumerate(declaration["joint_order"])}
         view = SimpleNamespace()
         previous = t.full((2, 43), .123)
         if native_getter:
@@ -301,10 +303,12 @@ class NativeEffortAdapterTests(unittest.TestCase):
             self.assertTrue((calls[0]["target"] == 0).all())
 
     def test_full43_declared_posture_caps_cannot_exceed_original_and_hand_cannot_bypass_total_cap(self):
-        for source in ("posture", "hand"):
+        for source in ("posture", "waist_pitch", "hand"):
             env, calls, _, _, _, _, contract, method = self.full_effort_fixture()
             if source == "posture":
                 contract["actuation"]["posture_gravity_feedforward"]["feedforward_caps_nm"][0] = 26.
+            elif source == "waist_pitch":
+                contract["actuation"]["posture_gravity_feedforward"]["feedforward_caps_nm"][-1] = 88.
             else:
                 env._last_written_hand_effort[0, 0] = .061
             with self.subTest(source=source), self.assertRaisesRegex(RuntimeError, "caps"):

@@ -1100,7 +1100,7 @@
             5.0,
             88.0,
             50.0,
-            88.0
+            50.0
           ],
           "native_pd_values_unchanged": true,
           "combined_pd_and_ff_total_not_certified_bounded": true,
