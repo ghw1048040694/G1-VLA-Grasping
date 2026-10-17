@@ -1108,9 +1108,9 @@
         }
       },
       "material": {
-        "variant": "hard_v4_control",
-        "compliant_contact_stiffness_n_m": 0.0,
-        "compliant_contact_damping_ns_m": 0.0,
+        "variant": "finger_compliant_v5",
+        "compliant_contact_stiffness_n_m": 1000.0,
+        "compliant_contact_damping_ns_m": 0.8,
         "compliant_contact_acceleration_spring": false,
         "rest_offset_m": 0.0,
         "contact_offset_m": 0.001,
