@@ -7,6 +7,7 @@ started. The contact-point and routing fixtures have independently known answers
 import ast
 import copy
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -43,6 +44,81 @@ class NativeEffortAdapterTests(unittest.TestCase):
         self.t = torch
         self.scope = {"torch": torch, "tensor": lambda v: v, "RLEnvironmentError": RuntimeError,
                       "settings": {"contact_offset_m": .001, "max_abs_normal_z": .6}}
+
+    def guide_fixture(self):
+        t = self.t
+        tree = ast.parse((ROOT/"src/g1_vla/rl_diagnostics.py").read_text())
+        nodes = [node for node in tree.body if
+                 (isinstance(node, ast.ClassDef) and node.name == "EffortGraspGuide") or
+                 (isinstance(node, ast.FunctionDef) and node.name in ("_bounded_vector", "_orientation_error")) or
+                 (isinstance(node, ast.Assign) and any(isinstance(v, ast.Name) and v.id == "POSE_SERVO"
+                                                      for v in node.targets))]
+        scope = {}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<actual-bootstrap-effort-guide>", "exec"), scope)
+        candidate = json.loads((ROOT/"resources/rl_geometry_candidates/opposed_face_effort_pinch_v1.json").read_text())
+        seed = candidate["source_hand_rad"]
+        q = t.zeros(2, 14)
+        q[:, 7:] = t.tensor(seed)
+        state = {"q_action_rad": q, "target_action_rad": q.clone(),
+            "joint_limits_action_rad": t.tensor([[[-2., 2.]]*14]*2),
+            "episode_id": t.zeros(2, dtype=t.long), "palm_position_world_m": t.zeros(2, 3),
+            "palm_quaternion_xyzw": t.tensor([[0., 0., 0., 1.]]*2),
+            "group_normal_force_n": t.zeros(2, 3), "unsafe_latched": t.zeros(2, dtype=t.bool),
+            "preload_contact_ready": t.zeros(2, dtype=t.bool),
+            "palm_point_jacobian_w": t.eye(6, 7)[None].repeat(2, 1, 1),
+            "per_step_action_rad": t.full((2, 14), .0198), "metrics": {}}
+        settings = {"guided_preload_controls": 3, "guided_probe_speed_m_s": .001,
+                    "guided_probe_height_m": .0025}
+        guide = scope["EffortGraspGuide"](t, settings, seed, state, candidate)
+        return guide, state
+
+    def test_actual_guide_first_request_accepts_empty_metrics_without_inventing_contact(self):
+        guide, state = self.guide_fixture()
+        requested, e = guide.actions(self.t.zeros(2, 14), state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertTrue(self.t.isfinite(requested).all())
+        self.assertGreater(float((e["guided_target_hand_rad"]-state["q_action_rad"][:, 7:]).abs().max()), 0)
+        self.assertFalse(e["stage_contact_geometry_is_control_signal_not_acceptance"].any())
+        self.assertFalse(e["closure_path_complete"].any())
+        self.assertFalse(e["probe_advance_permitted"].any())
+        self.assertTrue((e["preload_control_boundary_count"] == 0).all())
+        # Missing telemetry does not block a measured free-space waypoint.
+        state["q_action_rad"][:, 7:] = guide.goals[0]
+        guide.elapsed[:] = guide.durations[0]
+        _, e = guide.actions(self.t.zeros(2, 14), state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertTrue(e["stage_advance_after_this_request"].all())
+        self.assertTrue((e["stage0_precontact_raw_force_controls"] == 0).all())
+
+    def test_actual_guide_empty_metrics_cannot_qualify_final_or_stale_preload(self):
+        guide, state = self.guide_fixture()
+        guide.stage[:] = len(guide.names)-1
+        guide.elapsed[:] = guide.durations[-1]
+        guide.start[:] = guide.goals[-2]
+        guide.ready_count[:] = 4
+        state["q_action_rad"][:, 7:] = guide.goals[-1]
+        state["preload_contact_ready"][:] = True  # Even an inconsistent stale flag cannot promote missing feedback.
+        for _ in range(4):
+            _, e = guide.actions(self.t.zeros(2, 14), state, "guided_hand_pose_hold", .066, 1.5)
+            self.assertFalse(e["closure_path_complete"].any())
+            self.assertFalse(e["preload_contact_ready"].any())
+            self.assertFalse(e["probe_advance_permitted"].any())
+            self.assertTrue((e["probe_offset_m"] == 0).all())
+
+    def test_actual_guide_partial_contact_metrics_default_to_unavailable(self):
+        complete = {"contact_safe": self.t.ones(2, dtype=self.t.bool),
+                    "group_physical_loaded_contact_count": self.t.ones(2, 3, dtype=self.t.long),
+                    "opposition_dot": self.t.full((2,), -1.), "maximum_abs_normal_z": self.t.zeros(2),
+                    "maximum_penetration_m": self.t.zeros(2)}
+        for missing in complete:
+            with self.subTest(missing=missing):
+                guide, state = self.guide_fixture()
+                state["metrics"] = {key: value for key, value in complete.items() if key != missing}
+                state["group_normal_force_n"][:] = .4
+                guide.elapsed[:] = guide.durations[0]
+                guide.precontact_count[:] = 1
+                _, e = guide.actions(self.t.zeros(2, 14), state, "guided_hand_pose_hold", .066, 1.5)
+                self.assertFalse(e["stage_advance_after_this_request"].any())
+                self.assertFalse(e["stage_contact_geometry_is_control_signal_not_acceptance"].any())
+                self.assertTrue((e["stage0_precontact_raw_force_controls"] == 0).all())
 
     def geometry_fixture(self):
         t = self.t

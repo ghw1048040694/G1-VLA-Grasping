@@ -139,7 +139,7 @@ class EffortGraspGuide:
         delta = self.palm-state["palm_position_world_m"]
         angle = _orientation_error(t, self.rotation, state["palm_quaternion_xyzw"])
         tracking = (t.linalg.vector_norm(delta, dim=-1) <= .003) & (t.linalg.vector_norm(angle, dim=-1) <= .05)
-        metrics = state["metrics"]
+        metrics = state.get("metrics", {})
         overforce = (state["group_normal_force_n"] > force_limit).any(-1)
         progress = tracking & ~overforce & ~state["unsafe_latched"]
         index = self.stage.clone()
@@ -151,13 +151,23 @@ class EffortGraspGuide:
         measured_error = (state["q_action_rad"][:, 7:]-goal).abs().amax(-1)
         active_error = t.where(self.active[index], (state["q_action_rad"][:, 7:]-goal).abs(), 0.).amax(-1)
         final = index == len(self.names)-1
-        physical = metrics.get("contact_safe", t.zeros_like(progress))
-        contact_geometry = ((metrics["group_physical_loaded_contact_count"] > 0).all(-1) &
-            (metrics["opposition_dot"] <= -.6) & (metrics["maximum_abs_normal_z"] <= .6) &
-            (metrics["maximum_penetration_m"] <= .003) & ~overforce)
-        pair_physical = (metrics["group_physical_loaded_contact_count"][:, 1:] > 0).all(-1)
-        precontact_geometry = (active_error <= .05) | (pair_physical & (metrics["maximum_abs_normal_z"] <= .6))
-        precontact = ((index == 0) & (fraction >= 1) & tracking & ~overforce &
+        # No physics measurement exists on the first bootstrap request. Missing
+        # feedback permits free-space reference motion, never contact evidence.
+        contact_fields = ("contact_safe", "group_physical_loaded_contact_count", "opposition_dot",
+                          "maximum_abs_normal_z", "maximum_penetration_m")
+        contact_available = all(key in metrics for key in contact_fields)
+        group_loaded = metrics.get("group_physical_loaded_contact_count",
+                                   t.zeros_like(state["group_normal_force_n"], dtype=t.long))
+        unavailable = t.full_like(delta[:, 0], float("inf"))
+        opposition = metrics.get("opposition_dot", unavailable)
+        side_normal = metrics.get("maximum_abs_normal_z", unavailable)
+        penetration = metrics.get("maximum_penetration_m", unavailable)
+        physical = metrics.get("contact_safe", t.zeros_like(progress)) & contact_available
+        contact_geometry = ((group_loaded > 0).all(-1) & (opposition <= -.6) &
+            (side_normal <= .6) & (penetration <= .003) & ~overforce & contact_available)
+        pair_physical = (group_loaded[:, 1:] > 0).all(-1)
+        precontact_geometry = (active_error <= .05) | (pair_physical & (side_normal <= .6))
+        precontact = ((index == 0) & (fraction >= 1) & tracking & ~overforce & contact_available &
             precontact_geometry & (state["group_normal_force_n"][:, 1:] >= .05).all(-1))
         self.precontact_count = t.where(precontact, self.precontact_count+1, t.zeros_like(self.precontact_count))
         near = (active_error <= .025) | physical | contact_geometry | ((index == 0) & (self.precontact_count >= 2))
