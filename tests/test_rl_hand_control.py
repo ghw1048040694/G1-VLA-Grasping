@@ -510,6 +510,30 @@ class PhysicsStepPinchTests(unittest.TestCase):
         self.assertTrue(evidence["actual_requested_lead_not_yet_met"].all())
         self.assertFalse(unsafe.any())
 
+    def test_recorded_single_ulp_lead_breaches_enter_recovery_without_relaxing_native_bounds(self):
+        self.prime()
+        # Real run05 first-episode index0 states: both are one FP32 ULP beyond
+        # q+3mrad but below the former independent recovery detection tolerance.
+        self.applied[:, 3] = self.t.tensor([.8173501491546631, .8181098699569702])
+        self.measured[:, 3] = self.t.tensor([.8143500685691833, .8151097893714905])
+        inputs = self.inputs(1)
+        inputs["raw_group_force_n"][:, 1] = self.t.tensor([.04888264834880829, .3249495327472687])
+        inputs["macro_lower_hand_rad"] = self.applied-.2
+        inputs["macro_upper_hand_rad"] = self.applied+.2
+        target, e, unsafe = self.inner.update(**inputs)
+        exact_upper = self.measured[:, 3]+.003
+        self.assertTrue((self.applied[:, 3] > exact_upper).all())
+        self.assertTrue(e["contact_lead_recovery_by_joint"][:, 3].all())
+        self.assertTrue(e["contact_lead_recovery_too_closed_by_joint"][:, 3].all())
+        self.assertTrue(self.t.equal(target[:, 3], exact_upper))
+        self.assertFalse(e["actual_requested_lead_not_yet_met_by_joint"][:, 3].any())
+        self.assertFalse(e["request_constraints_infeasible"].any())
+        self.assertFalse(unsafe.any())
+        self.assertTrue((target >= inputs["step_lower_hand_rad"]).all())
+        self.assertTrue((target <= inputs["step_upper_hand_rad"]).all())
+        self.assertTrue((target >= inputs["macro_lower_hand_rad"]).all())
+        self.assertTrue((target <= inputs["macro_upper_hand_rad"]).all())
+
     def test_native_box_conflict_still_fails_closed_during_lead_recovery(self):
         self.prime()
         self.applied[:, 3] += .015

@@ -641,16 +641,19 @@ class PhysicsStepForceAdmittance:
         velocity = t.where(deadband, 0., velocity)
         lead = t.where(mode[:, self.group_ids], p["contact_target_lead_max_rad"],
                        p["free_target_lead_max_rad"])
-        old_lead = applied_hand_rad-measured_hand_rad
-        lead_recovery = mode[:, self.group_ids] & (old_lead.abs() > lead+1e-7)
-        signed_lead = old_lead*axis[None]
+        lead_lower, lead_upper = measured_hand_rad-lead, measured_hand_rad+lead
+        outside_previous_lead = (applied_hand_rad < lead_lower) | (applied_hand_rad > lead_upper)
+        lead_recovery = mode[:, self.group_ids] & outside_previous_lead
         effective_signed_velocity = velocity[:, self.group_ids].clone()
         # Contracting the lead on first touch cannot instantaneously move an
         # already written target through the native velocity box. Recover by
         # opening a too-closed target; other lagging targets hold until measured
         # joints catch up. Never reverse a high-force opening request to close.
-        too_closed = lead_recovery & feedback & (signed_lead > lead)
-        recovery_velocity = -((signed_lead-lead).clamp_min(0)/dt).clamp(
+        too_closed = lead_recovery & feedback & t.where(
+            axis[None] > 0, applied_hand_rad > lead_upper, applied_hand_rad < lead_lower)
+        recovery_distance = t.where(axis[None] > 0,
+            applied_hand_rad-lead_upper, lead_lower-applied_hand_rad).clamp_min(0)
+        recovery_velocity = -(recovery_distance/dt).clamp(
             max=p["retreat_speed_max_rad_s"])
         effective_signed_velocity = t.where(too_closed,
             t.minimum(effective_signed_velocity, recovery_velocity),
@@ -664,8 +667,8 @@ class PhysicsStepForceAdmittance:
         relaxed_lead = lead_recovery | lead_force_priority
         low = t.maximum(t.maximum(geometry_lower_hand_rad, step_lower_hand_rad), macro_lower_hand_rad)
         high = t.minimum(t.minimum(geometry_upper_hand_rad, step_upper_hand_rad), macro_upper_hand_rad)
-        low = t.where(relaxed_lead, low, t.maximum(low, measured_hand_rad-lead))
-        high = t.where(relaxed_lead, high, t.minimum(high, measured_hand_rad+lead))
+        low = t.where(relaxed_lead, low, t.maximum(low, lead_lower))
+        high = t.where(relaxed_lead, high, t.minimum(high, lead_upper))
         retreat_edge = self.most_closed_applied-axis[None]*p["maximum_retreat_rad"]
         force_low = t.maximum(t.minimum(applied_hand_rad, force_trial),
                              t.where(axis[None] > 0, retreat_edge, low))
@@ -710,8 +713,8 @@ class PhysicsStepForceAdmittance:
             "contact_lead_recovery": lead_recovery.any(-1),
             "contact_lead_recovery_too_closed_by_joint": too_closed,
             "contact_lead_high_force_retreat_priority_by_joint": lead_force_priority,
-            "actual_requested_lead_not_yet_met_by_joint": (target-measured_hand_rad).abs() > lead+1e-7,
-            "actual_requested_lead_not_yet_met": ((target-measured_hand_rad).abs() > lead+1e-7).any(-1),
+            "actual_requested_lead_not_yet_met_by_joint": (target < lead_lower) | (target > lead_upper),
+            "actual_requested_lead_not_yet_met": ((target < lead_lower) | (target > lead_upper)).any(-1),
             "force_admittance_closing_axis_hand7": axis,
             "force_admittance_previous_actually_written_hand_target_rad": applied_hand_rad,
             "force_admittance_most_closed_actual_applied_target_hand_rad": self.most_closed_applied.clone(),
