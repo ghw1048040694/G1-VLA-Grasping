@@ -1,0 +1,648 @@
+{
+  "schema_version": 2,
+  "candidate_id": "opposed_face_effort_pinch_v1",
+  "asset_sha256": "d23b9bbc8b59cf20fa1983f55874f855a76e038b9e22eae39542e62be5b4ba3d",
+  "oldseed_sha256": "b4b6ed59d18624b5bf45eda9153bc4b86f31eceebbaa30be98d66dee00e75470",
+  "hand_joint_order": [
+    "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
+    "right_hand_index_0_joint",
+    "right_hand_index_1_joint",
+    "right_hand_middle_0_joint",
+    "right_hand_middle_1_joint"
+  ],
+  "target_rad": [
+    0.5401264945959572,
+    -0.022767392420705527,
+    -1.2952979907592115,
+    0.976605351290174,
+    0.039498773323355954,
+    0.19911295904991522,
+    1.4450821710196666
+  ],
+  "source_hand_rad": [
+    0.7099596659290596,
+    -0.017536920855550652,
+    -1.1354126790570211,
+    0.7567796996938183,
+    0.32547714133564853,
+    0.1379705190297836,
+    1.326038654680329
+  ],
+  "closing_axis_hand7": [
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    1
+  ],
+  "closing_axis_scope": "Signs of fixed-palm near-contact 1mm-to-zero free-space q curve only; not an effort sign or universal contact controller. J.T external hand normal load has opposite sign to desired inward actuator effort.",
+  "closing_synergy_hand7_rad_per_m_gap": [
+    -16.875120225997797,
+    -8.027138874905154,
+    -5.838101853893551,
+    26.663938765831062,
+    -38.870844312191245,
+    4.278321399455609,
+    18.695415132025328
+  ],
+  "expected_geometry_q_domain": {
+    "type": "componentwise_closed_target_envelope",
+    "joint_names": [
+      "right_hand_thumb_0_joint",
+      "right_hand_thumb_1_joint",
+      "right_hand_thumb_2_joint",
+      "right_hand_index_0_joint",
+      "right_hand_index_1_joint",
+      "right_hand_middle_0_joint",
+      "right_hand_middle_1_joint"
+    ],
+    "lower_rad": [
+      0.5401264945959572,
+      -0.022767392420705527,
+      -1.2952979907592115,
+      0.7567796996938183,
+      0.039498773323355954,
+      0.1379705190297836,
+      1.326038654680329
+    ],
+    "upper_rad": [
+      0.7099596659290596,
+      -0.009923970220857283,
+      -1.1354126790570211,
+      0.976605351290174,
+      0.32547714133564853,
+      0.19911295904991522,
+      1.4450821710196666
+    ],
+    "actual_joint_overshoot_guaranteed": false,
+    "native_joint_limits_rad": [
+      [
+        -1.0471975511965976,
+        1.0471975511965976
+      ],
+      [
+        -1.0471975511965976,
+        0.6108651716189881
+      ],
+      [
+        -1.745329118836275,
+        0.0
+      ],
+      [
+        0.0,
+        1.5707963267948966
+      ],
+      [
+        0.0,
+        1.745329118836275
+      ],
+      [
+        0.0,
+        1.5707963267948966
+      ],
+      [
+        0.0,
+        1.745329118836275
+      ]
+    ]
+  },
+  "reset_joint_positions_rad": {
+    "left_hip_pitch_joint": -0.0006418623626965955,
+    "left_hip_roll_joint": -3.2394292618588494e-05,
+    "left_hip_yaw_joint": -6.133253018584328e-05,
+    "left_knee_joint": -0.0009247913572923371,
+    "left_ankle_pitch_joint": -0.004266868949765445,
+    "left_ankle_roll_joint": 0.00028280703069484206,
+    "right_hip_pitch_joint": 2.1172110775143412e-05,
+    "right_hip_roll_joint": -3.5301240575251465e-05,
+    "right_hip_yaw_joint": 7.887493883917577e-06,
+    "right_knee_joint": 2.1952096388687057e-07,
+    "right_ankle_pitch_joint": -3.523809302574666e-07,
+    "right_ankle_roll_joint": -2.1813285100730873e-07,
+    "waist_yaw_joint": 0,
+    "waist_roll_joint": 0,
+    "waist_pitch_joint": 0,
+    "left_shoulder_pitch_joint": 0.3956755842413026,
+    "left_shoulder_roll_joint": 0.532214580766817,
+    "left_shoulder_yaw_joint": 0.7277394939258747,
+    "left_elbow_joint": -0.4968674943260441,
+    "left_wrist_roll_joint": -0.6949255915674071,
+    "left_wrist_pitch_joint": 0.5190110359192706,
+    "left_wrist_yaw_joint": -0.4084832594582234,
+    "left_hand_thumb_0_joint": 1.105334019152098e-06,
+    "left_hand_thumb_1_joint": -8.419040451144016e-06,
+    "left_hand_thumb_2_joint": 0.00999862612918647,
+    "left_hand_middle_0_joint": -0.010025299092521126,
+    "left_hand_middle_1_joint": -0.010004033714205081,
+    "left_hand_index_0_joint": -0.010026628750722605,
+    "left_hand_index_1_joint": -0.010004193808716774,
+    "right_shoulder_pitch_joint": -0.8417976702332476,
+    "right_shoulder_roll_joint": 0.06593865933550563,
+    "right_shoulder_yaw_joint": 1.010678311152665,
+    "right_elbow_joint": 0.7754818797825681,
+    "right_wrist_roll_joint": 0.22300153176719134,
+    "right_wrist_pitch_joint": 0.6593659245685349,
+    "right_wrist_yaw_joint": -0.43587958056087706,
+    "right_hand_thumb_0_joint": 0.7099596659290596,
+    "right_hand_thumb_1_joint": -0.017536920855550652,
+    "right_hand_thumb_2_joint": -1.1354126790570211,
+    "right_hand_index_0_joint": 0.7567796996938183,
+    "right_hand_index_1_joint": 0.32547714133564853,
+    "right_hand_middle_0_joint": 0.1379705190297836,
+    "right_hand_middle_1_joint": 1.326038654680329
+  },
+  "reset_root_pose_xyzw": [
+    0.005995602712329634,
+    0.004629233246093502,
+    0.7931194348434304,
+    -0.0029182467633710545,
+    0.0037811366610237753,
+    6.324269557889628e-05,
+    0.9999885913557914
+  ],
+  "reset_palm_pose_world_m": [
+    0.38782849925889384,
+    0.033041249489980565,
+    0.8245887376672051
+  ],
+  "reset_palm_quaternion_xyzw": [
+    -0.4496228691740382,
+    0.18758414278761307,
+    0.16082212738259258,
+    0.8583633893838201
+  ],
+  "reset_palm_site_body_name": "right_wrist_yaw_link",
+  "reset_palm_site_position_m": [
+    0.14,
+    0.0,
+    0.0
+  ],
+  "reset_palm_site_quaternion_xyzw": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "reset_palm_contact_body_name": "right_hand_palm_link",
+  "reset_palm_link_pose_xyzw": [
+    0.30268997231927397,
+    0.02083016013929574,
+    0.8726883305838163,
+    -0.4496228691740382,
+    0.18758414278761307,
+    0.16082212738259258,
+    0.8583633893838201
+  ],
+  "reset_native_fk_reference": {
+    "method": "independent_official_native_joint_frame_FK_explicit_stage19_reset_override_v1",
+    "usd_entry_sha256": "d23b9bbc8b59cf20fa1983f55874f855a76e038b9e22eae39542e62be5b4ba3d",
+    "usd_structure_sha256": "25039b8b5a71f4627ccf8a41767c4ca85fbff491a9e1f0900357db1e67f13ef7",
+    "joint_position_units": "radian; USD limit metadata separately degree_to_radian",
+    "root_body": "pelvis",
+    "palm_site_body": "right_wrist_yaw_link",
+    "palm_world_position_m": [
+      0.38782849925889384,
+      0.033041249489980565,
+      0.8245887376672051
+    ],
+    "palm_quaternion_xyzw": [
+      -0.4496228691740382,
+      0.18758414278761307,
+      0.16082212738259258,
+      0.8583633893838201
+    ],
+    "palm_rotation_world": [
+      [
+        0.8778968654375472,
+        -0.44477189367951525,
+        0.17741210851480008
+      ],
+      [
+        0.10740341171263926,
+        0.5439510377196861,
+        0.8322149816700987
+      ],
+      [
+        -0.46664933387653607,
+        -0.7115442580447227,
+        0.5253029297806845
+      ]
+    ],
+    "body_count": 55,
+    "source_palm_position_delta_m": 0.062201653997412086,
+    "source_seed_untouched": true,
+    "reference_geometry_artifact_sha256": "140bf9319f49d6e05c352cde47f9589e080979b8c3faaf58c9a57c58bdddf9f3"
+  },
+  "original_seed_fields_to_preserve": {
+    "source_palm_world_position_m": [
+      0.35942570611307584,
+      0.08400048969379546,
+      0.845543178010653
+    ],
+    "source_palm_rotation_world": [
+      [
+        0.8036605645484584,
+        -0.16239890201666018,
+        -0.5725000380903363
+      ],
+      [
+        0.5412008698257423,
+        -0.20057862554315592,
+        0.8166209852037105
+      ],
+      [
+        -0.2474496221244099,
+        -0.9661236005806928,
+        -0.07330670441020452
+      ]
+    ],
+    "reset_vertical_lift_m": 0.000622058724370933
+  },
+  "reset_protocol": "explicit_43_joint_open_opposed_faces_v1_no_episode_pose_write",
+  "reset_velocity_protocol": "zero velocities only at reset; no attachment/object freeze/external impulse",
+  "cube_pose_source": "original pinned seed unchanged, plus same8 declared XY offsets; all4 repeats remain non-independent",
+  "fixed_cube_offsets_m": [
+    [
+      -0.0004,
+      -0.0002
+    ],
+    [
+      -0.0004,
+      0.0002
+    ],
+    [
+      -0.0002,
+      -0.0004
+    ],
+    [
+      -0.0002,
+      0.0004
+    ],
+    [
+      0.0002,
+      -0.0004
+    ],
+    [
+      0.0002,
+      0.0004
+    ],
+    [
+      0.0004,
+      -0.0002
+    ],
+    [
+      0.0004,
+      0.0002
+    ]
+  ],
+  "geometry_evidence": {
+    "protocol": "offline_native_usd_opposed_face_effort_geometry_v1",
+    "qualification": "candidate_only_not_physics_qualified",
+    "units": "m_rad",
+    "hand_joint_limits_rad": [
+      [
+        -1.0471975511965976,
+        1.0471975511965976
+      ],
+      [
+        -1.0471975511965976,
+        0.6108651716189881
+      ],
+      [
+        -1.745329118836275,
+        0.0
+      ],
+      [
+        0.0,
+        1.5707963267948966
+      ],
+      [
+        0.0,
+        1.745329118836275
+      ],
+      [
+        0.0,
+        1.5707963267948966
+      ],
+      [
+        0.0,
+        1.745329118836275
+      ]
+    ],
+    "finger_surface_evidence": {
+      "thumb": {
+        "contact_body": "right_hand_thumb_2_link",
+        "minimum_distance_to_cube_m": 0.00019999998885194506,
+        "closest_point_world_m": [
+          0.32480025896123865,
+          0.0546738441842364,
+          0.7787799988778419
+        ],
+        "cube_closest_point_world_m": [
+          0.32500025895008977,
+          0.05467384394593702,
+          0.7787799983705007
+        ],
+        "closing_direction_world": [
+          0.9999999999958665,
+          -1.1914969675572095e-06,
+          -2.5367059867762605e-06
+        ],
+        "normal_cube_to_hand_world": [
+          -0.9999999999958665,
+          1.1914969675572095e-06,
+          2.5367059867762605e-06
+        ],
+        "contact_point_body_local_m": [
+          0.002051502233371127,
+          0.0471031777560712,
+          0.0070814811624586626
+        ],
+        "method": "Official native USD joint-frame FK plus exact GJK between authored convex hull and original 50mm oriented Cube at nominal center; positive 0.2mm waypoint. Native cooked shape/contact normals must be physically confirmed."
+      },
+      "index": {
+        "contact_body": "right_hand_index_1_link",
+        "minimum_distance_to_cube_m": 0.00020000020687332038,
+        "closest_point_world_m": [
+          0.3752003203068102,
+          0.07352677886375728,
+          0.7940306131936583
+        ],
+        "cube_closest_point_world_m": [
+          0.3750003200999377,
+          0.07352677910205412,
+          0.7940306137009955
+        ],
+        "closing_direction_world": [
+          -0.9999999999958835,
+          1.1914829705368054e-06,
+          2.5366832375047083e-06
+        ],
+        "normal_cube_to_hand_world": [
+          0.9999999999958835,
+          -1.1914829705368054e-06,
+          -2.5366832375047083e-06
+        ],
+        "contact_point_body_local_m": [
+          0.01514573581516738,
+          0.006991289090365183,
+          -0.013100000098347626
+        ],
+        "method": "Official native USD joint-frame FK plus exact GJK between authored convex hull and original 50mm oriented Cube at nominal center; positive 0.2mm waypoint. Native cooked shape/contact normals must be physically confirmed."
+      },
+      "middle": {
+        "contact_body": "right_hand_middle_1_link",
+        "minimum_distance_to_cube_m": 0.00019999994144590018,
+        "closest_point_world_m": [
+          0.3752001955023662,
+          0.0354632343658319,
+          0.7628144615017168
+        ],
+        "cube_closest_point_world_m": [
+          0.3750001955609211,
+          0.03546323460413206,
+          0.7628144620090574
+        ],
+        "closing_direction_world": [
+          -0.9999999999959731,
+          1.1915011357598094e-06,
+          2.536703812494052e-06
+        ],
+        "normal_cube_to_hand_world": [
+          0.9999999999959731,
+          -1.1915011357598094e-06,
+          -2.536703812494052e-06
+        ],
+        "contact_point_body_local_m": [
+          0.04685344547033311,
+          0.003553424496203634,
+          -0.004175010137259958
+        ],
+        "method": "Official native USD joint-frame FK plus exact GJK between authored convex hull and original 50mm oriented Cube at nominal center; positive 0.2mm waypoint. Native cooked shape/contact normals must be physically confirmed."
+      }
+    },
+    "source_detail": {
+      "structural_change": "Index and middle contact same Cube +X face, thumb opposite -X face; original corner three-face grasp abandoned. Explicit open reset + independently solved 7arm pose and waist[0,0,0].",
+      "palm_frame_contract": "reset_palm/reference fields refer original wrist-yaw palm SITE, not palm rigid-body origin; reset_palm_link_pose_xyzw is actual collision palm body.",
+      "stage_keyframes": [
+        {
+          "name": "source",
+          "hand_target_rad": [
+            0.7099596659290596,
+            -0.017536920855550652,
+            -1.1354126790570211,
+            0.7567796996938183,
+            0.32547714133564853,
+            0.1379705190297836,
+            1.326038654680329
+          ],
+          "nominal_authored_gap_m": 0.008
+        },
+        {
+          "name": "symmetric_open_8mm_to4mm",
+          "hand_target_rad": [
+            0.6264510416071345,
+            -0.013497584137606466,
+            -1.219001950856661,
+            0.8551509396061168,
+            0.21136380267178806,
+            0.1829556366037699,
+            1.3533835135386467
+          ],
+          "nominal_authored_gap_m": 0.004,
+          "duration_s": 0.9
+        },
+        {
+          "name": "guarded_open_4mm_to1mm",
+          "hand_target_rad": [
+            0.5671266869575536,
+            -0.009923970220857283,
+            -1.2859570277929817,
+            0.9339430492648443,
+            0.10169212422286195,
+            0.19226764481078623,
+            1.415169506808426
+          ],
+          "nominal_authored_gap_m": 0.001,
+          "duration_s": 0.8
+        },
+        {
+          "name": "contact_entry_1mm_to_point2mm",
+          "hand_target_rad": [
+            0.5535855020716709,
+            -0.016280420088768427,
+            -1.2907244024831974,
+            0.9558330930134917,
+            0.0684384701624832,
+            0.1956186597565239,
+            1.43022235693989
+          ],
+          "nominal_authored_gap_m": 0.0002,
+          "duration_s": 0.6,
+          "control_contract": "Actual first contact stops free-space tangent motion; q is reference/envelope only. Force equilibrium is not free-space joint completion."
+        },
+        {
+          "name": "zero_gap_contact_reference",
+          "hand_target_rad": [
+            0.5502515667315558,
+            -0.017951109095762436,
+            -1.2917951296468753,
+            0.9606069880306753,
+            0.0628212799106707,
+            0.19654596621024184,
+            1.4338649219404513
+          ],
+          "nominal_authored_gap_m": 0.0,
+          "duration_s": 0.4,
+          "control_contract": "Actual first contact stops free-space tangent motion; q is reference/envelope only. Force equilibrium is not free-space joint completion."
+        },
+        {
+          "name": "bounded_force_envelope",
+          "hand_target_rad": [
+            0.5401264945959572,
+            -0.022767392420705527,
+            -1.2952979907592115,
+            0.976605351290174,
+            0.039498773323355954,
+            0.19911295904991522,
+            1.4450821710196666
+          ],
+          "nominal_authored_gap_m": -0.0006,
+          "duration_s": 0.6,
+          "control_contract": "Actual first contact stops free-space tangent motion; q is reference/envelope only. Force equilibrium is not free-space joint completion."
+        }
+      ],
+      "stage_progress_contract": "Precontact motion uses coordinated q-curve. At first actual contact, switch that pad to normal force/contact mode and stop tangent ramp. Do not wait for collision-blocked free-space q goal or push through to final cap. Only original actual contact/support gates qualify.",
+      "contact_reference_hand_rad": [
+        0.5502515667315558,
+        -0.017951109095762436,
+        -1.2917951296468753,
+        0.9606069880306753,
+        0.0628212799106707,
+        0.19654596621024184,
+        1.4338649219404513
+      ],
+      "precontact_point2mm_hand_rad": [
+        0.5535855020716709,
+        -0.016280420088768427,
+        -1.2907244024831974,
+        0.9558330930134917,
+        0.0684384701624832,
+        0.1956186597565239,
+        1.43022235693989
+      ],
+      "normal_force_balance_reference_not_measured_N": [
+        0.6,
+        0.3,
+        0.3
+      ],
+      "nominal_thumb_to_index_middle_force_fraction": 0.5074130552530008,
+      "nominal_normal_wrench_balance_error_m": 0.00016268559586307704,
+      "contact_point_jacobian_artifact": {
+        "path": "artifacts/g1-rebuild-20261017/stage19/opposed_face_contact_jacobian_v1.json",
+        "sha256": "ce8bb6016c693f8879d4926281ce8202e232a3e4ab298ef836bc84ec7d8f8a32"
+      },
+      "required_normal_only_contact_control": "At first real contact, stop that pad's free-space tangent motion; apply normal-only contact/force controller with actual-point J, measured force and common balance. No continued independent q-target ramp. If tangent/force constraints infeasible, hold/retract; no normal/friction/artificial force modifications.",
+      "normal_only_qdot_example_rad_s": [
+        0.002956225935315203,
+        0.0003308804862816651,
+        -0.0018361612347689421,
+        -0.0012792317367154682,
+        0.00021425437099972707,
+        -0.0008626874461104806,
+        -0.0050161325682586974,
+        -0.01521159056694357,
+        -0.012119805558662669,
+        -0.0027666246036335243,
+        0.014359094756507105,
+        0.004150597812945194,
+        0.008400984244428956,
+        0.007689784654958791
+      ],
+      "free_hand_synergy_pad_velocity_at_1mm_s_m_s": [
+        [
+          0.0009992460843501294,
+          8.526249604353808e-05,
+          0.0003455147807369992
+        ],
+        [
+          -0.0010011334793610916,
+          0.00028522964153257973,
+          -0.00011376136752554367
+        ],
+        [
+          -0.0009959252703653,
+          -9.104054879047064e-05,
+          0.0004805884305913848
+        ]
+      ],
+      "force_command_sign_contract": "n is cube-to-hand and Fn*n is external load on hand. Actuator inward effort is -J.T@(Fn*n), never +J.T external load.",
+      "planned_kinematics_only_no_controller_tuning": true,
+      "sampled_path_points": 101,
+      "minimum_reset_right_robot_cube_distance_all8_m": 0.0075946711586492325,
+      "minimum_nonpad_right_cube_distance_all8_path_m": 0.0024754222821293395,
+      "minimum_active_right_table_distance_path_m": 0.0035156094757872185,
+      "minimum_unfiltered_active_right_self_near_distance_m": 0.0026283683055544757,
+      "audit_artifacts": [
+        {
+          "path": "artifacts/g1-rebuild-20261017/stage19/opposed_face_all8_sampled_path_audit_v1.json",
+          "sha256": "140bf9319f49d6e05c352cde47f9589e080979b8c3faaf58c9a57c58bdddf9f3"
+        },
+        {
+          "path": "artifacts/g1-rebuild-20261017/stage19/opposed_face_contact_jacobian_v1.json",
+          "sha256": "ce8bb6016c693f8879d4926281ce8202e232a3e4ab298ef836bc84ec7d8f8a32"
+        },
+        {
+          "path": "artifacts/g1-rebuild-20261017/stage19/opposed_face_normal_wrench_geometry_search_v1.json",
+          "sha256": "f01804d9d3bfcfb6eb845e95deea3fedae45bc6d12af5655919488db35ab13b5"
+        },
+        {
+          "path": "artifacts/g1-rebuild-20261017/stage19/opposed_face_native_ik_collision_choices_v1.json",
+          "sha256": "bad1404dc554efb75a81e0b942fb9383b6626efec2228403e082ae8709764053"
+        },
+        {
+          "path": "artifacts/g1-rebuild-20261017/stage19/official_all_authored_collision_hulls_offline_v1.json",
+          "sha256": "845ef7a940836798f91bb94a5469734d57e97c416f4b5772baee19d8c9525073"
+        }
+      ],
+      "geometry_method": "54 authored collision shapes/48 bodies, instance proxies included. Exact ConvexHull for native Mesh/Cube; other primitive bodies conservatively bounded by local cuboid. GJK distances and 101 q-path samples/all8 Cube offsets. Positive distance certifies authored separation at samples; not continuous/cooked/native physics proof.",
+      "search_domain": "Finite same-face palm/q search then native bounded7arm IK over explicit limited waist grid and exact right shoulder/torso screening. No physical outcomes used for candidate tuning. Search artifacts preserve rejected solutions.",
+      "actuators": "Original seed native PD/effort/armature/damping unchanged by resource. New explicit effort/soft model requires separately versioned controller/model and physical calibration."
+    }
+  },
+  "known_geometric_overlaps": [
+    {
+      "bodies": [
+        "left_hand_camera_base_link",
+        "left_wrist_pitch_link"
+      ],
+      "scope": "preexisting left-hand fixed/adjacent authored geometry; unchanged relative geometry; native cooked/filtered treatment not measured here"
+    },
+    {
+      "bodies": [
+        "left_hand_camera_base_link",
+        "left_hand_palm_link"
+      ],
+      "scope": "preexisting left-hand fixed/adjacent authored geometry; unchanged relative geometry; native cooked/filtered treatment not measured here"
+    },
+    {
+      "bodies": [
+        "left_hand_camera_base_link",
+        "left_hand_thumb_0_link"
+      ],
+      "scope": "preexisting left-hand fixed/adjacent authored geometry; unchanged relative geometry; native cooked/filtered treatment not measured here"
+    }
+  ],
+  "admission_limitations": [
+    "Only authored/sampled active-right geometry admitted. Global robot self-collision-free claim blocked by documented original left fixed/adjacent overlaps until model semantics/actual forces checked.",
+    "All8 fixed offsets are repeats of the same local task, not layout generalization.",
+    "Normal contact/force/penetration, object Table unloading, friction certification and original strict success remain untested for this candidate.",
+    "Positive-gap contact force cannot establish actual loaded/support; original separation<=0 definition retained.",
+    "Final negative nominal gap is a conservative closing envelope, not actual penetration or force bound; stop by actual contact-force mode, not by reaching cap.",
+    "No main lift, no training, no new success threshold. First physical task is matched hard/soft contact calibration."
+  ]
+}

@@ -38,6 +38,9 @@ _PLANS = {"four_way_v1": ("g1_control_physics_diagnostics_v1", _PROFILES),
                "control_guard_version": "box_halfspace_projected_v2"}]),
           "physics_pinch_v5": ("g1_control_physics_diagnostics_v5", [
               {"name": "physics_pinch_pose_hold", "action_source": "guided_hand_pose_hold",
+               "control_guard_version": "box_halfspace_projected_v2"}]),
+          "balanced_effort_v6": ("g1_control_physics_diagnostics_v6", [
+              {"name": "balanced_effort_pose_hold", "action_source": "guided_hand_pose_hold",
                "control_guard_version": "box_halfspace_projected_v2"}])}
 _OLD_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v3"
 _FIXED_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v4_fixed_palm_adjacency"
@@ -109,6 +112,7 @@ RL_PROBE_DEFAULTS = {
     "candidate_id": "",
     "guided_target_lead_max_rad": None,
     "compliant_pinch_controller": None,
+    "effort_grasp_controller": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -208,7 +212,16 @@ def validate_probe_settings(value):
         raise ValueError("Diagnostic backend must match the declared profile_plan")
     if "profiles" not in value:
         result["profiles"] = copy.deepcopy(profiles)
-    for key, expected in (("num_envs", 8), ("episodes_per_env", 4), ("max_control_steps", 364),
+    effort = None
+    if plan == "balanced_effort_v6":
+        from .rl_effort_protocol import validate_effort_grasp_contract
+        effort = validate_effort_grasp_contract(result["effort_grasp_controller"])
+        result["effort_grasp_controller"] = effort
+    elif result["effort_grasp_controller"] is not None:
+        raise ValueError("Legacy diagnostics cannot silently install a new effort/material/reset model")
+    eval_plan = effort["evaluation"] if effort is not None else {"num_envs": 8, "episodes_per_env": 4, "max_control_steps": 364}
+    for key, expected in (("num_envs", eval_plan["num_envs"]), ("episodes_per_env", eval_plan["episodes_per_env"]),
+                          ("max_control_steps", eval_plan["max_control_steps"]),
                           ("optimizer_steps", 0), ("guided_preload_controls", 3),
                           ("guided_probe_height_m", .0025), ("guided_probe_speed_m_s", .002),
                           ("guided_force_relief_step_rad", .005)):
@@ -217,7 +230,7 @@ def validate_probe_settings(value):
     if result["profiles"] != profiles:
         raise ValueError("Diagnostics require exactly the declared profile_plan action/guard profiles in order")
     lead = result["guided_target_lead_max_rad"]
-    if ((plan in ("four_way_v1", "compliant_pinch_v4", "physics_pinch_v5") and lead is not None) or
+    if ((plan in ("four_way_v1", "compliant_pinch_v4", "physics_pinch_v5", "balanced_effort_v6") and lead is not None) or
             (plan in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3") and (type(lead) not in (int, float) or lead != .006))):
         raise ValueError("Diagnostic plan pins guided_target_lead_max_rad: None forv1/v4, .006 forv2/v3")
     if plan in _COMPLIANT_PLANS:
@@ -570,6 +583,98 @@ def _verify_geometry_candidate(config, settings, policy, reference):
     return path, result
 
 
+def _verify_effort_probe_reference(config, settings, current_audit):
+    """Admit a new declared model without claiming old-actor equivalence."""
+    from .rl_effort_protocol import validate_effort_grasp_contract
+    from .rl_protocol import RL_PHYSICS_EFFORT_GRASP
+    contract = validate_effort_grasp_contract(settings["effort_grasp_controller"])
+    manifest_path, manifest = _read_pinned(config, settings, "reference_manifest_path", "reference_manifest_sha256")
+    audit_path, old = _read_pinned(config, settings, "reference_environment_audit_path", "reference_environment_audit_sha256")
+    if (_reference_source_identity(manifest) != settings["reference_source_tree_sha256"] or
+            old.get("policy_contract_sha256") != settings["reference_policy_contract_sha256"] or
+            _canonical(old.get("policy_contract")) != settings["reference_policy_contract_sha256"]):
+        raise ValueError("Historical baseline provenance changed")
+    candidate_path = _path(config, settings["candidate_path"])
+    if _file_hash(candidate_path) != settings["candidate_sha256"]:
+        raise ValueError("Effort grasp geometry changed after explicit selection")
+    candidate = json.loads(candidate_path.read_text())
+    if (candidate.get("asset_sha256") != old["policy_contract"]["asset_sha256"] or
+            candidate.get("oldseed_sha256") != old["policy_contract"]["seed_state_sha256"]):
+        raise ValueError("New geometry/reset resource must pin the original official asset and unchanged seed bytes")
+    frames = candidate.get("geometry_evidence", {}).get("source_detail", {}).get("stage_keyframes")
+    if (candidate.get("candidate_id") != settings["candidate_id"] or
+            not isinstance(frames, list) or len(frames) < 2):
+        raise ValueError("Effort grasp requires a named geometry/reset/trajectory resource")
+    for frame in frames:
+        q = frame.get("hand_target_rad", frame.get("target_rad"))
+        if (not isinstance(q, list) or len(q) != 7 or
+                any(type(x) not in (int, float) or not math.isfinite(x) for x in q)):
+            raise ValueError("Effort trajectory requires seven finite joint values per keyframe")
+    if frames[-1].get("hand_target_rad", frames[-1].get("target_rad")) != settings["guided_hand_target_rad"]:
+        raise ValueError("Declared effort goal differs from geometry resource")
+    reset = candidate.get("reset_joint_positions_rad")
+    axes = candidate.get("closing_axis_hand7")
+    if (not isinstance(reset, dict) or len(reset) != 43 or
+            any(type(v) not in (int, float) or not math.isfinite(v) for v in reset.values()) or
+            not isinstance(axes, list) or len(axes) != 7 or
+            any(type(v) not in (int, float) or v not in (-1, 0, 1) for v in axes) or
+            any(not any(axes[i] for i in ids) for ids in ((0, 1, 2), (3, 4), (5, 6)))):
+        raise ValueError("Effort geometry requires an explicit43 reset and declared nonzero group closing axes")
+    if config["rl_teacher"]["physics_protocol"] != RL_PHYSICS_EFFORT_GRASP:
+        raise ValueError("Effort/material/reset intervention requires its own model identity")
+    current_verified = current_audit is not None
+    if current_verified:
+        actual = current_audit.get("policy_contract", {})
+        if (current_audit.get("source_tree_sha256") != _current_source_identity() or
+                current_audit.get("physics_version") != RL_PHYSICS_EFFORT_GRASP or
+                actual.get("effort_grasp_controller") != contract or
+                current_audit.get("diagnostic_effort_drive_readback", {}).get("verified") is not True or
+                current_audit.get("diagnostic_material_readback", {}).get("verified") is not True or
+                current_audit.get("policy_contract_sha256") != _canonical(actual)):
+            raise ValueError("Native effort/material/source readback differs from the explicit new model")
+        filters = current_audit.get("fixed_cluster_collision_filter_override", {}).get("current_stage_readback", {})
+        n = contract["evaluation"]["num_envs"]
+        self_collisions = filters.get("global_self_collision_readback", {})
+        if (actual.get("reset_protocol") != candidate.get("reset_protocol") or
+                current_audit.get("initial_state", {}).get("joint_positions_rad") != reset or
+                current_audit.get("initial_state", {}).get("root_pose_xyzw") != candidate.get("reset_root_pose_xyzw") or
+                actual.get("official_native_fk_reference") != candidate.get("reset_native_fk_reference") or
+                actual.get("explicit_reset_resource_sha256") != settings["candidate_sha256"] or
+                filters.get("available") is not True or filters.get("num_envs") != n or
+                filters.get("excluded_pair_count_per_env") != 30 or
+                filters.get("excluded_pair_count_total") != 30*n or
+                filters.get("source_graph_verified_env_count") != n or
+                len(self_collisions) != n or
+                any(v.get("enabled_self_collisions") is not True for v in self_collisions.values())):
+            raise ValueError("Native explicit reset or bilateral collision model differs from its declaration")
+        original = old["policy_contract"]
+        if actual.get("resolved_settings") != original.get("resolved_settings"):
+            raise ValueError("Effort probe must retain all original resolved physics and qualification settings")
+        for key in ("asset_sha256", "asset_manifest_sha256", "seed_state_sha256", "physics_dt_s",
+                    "control_period_s", "validation_offsets_m", "joint_limit_tolerance_rad", "support_gate_version"):
+            if actual.get(key) != original.get(key):
+                raise ValueError("Effort probe changed an undeclared invariant: " + key)
+        required = {"group_force_max_n": 1.5, "max_penetration_m": .003,
+                    "opposition_dot_max": -.6, "max_abs_normal_z": .6,
+                    "support_window_s": .198, "support_clearance_min_m": .002}
+        if any(actual.get("resolved_settings", {}).get(k) != v for k, v in required.items()):
+            raise ValueError("Effort probe must retain the original physical acceptance thresholds")
+    return {"reference_verified": True, "historical_baseline_only": True,
+        "checkpoint_metadata_verified": False, "actor_loaded": False,
+        "current_contract_verified": current_verified,
+        "ready_for_physical_probe": bool(settings["enabled"] and current_verified),
+        "source_identical_trained_eval": False, "optimizer_steps": 0, "training_allowed": False,
+        "diagnostic_backend": settings["backend"], "profile_plan": settings["profile_plan"],
+        "declared_profile_names": [p["name"] for p in settings["profiles"]],
+        "four_way_comparison_complete": False, "four_way_comparison_declared": False,
+        "diagnostic_controller_protocol": contract, "diagnostic_controller_protocol_sha256": _canonical(contract),
+        "current_source_tree_sha256": _current_source_identity(),
+        "candidate_reference": {"candidate_id": settings["candidate_id"],
+            "candidate_sha256": settings["candidate_sha256"], "physical_qualification": False},
+        "reference_files": [str(manifest_path), str(audit_path), str(candidate_path)],
+        "scope": "new explicit effort/material/reset engineering probe; no learned actor, training or original20 claim"}
+
+
 def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
     """Verify old provenance and, when supplied, the new diagnostic contract.
 
@@ -578,6 +683,8 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
     passing both actual checkpoint infos and its current source-tagged audit.
     """
     settings = validate_probe_settings(config.get("rl_diagnostics", {}))
+    if settings["profile_plan"] == "balanced_effort_v6":
+        return _verify_effort_probe_reference(config, settings, current_audit)
     manifest_path, manifest = _read_pinned(config, settings, "reference_manifest_path", "reference_manifest_sha256")
     audit_path, reference = _read_pinned(config, settings, "reference_environment_audit_path", "reference_environment_audit_sha256")
     checkpoint = _path(config, settings["reference_checkpoint_path"])

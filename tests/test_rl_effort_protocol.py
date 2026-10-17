@@ -1,0 +1,234 @@
+"""Backend-free safety/provenance checks for effort calibration declarations."""
+
+from copy import deepcopy
+import json
+import math
+import unittest
+
+from g1_vla.rl_effort_protocol import (
+    balanced_effort_controller_contract, effort_grasp_contract,
+    validate_balanced_effort_controller_contract, validate_effort_grasp_contract,
+    ALWAYS_RIGID_BODY_NAMES, FINGER_BODY_NAMES,
+)
+
+
+class EffortGraspProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.value = effort_grasp_contract()
+
+    def reject(self, group, key, value):
+        candidate = deepcopy(self.value)
+        (candidate if group is None else candidate[group])[key] = value
+        with self.assertRaises(ValueError):
+            validate_effort_grasp_contract(candidate)
+
+    def test_default_is_fresh_and_json_roundtrips(self):
+        original = effort_grasp_contract()
+        result = validate_effort_grasp_contract(json.loads(json.dumps(original)))
+        result["actuation"]["total_torque_caps_nm"][0] = 0.001
+        self.assertEqual(effort_grasp_contract(), original)
+        self.assertEqual(self.value, original)
+
+    def test_compliant_material_is_explicit_positive_force_spring(self):
+        self.value["material"].update(variant="finger_compliant_v5",
+                                     compliant_contact_stiffness_n_m=1000.0,
+                                     compliant_contact_damping_ns_m=0.8)
+        self.assertEqual(validate_effort_grasp_contract(self.value), self.value)
+
+    def test_explicit_parameters_vary_without_changing_code(self):
+        self.value["material"].update(variant="finger_compliant_v5",
+                                     compliant_contact_stiffness_n_m=800.0,
+                                     compliant_contact_damping_ns_m=1.25)
+        self.value["actuation"]["total_torque_caps_nm"] = [0.05] * 7
+        self.value["controller"]["parameters"]["joint_torque_limits_nm"] = [0.05] * 7
+        self.value["evaluation"]["max_wall_time_s"] = 900
+        self.value["logging"].update(raw_pre_steps=2, raw_post_steps=4, raw_max_samples=256)
+        self.assertEqual(validate_effort_grasp_contract(self.value), self.value)
+
+    def test_acceptance32_requires_full_fixed_quota(self):
+        self.value["evaluation"].update(protocol="acceptance32_v1", episodes_per_env=4,
+                                       max_control_steps=364)
+        validate_effort_grasp_contract(self.value)
+        self.value["evaluation"]["max_control_steps"] = 91
+        with self.assertRaises(ValueError):
+            validate_effort_grasp_contract(self.value)
+
+    def test_calibration_cannot_claim_32_episode_budget(self):
+        self.reject("evaluation", "episodes_per_env", 4)
+        self.reject("evaluation", "max_control_steps", 364)
+
+    def test_unknown_fields_at_every_layer_rejected(self):
+        for group in (None, "actuation", "material", "evaluation", "acceptance", "logging"):
+            with self.subTest(group=group):
+                self.reject(group, "hidden_override", True)
+        value = deepcopy(self.value)
+        value["material"]["friction"]["hidden_override"] = 0
+        with self.assertRaises(ValueError):
+            validate_effort_grasp_contract(value)
+
+    def test_missing_fields_rejected(self):
+        for group in self.value:
+            value = deepcopy(self.value)
+            del value[group]
+            with self.subTest(group=group), self.assertRaises(ValueError):
+                validate_effort_grasp_contract(value)
+
+    def test_joint_order_and_caps_cannot_silently_reorder(self):
+        self.reject(None, "joint_order", list(reversed(self.value["joint_order"])))
+        self.reject("actuation", "total_torque_caps_nm", [0.04] * 6)
+        self.reject("actuation", "total_torque_caps_nm", tuple([0.04] * 7))
+
+    def test_total_caps_positive_finite_not_bool_and_within_native_effort(self):
+        for bad in (0.0, -0.01, True, math.nan, math.inf, "0.06", 2.451):
+            with self.subTest(bad=bad):
+                caps = list(self.value["actuation"]["total_torque_caps_nm"])
+                caps[0] = bad
+                self.reject("actuation", "total_torque_caps_nm", caps)
+        caps = [0.04] * 7
+        caps[1] = 1.401
+        self.reject("actuation", "total_torque_caps_nm", caps)
+
+    def test_implicit_drive_and_model_gains_must_all_be_zero(self):
+        for name in ("model_stiffness_nm_rad", "model_damping_nm_s_rad",
+                     "native_drive_stiffness_nm_rad", "native_drive_damping_nm_s_rad"):
+            self.reject("actuation", name, 0.01)
+            self.reject("actuation", name, False)
+        self.reject("actuation", "model", "ImplicitActuator")
+
+    def test_gravity_and_feedforward_cannot_escape_total_cap(self):
+        self.reject("actuation", "gravity_compensation_within_total_cap", False)
+        self.reject("actuation", "gravity_compensation_within_total_cap", 1)
+
+    def test_hard_material_cannot_hide_compliance(self):
+        self.reject("material", "compliant_contact_stiffness_n_m", 1000)
+        self.reject("material", "compliant_contact_damping_ns_m", 0.8)
+
+    def test_compliant_parameters_require_range_and_finite(self):
+        self.value["material"]["variant"] = "finger_compliant_v5"
+        for bad in (0, -1, True, math.nan, math.inf, 1000001):
+            self.reject("material", "compliant_contact_stiffness_n_m", bad)
+        self.value["material"]["compliant_contact_stiffness_n_m"] = 1000
+        for bad in (-1, False, math.nan, math.inf, 1001):
+            self.reject("material", "compliant_contact_damping_ns_m", bad)
+
+    def test_no_acceleration_spring_negative_restitution_or_negative_rest_offset(self):
+        self.reject("material", "compliant_contact_acceleration_spring", True)
+        self.reject("material", "restitution", -1000.0)
+        self.reject("material", "rest_offset_m", -0.0001)
+        self.reject("material", "contact_offset_m", 0.0)
+
+    def test_compliance_cannot_extend_to_cube_table_palm_or_change_friction(self):
+        bodies = list(self.value["material"]["compliance_candidate_body_names"]) + ["Cube"]
+        self.reject("material", "compliance_candidate_body_names", bodies)
+        self.reject("material", "always_rigid_body_names", ["Table"])
+        self.reject("material", "friction", {**self.value["material"]["friction"], "finger_static": 5.0})
+        self.reject("material", "native_binding_readback_required", False)
+
+    def test_default_compliance_is_distal_pads_and_other_fingers_stay_rigid(self):
+        material = self.value["material"]
+        self.assertEqual(material["compliance_candidate_body_names"], [
+            "right_hand_thumb_2_link", "right_hand_index_1_link", "right_hand_middle_1_link"])
+        self.assertIn("right_hand_thumb_0_link", material["always_rigid_body_names"])
+        self.assertIn("right_hand_palm_link", material["always_rigid_body_names"])
+
+    def test_explicit_finger_subset_requires_exact_hard_complement(self):
+        material = self.value["material"]
+        soft = ["right_hand_thumb_2_link", "right_hand_index_1_link"]
+        material["compliance_candidate_body_names"] = soft
+        material["always_rigid_body_names"] = list(ALWAYS_RIGID_BODY_NAMES) + [
+            name for name in FINGER_BODY_NAMES if name not in soft]
+        validate_effort_grasp_contract(self.value)
+        material["always_rigid_body_names"].remove("right_hand_middle_1_link")
+        with self.assertRaises(ValueError):
+            validate_effort_grasp_contract(self.value)
+
+    def test_no_empty_duplicate_unknown_or_nonlist_soft_subset(self):
+        for names in ([], ["right_hand_thumb_2_link"] * 2, ["right_hand_palm_link"],
+                      ["Cube"], [True], tuple(["right_hand_thumb_2_link"])):
+            self.reject("material", "compliance_candidate_body_names", names)
+
+    def test_acceptance_cannot_be_relaxed_even_if_named_calibration(self):
+        for key, bad in (("group_force_max_n", 2.0), ("maximum_penetration_m", 0.004),
+                         ("opposition_dot_max", -0.5), ("maximum_abs_normal_z", 0.7),
+                         ("support_consecutive_samples", 99), ("minimum_corner_clearance_m", 0.001),
+                         ("physical_loaded_separation_max_m", 1e-7),
+                         ("legacy_complete_partner_friction_manifold_required", False),
+                         ("all_nonzero_positive_gap_hand_load_forbidden", False),
+                         ("main_lift_authorized", True), ("reward_used_as_success", True)):
+            self.reject("acceptance", key, bad)
+
+    def test_training_randomization_timing_or_population_cannot_drift(self):
+        for key, bad in (("num_envs", 16), ("num_envs", True), ("training_allowed", True),
+                         ("optimizer_steps", 1), ("physics_dt_s", 0.001),
+                         ("control_period_s", 0.033), ("nominal_episode_budget_s", 7),
+                         ("validation_offsets", "new_offsets"), ("randomization_expanded", True)):
+            self.reject("evaluation", key, bad)
+
+    def test_typed_quota_and_wall_budget_rejected(self):
+        for group, key, value in (("evaluation", "episodes_per_env", True),
+                                  ("evaluation", "max_control_steps", 91.0),
+                                  ("evaluation", "max_wall_time_s", 3601),
+                                  ("evaluation", "max_wall_time_s", math.nan)):
+            self.reject(group, key, value)
+
+    def test_logging_is_complete_compact_bounded_raw_no_hidden_omissions(self):
+        self.reject("logging", "compact_2ms", "macro_only")
+        self.reject("logging", "raw_mode", "all")
+        self.reject("logging", "raw_omissions_and_truncation_reported", False)
+        self.reject("logging", "raw_pre_steps", True)
+        self.reject("logging", "raw_max_samples", 4097)
+        self.reject("logging", "raw_max_samples", 3)
+
+    def test_balanced_controller_roundtrip_and_fresh_copy(self):
+        value = balanced_effort_controller_contract()
+        result = validate_balanced_effort_controller_contract(value)
+        result["parameters"]["group_force_targets_n"][0] = 0.5
+        self.assertEqual(value, balanced_effort_controller_contract())
+
+    def test_balanced_controller_all_parameters_typed_and_finite(self):
+        default = balanced_effort_controller_contract()
+        for key, original in default["parameters"].items():
+            for bad in (True, math.nan, math.inf):
+                value = deepcopy(default)
+                value["parameters"][key] = [bad] * len(original) if isinstance(original, list) else bad
+                with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                    validate_balanced_effort_controller_contract(value)
+
+    def test_balanced_controller_rejects_bad_shapes_and_unknown_keys(self):
+        for key, bad in (("group_force_targets_n", [0.4] * 2),
+                         ("joint_torque_limits_nm", [0.04] * 6),
+                         ("group_force_targets_n", tuple([0.4] * 3))):
+            value = balanced_effort_controller_contract()
+            value["parameters"][key] = bad
+            with self.assertRaises(ValueError):
+                validate_balanced_effort_controller_contract(value)
+        value = balanced_effort_controller_contract()
+        value["parameters"]["hidden_gain"] = 1
+        with self.assertRaises(ValueError):
+            validate_balanced_effort_controller_contract(value)
+
+    def test_balanced_controller_explicit_changes_get_their_own_values(self):
+        value = balanced_effort_controller_contract()
+        value["parameters"].update(group_force_targets_n=[0.6, 0.3, 0.3], joint_stiffness_nm_rad=0.12,
+                                    normal_force_feedback_gain=0.8, reacquisition_velocity_limit_rad_s=0.02)
+        self.assertEqual(validate_balanced_effort_controller_contract(value), value)
+
+    def test_balanced_controller_force_caps_and_overforce_cannot_disappear(self):
+        for key, bad in (("group_force_limit_n", 1.6), ("maximum_penetration_m", 0.004),
+                         ("group_force_command_lower_n", 0.0), ("overforce_opening_torque_nm", 0.0),
+                         ("group_force_command_upper_n", 1.6), ("contact_feedback_onset_n", 0.5),
+                         ("reacquisition_velocity_limit_rad_s", 0.041)):
+            value = balanced_effort_controller_contract()
+            value["parameters"][key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_balanced_effort_controller_contract(value)
+
+    def test_controller_and_actuator_total_caps_must_be_identical(self):
+        value = deepcopy(self.value)
+        value["actuation"]["total_torque_caps_nm"][0] = 0.05
+        with self.assertRaises(ValueError):
+            validate_effort_grasp_contract(value)
+
+
+if __name__ == "__main__":
+    unittest.main()

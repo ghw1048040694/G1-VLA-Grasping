@@ -8,13 +8,15 @@ regression layout, exports demonstrations, or interprets reward as task success.
 from __future__ import annotations
 
 import hashlib
+import copy
+from collections import deque
 import json
 import math
 from pathlib import Path
 
 from .control import LOWER_BODY_JOINT_NAMES
 from .contracts import canonical_sha256, read_joint_order
-from .rl_protocol import RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY
+from .rl_protocol import RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY, RL_PHYSICS_EFFORT_GRASP
 
 
 ENVIRONMENT_VERSION = "g1_physx_official_precontact_rl_v2"
@@ -1044,11 +1046,39 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         raise RLEnvironmentError("control diagnostics require standalone evaluation, output and at most eight environments")
     settings = resolve_settings(config)
     physics_protocol = config["rl_teacher"]["physics_protocol"]
-    if physics_protocol not in (RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY):
+    if physics_protocol not in (RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY, RL_PHYSICS_EFFORT_GRASP):
         raise RLEnvironmentError("unsupported explicit RL physics protocol")
-    fixed_palm_model = physics_protocol == RL_PHYSICS_FIXED_PALM_ADJACENCY
+    effort_model = physics_protocol == RL_PHYSICS_EFFORT_GRASP
+    fixed_palm_model = physics_protocol in (RL_PHYSICS_FIXED_PALM_ADJACENCY, RL_PHYSICS_EFFORT_GRASP)
+    effort_contract, effort_candidate = None, None
+    if effort_model:
+        from .rl_effort_protocol import validate_effort_grasp_contract
+        diagnostic = config.get("rl_diagnostics", {})
+        if not probe_profile or diagnostic.get("profile_plan") != "balanced_effort_v6":
+            raise RLEnvironmentError("new effort physics is only admitted by its standalone diagnostic plan")
+        effort_contract = validate_effort_grasp_contract(diagnostic["effort_grasp_controller"])
+        payload = Path(diagnostic["candidate_path"]).read_bytes()
+        if hashlib.sha256(payload).hexdigest() != diagnostic["candidate_sha256"]:
+            raise RLEnvironmentError("effort geometry/reset resource changed")
+        effort_candidate = json.loads(payload)
     initial = _seed_state(config)
+    original_initial = copy.deepcopy(initial)
+    if effort_model and "reset_joint_positions_rad" in effort_candidate:
+        override = effort_candidate["reset_joint_positions_rad"]
+        if (set(override) != set(initial["joint_positions_rad"]) or
+                any(type(v) not in (int, float) or not math.isfinite(v) for v in override.values())):
+            raise RLEnvironmentError("new reset must explicitly name all43 finite joint positions")
+        initial = copy.deepcopy(initial)
+        initial["joint_positions_rad"] = dict(override)
+        reference = effort_candidate.get("reset_native_fk_reference")
+        if not isinstance(reference, dict):
+            raise RLEnvironmentError("new joint reset requires independently computed native FK reference")
+        initial["official_native_fk_reference"] = reference
+        initial["root_pose_xyzw"] = list(effort_candidate.get("reset_root_pose_xyzw", initial["root_pose_xyzw"]))
     actuator_specs = _actuator_specifications(initial)
+    if effort_model:
+        for name, cap in zip(RIGHT_HAND, effort_contract["actuation"]["total_torque_caps_nm"]):
+            actuator_specs[name].update(kp=0., kd=0., effort_limit_nm=cap)
     asset_path = Path(asset_path).resolve()
     if not asset_path.is_file() or asset_path.suffix.lower() not in (".usd", ".usda", ".usdc", ".xml"):
         raise RLEnvironmentError("a prepared robot-only MJCF or USD asset is required")
@@ -1073,7 +1103,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     import torch
     import warp as wp
     import isaaclab.sim as sim_utils
-    from isaaclab.actuators import ImplicitActuatorCfg
+    from isaaclab.actuators import ImplicitActuatorCfg, IdealPDActuatorCfg
     from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
     from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
     from isaaclab.scene import InteractiveSceneCfg
@@ -1081,7 +1111,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     from isaaclab.sim import SimulationCfg
     from isaaclab.sim.utils.stage import get_current_stage
     from isaaclab.sim.utils.prims import bind_physics_material
-    from pxr import UsdPhysics
+    from pxr import Usd, UsdPhysics, PhysxSchema
     from isaaclab.utils.configclass import configclass
     from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul
     from isaaclab_physx.physics import PhysxCfg
@@ -1184,6 +1214,24 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._physics_pinch_reference = None
             self._physics_pinch_update_count = 0
             self._physics_pinch_last_sample = None
+            self._effort_grasp = None
+            self._effort_reference = None
+            self._effort_geometry = None
+            self._effort_update_count = 0
+            self._effort_last_sample = None
+            self._effort_material_readback = None
+            self._effort_drive_readback = None
+            self._effort_raw_samples_written = 0
+            self._effort_raw_samples_omitted = 0
+            self._effort_previous_physical = None
+            self._effort_raw_post_remaining = 0
+            self._effort_raw_triggers = 0
+            self._effort_raw_omitted_triggers = 0
+            self._effort_raw_history = deque(maxlen=effort_contract["logging"]["raw_pre_steps"] if effort_model else 0)
+            self._effort_raw_last_written_native = -1
+            self._effort_raw_episode_ids = None
+            self._effort_raw_loss_seen = None
+            self._effort_raw_max_force = 0.
             self._contact_crosscheck = {"protocol": CONTACT_COLLECTION_VERSION,
                                        "required_physics_samples": CONTACT_CROSSCHECK["physics_samples"],
                                        "enabled": num_envs == CONTACT_CROSSCHECK["num_envs"],
@@ -1214,7 +1262,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 raise RLEnvironmentError("native physics did not recognize the imported robot as fixed-root")
             if self._evaluation_camera is not None:
                 pinch_closeup = (self._control_probe_profile is not None and
-                                 self._control_probe_profile["name"] in ("compliant_pinch_pose_hold", "physics_pinch_pose_hold"))
+                                 self._control_probe_profile["name"] in ("compliant_pinch_pose_hold", "physics_pinch_pose_hold", "balanced_effort_pose_hold"))
                 eye_offset = [0.635, -0.262, 1.045] if pinch_closeup else [1.05, -0.65, 1.30]
                 target_offset = [0.32, 0.055, 0.82] if pinch_closeup else [0.35, 0.055, 0.80]
                 eye = self.scene.env_origins[0] + torch.tensor(eye_offset, device=self.device)
@@ -1275,6 +1323,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._last_contact_episode_ids = torch.full_like(self._episode_ids, -1)
             self._last_contact_native_step = -1
             self._last_written_hand_target = self._targets[:, self._action_ids[7:]].clone()
+            self._last_written_hand_effort = torch.zeros(self.num_envs, 7, device=self.device)
+            self._effort_hand_body_ids = [self.robot.body_names.index(name) for name in HAND_BODIES]
             self._reward_terms = {}
             self._train_generator = torch.Generator(device=self.device).manual_seed(int(train_seed))
             self._eval_generator = torch.Generator(device=self.device).manual_seed(int(settings["eval_seed"]))
@@ -1313,20 +1363,33 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                                           "target_world_m": self._video_status.get("target_world_m"),
                                                           **({"control_probe": dict(self._control_probe_profile)} if self._control_probe_enabled else {})}) + "\n")
             if self._control_probe_enabled:
+                if effort_model:
+                    self._verify_effort_native_model()
                 self.configure_control_probe(self._control_probe_profile)
 
         def _setup_scene(self):
+            pd_specs = {name: value for name, value in actuator_specs.items()
+                        if not effort_model or name not in RIGHT_HAND}
+            actuators = {"shared_pd_without_mujoco_bias_v1": ImplicitActuatorCfg(
+                joint_names_expr=list(pd_specs) if effort_model else [".*"],
+                stiffness={name: value["kp"] for name, value in pd_specs.items()},
+                damping={name: value["kd"] for name, value in pd_specs.items()},
+                effort_limit_sim={name: value["effort_limit_nm"] for name, value in pd_specs.items()},
+                armature={name: value["armature"] for name, value in pd_specs.items()},
+                viscous_friction={name: value["dof_damping"] for name, value in pd_specs.items()})}
+            if effort_model:
+                caps = dict(zip(RIGHT_HAND, effort_contract["actuation"]["total_torque_caps_nm"]))
+                actuators["right_hand_bounded_explicit_effort_v1"] = IdealPDActuatorCfg(
+                    joint_names_expr=list(RIGHT_HAND), stiffness=0., damping=0.,
+                    effort_limit=caps, effort_limit_sim=caps,
+                    armature={name: actuator_specs[name]["armature"] for name in RIGHT_HAND},
+                    viscous_friction={name: actuator_specs[name]["dof_damping"] for name in RIGHT_HAND})
             self.robot = Articulation(ArticulationCfg(
                 prim_path="/World/envs/env_.*/Robot", spawn=robot_spawn,
                 init_state=ArticulationCfg.InitialStateCfg(
                     pos=tuple(initial["root_pose_xyzw"][:3]), rot=tuple(initial["root_pose_xyzw"][3:]),
                     joint_pos=initial["joint_positions_rad"], joint_vel={".*": 0.0}),
-                actuators={"shared_pd_without_mujoco_bias_v1": ImplicitActuatorCfg(
-                    joint_names_expr=[".*"], stiffness={name: value["kp"] for name, value in actuator_specs.items()},
-                    damping={name: value["kd"] for name, value in actuator_specs.items()},
-                    effort_limit_sim={name: value["effort_limit_nm"] for name, value in actuator_specs.items()},
-                    armature={name: value["armature"] for name, value in actuator_specs.items()},
-                    viscous_friction={name: value["dof_damping"] for name, value in actuator_specs.items()})}))
+                actuators=actuators))
             self.cube = RigidObject(RigidObjectCfg(
                 prim_path="/World/envs/env_.*/Cube",
                 spawn=sim_utils.CuboidCfg(size=(0.05, 0.05, 0.05), rigid_props=rigid,
@@ -1394,6 +1457,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 raise RLEnvironmentError("official USD revolute-joint schema differs from the exact 43 source names")
             hand_material = material(settings["hand_friction"])
             hand_material.func("/World/RLHandContactMaterial", hand_material)
+            if effort_model:
+                pad_material = material(settings["hand_friction"])
+                pad_material.func("/World/RLFingerPadContactMaterial", pad_material)
+                pad_api = PhysxSchema.PhysxMaterialAPI.Apply(stage.GetPrimAtPath("/World/RLFingerPadContactMaterial"))
+                declared = effort_contract["material"]
+                pad_api.CreateCompliantContactStiffnessAttr(declared["compliant_contact_stiffness_n_m"])
+                pad_api.CreateCompliantContactDampingAttr(declared["compliant_contact_damping_ns_m"])
+                pad_api.CreateCompliantContactAccelerationSpringAttr(False)
+                pad_api.CreateRestitutionCombineModeAttr(declared["restitution_combine_mode"])
+                pad_api.CreateDampingCombineModeAttr(declared["damping_combine_mode"])
             palm_material = material(settings["palm_friction"])
             palm_material.func("/World/RLPalmContactMaterial", palm_material)
             self._material_bindings = []
@@ -1415,6 +1488,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         self._instance_overrides.append(instance_path.replace("/env_0/", "/env_*/"))
                         prim = stage.GetPrimAtPath(collider_path)
                     material_path = "/World/RLPalmContactMaterial" if ancestor.GetName() == palm_contact_body else "/World/RLHandContactMaterial"
+                    if effort_model and ancestor.GetName() in effort_contract["material"]["compliance_candidate_body_names"]:
+                        material_path = "/World/RLFingerPadContactMaterial"
                     bind_physics_material(str(prim.GetPath()), material_path, stage=stage)
                     sim_utils.modify_collision_properties(str(prim.GetPath()), collision, stage=stage)
                     bound = [str(path) for path in prim.GetRelationship("material:binding:physics").GetTargets()]
@@ -1476,10 +1551,137 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 light.func("/World/RLEvaluationLight", light)
             self.scene.clone_environments(copy_from_source=False)
             if fixed_palm_model:
-                self._fixed_cluster_filter_readback = author_fixed_palm_adjacency_filters(
-                    stage, UsdPhysics, self.num_envs, asset_sha)
+                if effort_model:
+                    from .rl_collision_model import author_bilateral_fixed_cluster_filters
+                    self._fixed_cluster_filter_readback = author_bilateral_fixed_cluster_filters(
+                        stage, UsdPhysics, self.num_envs, asset_sha)
+                else:
+                    self._fixed_cluster_filter_readback = author_fixed_palm_adjacency_filters(
+                        stage, UsdPhysics, self.num_envs, asset_sha)
             if self.device == "cpu":
                 self.scene.filter_collisions(global_prim_paths=[])
+
+        def _verify_effort_native_model(self):
+            """Fail closed on actual drive/material bindings, not config labels."""
+            ids = self._action_ids[7:]
+            kp = tensor(self.robot.root_view.get_dof_stiffnesses()).clone()
+            kd = tensor(self.robot.root_view.get_dof_dampings()).clone()
+            maximum = tensor(self.robot.root_view.get_dof_max_forces()).clone()
+            expected_kp = torch.tensor([actuator_specs[n]["kp"] for n in self.robot.joint_names], device=kp.device)
+            expected_kd = torch.tensor([actuator_specs[n]["kd"] for n in self.robot.joint_names], device=kd.device)
+            expected_caps = torch.tensor([actuator_specs[n]["effort_limit_nm"] for n in self.robot.joint_names], device=maximum.device)
+            passed = (tuple(kp.shape) == (self.num_envs, 43) and
+                bool(torch.isclose(kp, expected_kp[None], atol=1e-5, rtol=0).all()) and
+                bool(torch.isclose(kd, expected_kd[None], atol=1e-5, rtol=0).all()) and
+                bool(torch.isclose(maximum, expected_caps[None], atol=1e-5, rtol=0).all()))
+            gravity = tensor(self.robot.data.gravity_compensation_forces)
+            if gravity.shape != (self.num_envs, 43) or not bool(torch.isfinite(gravity).all()):
+                raise RLEnvironmentError("effort control requires finite current native gravity compensation")
+            self._effort_drive_readback = _probe_payload(torch, {
+                "verified": passed, "joint_names": list(self.robot.joint_names),
+                "hand_joint_indices": ids, "native_stiffness_nm_rad": kp,
+                "native_damping_nm_s_rad": kd, "native_drive_force_caps_nm": maximum,
+                "initial_gravity_compensation_hand_nm": gravity[:, ids],
+                "explicit_actuator_type": type(self.robot.actuators["right_hand_bounded_explicit_effort_v1"]).__name__,
+                "gravity_inside_total_cap": True, "other_36_pd_values_verified": passed,
+                "drive_force_cap_is_not_external_contact_force_or_isolated_torque_measurement": True})
+            if not passed:
+                raise RLEnvironmentError("native hand7 drives must be zero and other36 original PD unchanged")
+            stage = get_current_stage()
+            from pxr import UsdShade
+            mat = effort_contract["material"]
+            expected_pad = (mat["compliant_contact_stiffness_n_m"], mat["compliant_contact_damping_ns_m"])
+            records = []
+            for i in range(self.num_envs):
+                for binding in self._material_bindings:
+                    path = binding["collider"].replace("/env_*/", "/env_{}/".format(i))
+                    prim = stage.GetPrimAtPath(path)
+                    bound = [str(p) for p in prim.GetRelationship("material:binding:physics").GetTargets()]
+                    if bound != [binding["material"]]:
+                        raise RLEnvironmentError("native finger material binding mismatch: " + path)
+                    material_prim = stage.GetPrimAtPath(bound[0])
+                    api = PhysxSchema.PhysxMaterialAPI(material_prim)
+                    stiffness = api.GetCompliantContactStiffnessAttr().Get()
+                    damping = api.GetCompliantContactDampingAttr().Get()
+                    acceleration = api.GetCompliantContactAccelerationSpringAttr().Get()
+                    pad = binding["body"] in mat["compliance_candidate_body_names"]
+                    want_k, want_c = expected_pad if pad else (0., 0.)
+                    if (float(stiffness or 0) != want_k or float(damping or 0) != want_c or bool(acceleration)):
+                        raise RLEnvironmentError("native hand contact spring differs from declared stiffness/damping: " + path)
+                    if pad and (str(api.GetRestitutionCombineModeAttr().Get()) != mat["restitution_combine_mode"] or
+                            str(api.GetDampingCombineModeAttr().Get()) != mat["damping_combine_mode"]):
+                        raise RLEnvironmentError("native compliant contact combination mode mismatch")
+                    physics_material = UsdPhysics.MaterialAPI(material_prim)
+                    friction = settings["palm_friction"] if binding["body"] == palm_contact_body else settings["hand_friction"]
+                    if (float(physics_material.GetStaticFrictionAttr().Get()) != friction or
+                            float(physics_material.GetDynamicFrictionAttr().Get()) != friction or
+                            float(physics_material.GetRestitutionAttr().Get()) != 0.):
+                        raise RLEnvironmentError("effort model changed undeclared friction/restitution")
+                    records.append({"collider": path, "body": binding["body"], "material": bound[0],
+                        "stiffness_n_m": stiffness, "damping_ns_m": damping,
+                        "acceleration_spring": acceleration, "soft_candidate": pad})
+            external_records, rigid_body_records = [], []
+            for i in range(self.num_envs):
+                for body_name in mat["always_rigid_body_names"]:
+                    prefix = "/World/envs/env_{}/".format(i)
+                    path = prefix + body_name if body_name in ("Cube", "Table") else prefix + "Robot/" + body_name
+                    body = stage.GetPrimAtPath(path)
+                    if not body.IsValid() or not body.HasAPI(UsdPhysics.RigidBodyAPI):
+                        raise RLEnvironmentError("missing declared always-rigid body during material readback: " + path)
+                    colliders = [prim for prim in Usd.PrimRange(body, Usd.TraverseInstanceProxies())
+                                 if prim.HasAPI(UsdPhysics.CollisionAPI)]
+                    if not colliders and body_name in ("Cube", "Table"):
+                        raise RLEnvironmentError("Cube/Table must retain actual collision geometry: " + path)
+                    body_record = {"env_id": i, "body": body_name, "body_path": path,
+                                   "collider_count": len(colliders), "colliders": [],
+                                   "status": "verified_rigid_materials" if colliders else "no_collision_geometry"}
+                    for prim in colliders:
+                        # Resolve inheritance, collection bindings, purpose
+                        # fallback and instance proxies using USD's actual
+                        # binding rules rather than the nearest raw relation.
+                        bound_material, binding_rel = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial("physics")
+                        if bound_material and bound_material.GetPrim().IsValid():
+                            material_prim = bound_material.GetPrim()
+                            api = PhysxSchema.PhysxMaterialAPI(material_prim)
+                            k = api.GetCompliantContactStiffnessAttr().Get()
+                            c = api.GetCompliantContactDampingAttr().Get()
+                            acceleration = api.GetCompliantContactAccelerationSpringAttr().Get()
+                            binding_path = str(binding_rel.GetPath()) if binding_rel else None
+                            material_path = str(material_prim.GetPath())
+                            resolution = "resolved_usd_physics_purpose_binding"
+                        else:
+                            # A genuinely unbound collider uses the engine's
+                            # rigid default. A dangling authored binding is
+                            # not equivalent to being unbound and must fail.
+                            ancestor, declared_binding = prim, bool(binding_rel and binding_rel.GetTargets())
+                            while ancestor.IsValid():
+                                for rel in ancestor.GetRelationships():
+                                    if str(rel.GetName()).startswith("material:binding") and rel.GetTargets():
+                                        declared_binding = True
+                                ancestor = ancestor.GetParent()
+                            if declared_binding:
+                                raise RLEnvironmentError("unresolved authored material binding on always-rigid collider: " + str(prim.GetPath()))
+                            k, c, acceleration = 0., 0., False
+                            binding_path, material_path = None, None
+                            resolution = "unbound_engine_rigid_default_no_usd_material_override"
+                        if (not math.isfinite(float(k or 0)) or not math.isfinite(float(c or 0)) or
+                                float(k or 0) != 0 or float(c or 0) != 0):
+                            raise RLEnvironmentError("declared always-rigid collider has compliant contact material: " + str(prim.GetPath()))
+                        record = {"collider": str(prim.GetPath()), "body": body_name,
+                                  "instance_proxy": bool(prim.IsInstanceProxy()),
+                                  "material": material_path, "binding_relationship": binding_path,
+                                  "binding_resolution": resolution, "stiffness_n_m": k,
+                                  "damping_ns_m": c, "acceleration_spring": acceleration}
+                        body_record["colliders"].append(record)
+                        if body_name in ("Cube", "Table"):
+                            external_records.append(record)
+                    rigid_body_records.append(body_record)
+            self._effort_material_readback = {"verified": True, "variant": mat["variant"],
+                "bindings": records, "cube_table_rigid_readback": external_records,
+                "always_rigid_body_readback": rigid_body_records,
+                "always_rigid_body_names_verified": list(mat["always_rigid_body_names"]),
+                "material_readback_scope": "actual USD collision material bindings and schema including instance proxies; not a measured contact spring response",
+                "compliance_is_model_change_not_force_cap_or_real_robot_certification": True}
 
         def _pre_physics_step(self, actions):
             if tuple(actions.shape) != (self.num_envs, 14) or not bool(torch.isfinite(actions).all()):
@@ -1491,6 +1693,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._actions[:] = actions.clamp(-1.0, 1.0)
             if self._physics_pinch is not None:
                 self._action_origin = "declared_macro_pose_and_geometry_reference_plus_native_2ms_force_admittance"
+            if self._effort_grasp is not None:
+                self._action_origin = "macro_arm_position_reference_and_native_2ms_explicit_hand_effort"
+                # These seven slots are inactive bookkeeping in effort mode.
+                # They are never handed to a native position drive in _apply_action.
+                self._targets[:, self._action_ids[7:]] = tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]]
             per_step = torch.minimum(self._velocity * self.step_dt,
                                      torch.full_like(self._velocity, float(config["rl_teacher"]["action_scale_rad"])))
             previous = self._targets[:, self._action_ids]
@@ -1589,10 +1796,143 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._sample_physics()
             if self._physics_pinch is not None:
                 self._update_physics_pinch()
-            self.robot.set_joint_position_target_index(target=self._targets)
+            if self._effort_grasp is not None:
+                self._update_effort_grasp()
+                position_ids = [i for i in range(43) if i not in self._action_ids[7:]]
+                self.robot.set_joint_position_target_index(target=self._targets[:, position_ids], joint_ids=position_ids)
+                self.robot.set_joint_effort_target_index(target=self._last_written_hand_effort, joint_ids=self._action_ids[7:])
+            else:
+                self.robot.set_joint_position_target_index(target=self._targets)
             if self._physics_pinch is not None:
                 self._last_written_hand_target = self._targets[:, self._action_ids[7:]].clone()
             self._pending_physics_sample = True
+
+        def configure_effort_grasp(self, contract):
+            from .rl_effort_protocol import validate_effort_grasp_contract
+            from .rl_hand_control import BalancedEffortGraspController
+            if not effort_model or validate_effort_grasp_contract(contract) != effort_contract:
+                raise RLEnvironmentError("effort controller cannot silently change its physical contract")
+            if self._effort_grasp is not None:
+                raise RLEnvironmentError("effort controller cannot be replaced during a run")
+            self._effort_grasp = BalancedEffortGraspController(torch,
+                tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]], self._episode_ids,
+                parameters=contract["controller"]["parameters"])
+            self._write_control_probe({"event": "effort_grasp_controller_installed", "contract": contract,
+                "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                "episode_id": self._episode_ids, "drive_readback": self._effort_drive_readback,
+                "material_readback": self._effort_material_readback, "optimizer_steps": 0})
+
+        def set_effort_grasp_reference(self, **reference):
+            required = {"nominal_hand_rad", "geometry_lower_hand_rad", "geometry_upper_hand_rad",
+                        "closing_axis_hand7", "palm_reference_world_m", "palm_reference_quaternion_xyzw"}
+            if self._effort_grasp is None or set(reference) != required:
+                raise RLEnvironmentError("effort grasp needs the exact declared macro reference fields")
+            self._effort_reference = {k: v.detach().clone() for k, v in reference.items()}
+            self._effort_reference["episode_id"] = self._episode_ids.clone()
+
+        def _effort_contact_geometry(self, hand):
+            """Current native points -> link-origin shifted Jacobians, no old normals.
+
+            Speculative points may steer control. They never become physical
+            loaded points or alter the independent legacy acceptance formula.
+            """
+            jac = tensor(self.robot.data.body_link_jacobian_w)
+            if jac.shape[1:] != (self.robot.num_bodies-1, 6, 43):
+                raise RLEnvironmentError("effort control requires fixed-base link-origin Jacobians")
+            j = jac[:, [i-1 for i in self._effort_hand_body_ids]][:, :, :, self._action_ids[7:]]
+            link = tensor(self.robot.data.body_pos_w)[:, self._effort_hand_body_ids]
+            point = hand["point"][:, :7]
+            offset = point-link[:, :, None]
+            angular = j[:, :, None, 3:, :].transpose(-1, -2).expand(-1, -1, 32, -1, -1)
+            correction = torch.cross(angular, offset[:, :, :, None].expand_as(angular), dim=-1).transpose(-1, -2)
+            point_j = j[:, :, None, :3, :]+correction
+            cube = tensor(self.cube.data.root_pos_w)
+            n = hand["point_normal"][:, :7]
+            toward_cube = cube[:, None, None]-point
+            sign = torch.where((n*toward_cube).sum(-1) >= 0, 1., -1.)
+            inward = n*sign[..., None]
+            valid = hand["point_valid"][:, :7] & (hand["separation"][:, :7] <= 2*settings["contact_offset_m"])
+            valid &= inward[:, :, :, 2].abs() <= settings["max_abs_normal_z"]
+            norm = torch.linalg.vector_norm(inward, dim=-1)
+            valid &= torch.isfinite(norm) & (norm > .5)
+            inward = inward/norm.clamp_min(1e-12)[..., None]
+            weights = (hand["point_force"][:, :7].abs()+.001)*valid
+            a, centers, normals, availability = [], [], [], []
+            for first, last in ((0, 3), (3, 5), (5, 7)):
+                w = weights[:, first:last]
+                total = w.sum(dim=(1, 2))
+                w = w/total.clamp_min(1e-12)[:, None, None]
+                row = (inward[:, first:last, :, :, None]*point_j[:, first:last]).sum(-2)
+                a.append((w[..., None]*row).sum(dim=(1, 2)))
+                centers.append((w[..., None]*point[:, first:last]).sum(dim=(1, 2)))
+                normals.append((w[..., None]*inward[:, first:last]).sum(dim=(1, 2)))
+                availability.append(total > 0)
+            self._effort_geometry = {"normal_jacobian": torch.stack(a, 1).detach().clone(),
+                "point_world_m": torch.stack(centers, 1).detach().clone(),
+                "inward_normal_world": torch.stack(normals, 1).detach().clone(),
+                "current_normal_available": torch.stack(availability, 1).detach().clone(),
+                "episode_id": self._episode_ids.clone(),
+                "native_step": int(self.sim.get_physics_step_count())}
+
+        def _update_effort_grasp(self):
+            ref = self._effort_reference
+            if ref is None:
+                raise RLEnvironmentError("missing explicit effort macro reference")
+            native_step = int(self.sim.get_physics_step_count())
+            ids = self._action_ids[7:]
+            q = tensor(self.robot.data.joint_pos)[:, ids]
+            geometry = self._effort_geometry
+            fresh = (self._last_contact_episode_ids == self._episode_ids) & (ref["episode_id"] == self._episode_ids)
+            fresh &= self._last_contact_native_step == native_step
+            metrics = self._last_metrics
+            valid = fresh & metrics.get("finite", torch.zeros_like(fresh)) & metrics.get("joint_safe", torch.zeros_like(fresh))
+            valid &= metrics.get("table_pair_measurement_supported", torch.zeros_like(fresh))
+            if geometry is None:
+                a = torch.zeros(self.num_envs, 3, 7, device=self.device)
+                current = torch.zeros(self.num_envs, 3, dtype=torch.bool, device=self.device)
+            else:
+                geometry_fresh = (geometry["episode_id"] == self._episode_ids) & (geometry["native_step"] == native_step)
+                current = geometry["current_normal_available"] & fresh[:, None] & geometry_fresh[:, None]
+                a = geometry["normal_jacobian"]
+            body_rotation = tensor(self.robot.data.body_quat_w)[:, self._palm_id]
+            palm = tensor(self.robot.data.body_pos_w)[:, self._palm_id]+quat_apply(body_rotation, self._palm_local)
+            rotation = quat_mul(body_rotation, self._palm_local_rotation)
+            dot = (rotation*ref["palm_reference_quaternion_xyzw"]).sum(-1).abs().clamp(0, 1)
+            tracking = ((torch.linalg.vector_norm(palm-ref["palm_reference_world_m"], dim=-1) <= .003) &
+                        (2*torch.acos(dot) <= .05))
+            physical = metrics.get("group_physical_loaded_contact_count", torch.zeros(self.num_envs, 3, device=self.device)) > 0
+            gravity = tensor(self.robot.data.gravity_compensation_forces)[:, ids]
+            effort, evidence, unsafe = self._effort_grasp.update(sample_id=native_step,
+                episode_id=self._episode_ids, dt=self.physics_dt, measured_hand_rad=q,
+                measured_hand_velocity_rad_s=tensor(self.robot.data.joint_vel)[:, ids],
+                nominal_hand_rad=ref["nominal_hand_rad"], gravity_hand_nm=gravity,
+                inward_normal_jacobian=a, group_contact_valid=current,
+                group_physical_loaded=physical & fresh[:, None],
+                raw_group_force_n=metrics.get("group_normal_force_n", torch.zeros(self.num_envs, 3, device=self.device)),
+                contact_measurement_valid=valid, tracking=tracking, unsafe_latched=self._unsafe,
+                joint_lower_hand_rad=self._limits[:, ids, 0], joint_upper_hand_rad=self._limits[:, ids, 1],
+                geometry_lower_hand_rad=ref["geometry_lower_hand_rad"], geometry_upper_hand_rad=ref["geometry_upper_hand_rad"],
+                nominal_velocity_limit_hand_rad_s=self._velocity[7:][None].expand_as(q),
+                penetration_m=metrics.get("maximum_penetration_m", torch.zeros(self.num_envs, device=self.device)),
+                closing_axis_hand7=ref["closing_axis_hand7"])
+            self._unsafe |= unsafe
+            self._last_written_hand_effort = effort.clone()
+            self._effort_update_count += 1
+            self._effort_last_sample = native_step
+            predicted_wrench = None
+            if geometry is not None:
+                normal_force = geometry["inward_normal_world"]*evidence["group_force_command_n"][..., None]
+                torque = torch.cross(geometry["point_world_m"]-tensor(self.cube.data.root_pos_w)[:, None], normal_force, dim=-1)
+                predicted_wrench = torch.cat((normal_force.sum(1), torque.sum(1)), -1)
+            self._write_control_probe({"event": "physics_hand_effort", "command_id": self._control_command_id,
+                "native_physics_step_count": native_step, "force_measurement_native_step": self._last_contact_native_step,
+                "episode_id": self._episode_ids, "force_measurement_episode_id": self._last_contact_episode_ids,
+                "contact_measurement_current_episode": fresh, "measured_hand_rad": q,
+                "next_hand_effort_target_nm": effort, "current_normal_geometry": geometry,
+                "estimated_normal_only_object_wrench_before_torque_saturation": predicted_wrench,
+                "wrench_estimate_excludes_friction_and_is_not_verified_balance": True,
+                "evidence": evidence, "requires_unsafe": unsafe,
+                "hand_position_drive_disabled": True, "torque_command_cap_is_not_physical_force_cap": True})
 
         def configure_physics_pinch(self, contract):
             from .rl_probe_protocol import physics_pinch_controller_contract
@@ -1826,7 +2166,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "friction_force_on_sensor_w_n": hand["friction"][:min(8, self.num_envs), index],
                         "physical_loaded_count": hand["physical_loaded_count"][:min(8, self.num_envs), index]}
             other = self._cube_other_filter_indices
-            return {"table_normal": normal[:, 0], "table_fn": fn[:, 0], "table_loaded_count": loaded[:, 0],
+            return {"cube_total_force": cube_normal+friction.sum(1),
+                    "table_normal": normal[:, 0], "table_fn": fn[:, 0], "table_loaded_count": loaded[:, 0],
                     "robot_normal": normal[:, 1:].sum(dim=1), "robot_fn": fn[:, 1:].sum(dim=1),
                     "maximum_penetration_m": depth.amax(dim=1),
                     "other_fn": fn[:, other].sum(dim=1), "other_loaded_count": loaded[:, other].sum(dim=1),
@@ -1906,6 +2247,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             return cube_position, cube_rotation, cube_velocity, cube_angular, relative_position, relative_rotation, clearance
 
         def _sample_physics(self):
+            active_effort = getattr(self, "_effort_grasp", None) is not None
             if self._record:
                 self._raw_contact_tensors = {}
             state = self._physical_state()
@@ -1929,6 +2271,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 x, y, z, w = rotation.unbind(-1)
                 object_up_world = torch.stack((2*(x*z+w*y), 2*(y*z-w*x), 1-2*(x*x+y*y)), dim=-1)
                 cube_contacts = self._cube_contact_values(object_up_world)
+                if active_effort:
+                    self._effort_contact_geometry(cube_contacts["hand"])
                 summary = _summarize_hand_contacts(torch, cube_contacts["hand"])
                 reference_summary = self._crosscheck_hand_views(cube_contacts["hand"], object_up_world)
                 total_sum, groups = summary["total_sum"], summary["groups"]
@@ -2054,7 +2398,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                   "unsafe_probe_overshoot": self._probe_overshoot, "success": self._local_success}
             self._last_contact_episode_ids = self._episode_ids.clone()
             self._last_contact_native_step = int(self.sim.get_physics_step_count())
-            if self._physics_pinch is not None:
+            if self._physics_pinch is not None or active_effort:
                 self._write_control_probe({"event": "physics_hand_measurement",
                     "command_id": self._control_command_id,
                     "native_physics_step_count": self._last_contact_native_step,
@@ -2062,10 +2406,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "measured_hand_rad": tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]],
                     "measured_hand_velocity_rad_s": tensor(self.robot.data.joint_vel)[:, self._action_ids[7:]],
                     "actually_written_hand_target_rad": self._last_written_hand_target,
+                    "actually_written_hand_effort_target_nm": self._last_written_hand_effort if active_effort else None,
+                    "hand_position_target_active": not active_effort,
+                    "cube_position_world_m": position if active_effort else None,
+                    "cube_linear_velocity_world_m_s": velocity if active_effort else None,
+                    "cube_contact_normal_plus_declared_partner_friction_world_n": cube_contacts.get("cube_total_force") if active_effort and contact_available else None,
                     "metrics": self._last_metrics, "unsafe_latched": self._unsafe,
                     "sample_scope": "every_completed_2ms_sample_including_terminal_pre_reset_no_force_decimation"})
             self._physics_samples += 1
-            if self._record:
+            if self._record and active_effort:
+                self._record_bounded_effort_raw(state)
+            if self._record and not active_effort:
                 count = min(8, self.num_envs)
                 row = {"event": "post_physics", "physics_sample": self._physics_samples,
                        "native_physics_step_count": int(self.sim.get_physics_step_count()),
@@ -2090,6 +2441,75 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                        "raw_contacts": {name: {key: value.detach().cpu().tolist() for key, value in raw.items()}
                                         for name, raw in self._raw_contact_tensors.items()}}
                 self._write_evaluation_row(row)
+
+        def _record_bounded_effort_raw(self, state):
+            """Retain bounded raw windows; compact physical evidence stays full-rate."""
+            specification = effort_contract["logging"]
+            physical = self._last_metrics["group_physical_loaded_contact_count"] > 0
+            new_epoch = (torch.ones_like(self._episode_ids, dtype=torch.bool) if self._effort_raw_episode_ids is None
+                         else self._effort_raw_episode_ids != self._episode_ids)
+            if self._effort_raw_loss_seen is None:
+                self._effort_raw_loss_seen = torch.zeros_like(new_epoch)
+            self._effort_raw_loss_seen[new_epoch] = False
+            loss = torch.zeros_like(new_epoch)
+            if self._effort_previous_physical is not None:
+                loss = (self._effort_previous_physical & ~physical).any(-1) & ~new_epoch & ~self._effort_raw_loss_seen
+            peak = float(self._last_metrics["group_normal_force_n"].amax().item())
+            peak_trigger = peak > max(1.5, self._effort_raw_max_force+.05)
+            trigger = bool(new_epoch.any() or loss.any() or peak_trigger)
+            reasons = (["reset_initialization"] if bool(new_epoch.any()) else [])
+            if bool(loss.any()):
+                reasons.append("physical_contact_loss_first_per_episode")
+            if peak_trigger:
+                reasons.append("force_above_acceptance_cap_new_run_peak")
+            self._effort_raw_loss_seen |= loss
+            self._effort_raw_episode_ids = self._episode_ids.clone()
+            self._effort_previous_physical = physical.clone()
+            self._effort_raw_max_force = max(peak, self._effort_raw_max_force)
+            position, rotation, velocity, angular, relative, relative_rotation, _ = state
+            row = {"event": "post_physics", "physics_sample": self._physics_samples,
+                "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                "actual_physics_dt_s": float(self.sim.get_physics_dt()),
+                "episode_id": self._episode_ids, "env_ids": list(range(self.num_envs)),
+                "force_unavailable": self._force_unavailable, "qualification_supported": self._qualification_supported,
+                "metrics": self._last_metrics, "joint_position_rad": tensor(self.robot.data.joint_pos),
+                "joint_velocity_rad_s": tensor(self.robot.data.joint_vel), "action_origin": self._action_origin,
+                "hand_effort_target_nm": self._last_written_hand_effort,
+                "hand_position_targets_inactive": True, "cube_position_world_m": position,
+                "cube_quaternion_xyzw": rotation, "cube_linear_velocity_world_m_s": velocity,
+                "cube_angular_velocity_world_rad_s": angular, "cube_position_in_palm_m": relative,
+                "cube_rotation_in_palm_xyzw": relative_rotation, "raw_contacts": self._raw_contact_tensors,
+                "main_lift_authorized": False, "raw_capture_reasons": reasons}
+            def frozen(value):
+                if torch.is_tensor(value):
+                    return value.detach().clone()
+                if isinstance(value, dict):
+                    return {k: frozen(v) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [frozen(v) for v in value]
+                return value
+            snapshot = frozen(row)
+            def write(sample):
+                native = sample["native_physics_step_count"]
+                if native <= self._effort_raw_last_written_native or self._effort_raw_samples_written >= specification["raw_max_samples"]:
+                    return
+                self._write_evaluation_row(_probe_payload(torch, sample))
+                self._effort_raw_samples_written += 1
+                self._effort_raw_last_written_native = native
+            if trigger:
+                if (self._effort_raw_triggers < specification["raw_max_trigger_windows"] and
+                        self._effort_raw_samples_written < specification["raw_max_samples"]):
+                    self._effort_raw_triggers += 1
+                    for previous in self._effort_raw_history:
+                        write(previous)
+                    self._effort_raw_post_remaining = max(self._effort_raw_post_remaining, specification["raw_post_steps"]+1)
+                else:
+                    self._effort_raw_omitted_triggers += 1
+            if self._effort_raw_post_remaining > 0:
+                write(snapshot)
+                self._effort_raw_post_remaining -= 1
+            self._effort_raw_history.append(snapshot)
+            self._effort_raw_samples_omitted = self._physics_samples-self._effort_raw_samples_written
 
         def _get_dones(self):
             if self._pending_physics_sample:
@@ -2328,6 +2748,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self.cube.write_root_velocity_to_sim_index(root_velocity=torch.zeros(n, 6, device=self.device), env_ids=env_ids)
             self._targets[env_ids] = q
             self._last_written_hand_target[env_ids] = q[:, self._action_ids[7:]]
+            if effort_model:
+                self._last_written_hand_effort[env_ids] = 0
+                self.robot.set_joint_effort_target_index(target=torch.zeros(n, 7, device=self.device),
+                    joint_ids=self._action_ids[7:], env_ids=env_ids)
             self._last_contact_episode_ids[env_ids] = -1
             self._actions[env_ids] = 0
             self._previous_actions[env_ids] = 0
@@ -2651,12 +3075,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "main_lift_authorized": False,
                     "observation_cameras": [], "in_episode_object_state_writes": 0, "object_attachments": 0}
             if fixed_palm_model:
-                audit["policy_contract"]["fixed_cluster_collision_filter"] = fixed_palm_adjacency_filter_contract()
+                if effort_model:
+                    from .rl_collision_model import bilateral_fixed_cluster_contract, readback_bilateral_fixed_cluster_filters
+                    audit["policy_contract"]["fixed_cluster_collision_filter"] = bilateral_fixed_cluster_contract()
+                    current_filter = readback_bilateral_fixed_cluster_filters(get_current_stage(), UsdPhysics, self.num_envs)
+                else:
+                    audit["policy_contract"]["fixed_cluster_collision_filter"] = fixed_palm_adjacency_filter_contract()
+                    current_filter = readback_fixed_palm_adjacency_filters(get_current_stage(), UsdPhysics, self.num_envs)
                 audit["fixed_cluster_collision_filter_override"] = {
-                    **self._fixed_cluster_filter_readback,
-                    "current_stage_readback": readback_fixed_palm_adjacency_filters(
-                        get_current_stage(), UsdPhysics, self.num_envs)}
+                    **self._fixed_cluster_filter_readback, "current_stage_readback": current_filter}
                 audit["physics_differences"].append(
+                    "explicit bilateral fixed-component and direct revolute-adjacency30 exclusions" if effort_model else
                     "explicit right wrist fixed-component internal and direct revolute-adjacency 15-pair exclusions; all other self-collisions remain enabled")
             if self._control_probe_enabled:
                 audit["policy_contract"]["control_guard_version"] = self._control_probe_profile["control_guard_version"]
@@ -2664,6 +3093,20 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 audit["diagnostic_native_joint_load_readback"] = self._native_joint_load_diagnostic.readback
                 audit["diagnostic_native_self_pair_readback"] = self._native_self_pair_diagnostic.summary()
                 audit["diagnostic_legacy_postcheck"] = "exact residuals recorded; source-pinned roundoff-only allowance, meaningful box/height violations latch unsafe"
+            if effort_model:
+                audit["policy_contract"].update(effort_grasp_controller=copy.deepcopy(effort_contract),
+                    pd_backend="original_other36_implicit_and_right_hand7_explicit_zero_native_pd_v1",
+                    action_units="arm velocity-limited position reference; hand action slots inactive, independent2ms explicit effort in Nm",
+                    explicit_reset_resource_sha256=config["rl_diagnostics"]["candidate_sha256"],
+                    reset_protocol=effort_candidate["reset_protocol"],
+                    historical_reset_protocol=config["rl_teacher"]["reset_protocol"],
+                    original_seed_state_retained_sha256=hashlib.sha256(json.dumps(original_initial, sort_keys=True).encode()).hexdigest())
+                audit["diagnostic_effort_drive_readback"] = self._effort_drive_readback
+                audit["diagnostic_material_readback"] = self._effort_material_readback
+                audit["physics_differences"].extend([
+                    "right hand7 implicit PD removed; explicit current-contact-Jacobian effort with gravity included inside commanded torque cap",
+                    "declared finger-pad compliant-contact material variant; original rigid model and strict qualification retained as separate control",
+                    "explicit new geometry/reset resource and measured arm pose reference; no old trained actor loaded"])
             return audit
 
         def step_audit(self):
@@ -2681,6 +3124,15 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "update_calls": self._physics_pinch_update_count,
                         "last_feedback_sample": self._physics_pinch_last_sample,
                         "declared_feedback_period_s": self.physics_dt if self._physics_pinch is not None else None},
+                    "effort_grasp_feedback": {"enabled": self._effort_grasp is not None,
+                        "update_calls": self._effort_update_count, "last_feedback_sample": self._effort_last_sample,
+                        "declared_feedback_period_s": self.physics_dt if self._effort_grasp is not None else None,
+                        "hand_position_drive_disabled": effort_model,
+                        "raw_samples_written": self._effort_raw_samples_written,
+                        "raw_samples_omitted": self._effort_raw_samples_omitted,
+                        "raw_trigger_windows_written": self._effort_raw_triggers,
+                        "raw_triggers_omitted": self._effort_raw_omitted_triggers,
+                        "compact_2ms_complete": True if self._effort_grasp is not None else None},
                     "contact_data_unavailable_reason": self._force_unavailable,
                     "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
                     "contact_collection_crosscheck": dict(self._contact_crosscheck),

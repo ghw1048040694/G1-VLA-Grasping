@@ -331,7 +331,7 @@ class ControllerDiagnosticTensorTest(unittest.TestCase):
         jac[0, 0, 2, 0], jac[0, 0, 4, 1] = 1, -2
         data = SimpleNamespace(joint_pos=t.zeros(1, 43), body_quat_w=t.tensor([[[0., 0, 0, 1], [0., 0, 0, 1]]]),
                                body_pos_w=t.zeros(1, 2, 3), body_link_jacobian_w=jac)
-        fake = SimpleNamespace(num_envs=1, _control_probe_enabled=False, _physics_pinch=None, _previous_actions=t.zeros(1, 14),
+        fake = SimpleNamespace(num_envs=1, _control_probe_enabled=False, _physics_pinch=None, _effort_grasp=None, _previous_actions=t.zeros(1, 14),
             _actions=t.zeros(1, 14), _next_action_origin="actor", _targets=t.zeros(1, 43),
             _action_ids=list(range(14)), _velocity=t.full((14,), .5), step_dt=.066,
             _limits=t.tensor([[[-1., 1.]]*43]), _unsafe=t.zeros(1, dtype=t.bool),

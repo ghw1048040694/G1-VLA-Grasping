@@ -1,9 +1,10 @@
-"""Measured joint target control for the declared, untrained pinch intervention.
+"""Declared untrained hand interventions with independent physical qualification.
 
-This is an outer force admittance around the unchanged native joint PD drives.
-It bounds requests, not real contact force. Native contact/support qualification,
-joint/anchor/speed bounds, episode deadlines and the arm controller stay outside
-this module. In particular, a contact-mode latch never certifies physical support.
+The legacy controllers use force admittance around native joint PD drives. The
+separate effort controller requires the seven hand PD drives to be disabled.
+Both bound requests, not real contact force. Native contact/support qualification,
+episode deadlines and the arm controller stay outside this module. In particular,
+a contact-mode latch never certifies physical support.
 """
 
 from __future__ import annotations
@@ -734,3 +735,277 @@ class PhysicsStepForceAdmittance:
             "reference": "last_actually_written_target_one_update_per_native_sample",
         }
         return target, evidence, unsafe
+
+
+def _balanced_effort_contract_and_parameters(parameters):
+    """Read the separate effort declaration without changing legacy contracts."""
+    from .rl_effort_protocol import (balanced_effort_controller_contract,
+                                     validate_balanced_effort_controller_contract)
+    contract = balanced_effort_controller_contract()
+    if parameters is not None:
+        contract["parameters"] = copy.deepcopy(parameters)
+    validated = validate_balanced_effort_controller_contract(contract)
+    # A validator may return the validated declaration or validate in place.
+    if validated is not None:
+        contract = validated
+    return copy.deepcopy(contract), copy.deepcopy(contract["parameters"])
+
+
+class BalancedEffortGraspController:
+    """Joint efforts for the declared hand-only grasp intervention.
+
+    The native position/velocity drives on these seven joints MUST be disabled
+    by the environment. This class cannot inspect the native drive properties.
+    It bounds the complete requested joint torque, including gravity, rather
+    than claiming a bound on measured contact force. All contacts, acceptance
+    gates and other 36 native drives remain outside this controller.
+
+    Each current normal-Jacobian row maps hand velocity to inward velocity at
+    the actual native contact point. A speculative point may supply a current
+    row for feedback; it never establishes physically loaded contact. No row
+    from an earlier sample is stored or reused. The declared .8/.4/.4 N target
+    distribution is an internal-force reference, not a measured wrench balance.
+    """
+
+    def __init__(self, torch, initial_hand_rad, episode_id, *, parameters=None):
+        self.contract, self.parameters = _balanced_effort_contract_and_parameters(parameters)
+        self.torch = torch
+        if (not torch.is_tensor(initial_hand_rad) or not initial_hand_rad.is_floating_point() or initial_hand_rad.ndim != 2 or
+                initial_hand_rad.shape[1] != 7 or not bool(torch.isfinite(initial_hand_rad).all())):
+            raise ValueError("Balanced effort requires finite measured N by seven reset joints")
+        self.seed = initial_hand_rad.detach().clone()
+        self.num_envs = self.seed.shape[0]
+        if (not torch.is_tensor(episode_id) or tuple(episode_id.shape) != (self.num_envs,) or
+                episode_id.dtype not in (torch.int32, torch.int64)):
+            raise ValueError("Balanced effort requires integer episode identities")
+        self.ids = episode_id.clone()
+        self.reference = self.seed.clone()
+        self.contact_latched = torch.zeros(self.num_envs, 3, dtype=torch.bool, device=self.seed.device)
+        self.previous_normal_available = torch.zeros_like(self.contact_latched)
+        self.seen_valid_feedback = torch.zeros(self.num_envs, dtype=torch.bool, device=self.seed.device)
+        self.last_effort = torch.zeros_like(self.seed)
+        self.sample_id = None
+        self.group_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2], device=self.seed.device)
+        payload = json.dumps(self.contract, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False).encode()
+        self.contract_sha256 = hashlib.sha256(payload).hexdigest()
+
+    def update(self, *, sample_id, episode_id, dt, measured_hand_rad,
+               measured_hand_velocity_rad_s, nominal_hand_rad, gravity_hand_nm,
+               inward_normal_jacobian, group_contact_valid, group_physical_loaded,
+               raw_group_force_n, contact_measurement_valid, tracking, unsafe_latched,
+               joint_lower_hand_rad, joint_upper_hand_rad, geometry_lower_hand_rad,
+               geometry_upper_hand_rad, nominal_velocity_limit_hand_rad_s,
+               penetration_m, closing_axis_hand7):
+        """Use completed native sample k to request efforts for k+1 exactly once."""
+        t, p, n = self.torch, self.parameters, self.num_envs
+        if (type(sample_id) is not int or sample_id < 0 or type(dt) not in (int, float) or
+                not math.isfinite(dt) or dt != p["physics_dt_s"]):
+            raise ValueError("Balanced effort requires its declared native timestep and integer sample")
+        hands = (measured_hand_rad, measured_hand_velocity_rad_s, nominal_hand_rad,
+                 gravity_hand_nm, joint_lower_hand_rad, joint_upper_hand_rad,
+                 geometry_lower_hand_rad, geometry_upper_hand_rad,
+                 nominal_velocity_limit_hand_rad_s)
+        if any(not t.is_tensor(v) or tuple(v.shape) != (n, 7) for v in hands):
+            raise ValueError("Balanced effort needs native N by seven state/reference/bound tensors")
+        if (not t.is_tensor(episode_id) or tuple(episode_id.shape) != (n,) or
+                episode_id.dtype not in (t.int32, t.int64) or
+                tuple(inward_normal_jacobian.shape) != (n, 3, 7) or
+                tuple(raw_group_force_n.shape) != (n, 3) or tuple(penetration_m.shape) != (n,) or
+                tuple(closing_axis_hand7.shape) != (7,) or
+                any(tuple(v.shape) != (n, 3) or v.dtype != t.bool
+                    for v in (group_contact_valid, group_physical_loaded)) or
+                any(tuple(v.shape) != (n,) or v.dtype != t.bool
+                    for v in (contact_measurement_valid, tracking, unsafe_latched))):
+            raise ValueError("Balanced effort feedback dimensions or boolean types are invalid")
+        axis = closing_axis_hand7.to(device=self.seed.device, dtype=self.seed.dtype)
+        if (closing_axis_hand7.dtype == t.bool or not bool(t.isfinite(axis).all()) or
+                not bool(((axis == 0) | (axis.abs() == 1)).all()) or
+                not bool(axis[:3].ne(0).any() & axis[3:5].ne(0).any() & axis[5:].ne(0).any())):
+            raise ValueError("Balanced effort requires finite candidate closing axes in {-1,0,1} for every group")
+        # A contact on one finger may not silently control another finger. The
+        # fixed-root hand7 Jacobian has this exact kinematic sparsity.
+        structural = self.group_ids[None, :] == t.arange(3, device=self.seed.device)[:, None]
+        finite = t.ones(n, dtype=t.bool, device=self.seed.device)
+        for value in hands:
+            finite &= t.isfinite(value).all(-1)
+        finite &= t.isfinite(inward_normal_jacobian).all(dim=(-1, -2))
+        finite &= t.isfinite(raw_group_force_n).all(-1) & (raw_group_force_n >= 0).all(-1)
+        finite &= t.isfinite(penetration_m) & (penetration_m >= 0)
+        cross_group_jacobian = ((inward_normal_jacobian * (~structural)[None]).abs() > 1e-8).any(dim=(-1, -2))
+        changed = episode_id != self.ids
+        initial = self.sample_id is None
+        duplicate = not initial and sample_id == self.sample_id
+        discontinuity = not initial and not duplicate and sample_id != self.sample_id+1
+        duplicate_epoch_conflict = changed & duplicate
+        lower = t.maximum(joint_lower_hand_rad, geometry_lower_hand_rad)
+        upper = t.minimum(joint_upper_hand_rad, geometry_upper_hand_rad)
+        invalid_bounds = (lower > upper).any(-1) | (nominal_velocity_limit_hand_rad_s <= 0).any(-1)
+        reset_mismatch = changed & ((measured_hand_rad-self.seed).abs().amax(-1) > 1e-4)
+        lost_measurement = ~contact_measurement_valid & self.seen_valid_feedback & ~changed & (not duplicate)
+        unsafe = (unsafe_latched | ~finite | invalid_bounds | cross_group_jacobian | reset_mismatch |
+                  (penetration_m > p["maximum_penetration_m"]) | lost_measurement | discontinuity |
+                  duplicate_epoch_conflict)
+        fresh = t.full((n,), not (initial or duplicate or discontinuity), dtype=t.bool,
+                       device=self.seed.device) & ~changed
+        safe = fresh & contact_measurement_valid & ~unsafe
+        if not duplicate:
+            self.ids = episode_id.clone()
+            self.sample_id = sample_id
+            self.reference[changed] = self.seed[changed]
+            self.contact_latched[changed] = False
+            self.previous_normal_available[changed] = False
+            self.seen_valid_feedback[changed] = False
+        self.seen_valid_feedback |= contact_measurement_valid & finite & ~unsafe & ~changed & (not duplicate)
+        # Replace invalid data before linear algebra. Its environment is still
+        # marked unsafe and receives zero effort; NaNs never enter SVD.
+        q = t.where(finite[:, None], measured_hand_rad, self.seed)
+        qd = t.where(finite[:, None], measured_hand_velocity_rad_s, t.zeros_like(self.seed))
+        g = t.where(finite[:, None], gravity_hand_nm, t.zeros_like(self.seed))
+        force = t.where((finite & contact_measurement_valid)[:, None], raw_group_force_n,
+                        t.zeros_like(raw_group_force_n))
+        a_input = t.where(finite[:, None, None], inward_normal_jacobian,
+                          t.zeros_like(inward_normal_jacobian))
+        row_norm = t.linalg.vector_norm(a_input, dim=-1)
+        normal_available = (group_contact_valid & safe[:, None] &
+                            (row_norm >= p["normal_jacobian_rank_tolerance_m"]))
+        a = t.where(normal_available[:, :, None], a_input, t.zeros_like(a_input))
+        latched_before = self.contact_latched.clone()
+        # Having used a current (possibly speculative, even zero-force) point
+        # for force control is enough to latch its CONTROL mode. Otherwise the
+        # next absent point would jump back to the fast free-space trajectory.
+        self.contact_latched |= safe[:, None] & ((force > p["contact_feedback_onset_n"]) | normal_available)
+        reacquire = self.contact_latched & ~normal_available & safe[:, None]
+        lost_current_normal = self.previous_normal_available & ~normal_available & safe[:, None]
+        force_axis = axis != 0
+        # Drop old free-space position error when a current normal disappears.
+        # Subsequent reacquisition starts from measured q with a declared rate.
+        reset_reference = (lost_current_normal | (reacquire & ~latched_before))[:, self.group_ids]
+        reference = t.where(reset_reference, q, self.reference)
+        velocity_limit = nominal_velocity_limit_hand_rad_s.clone()
+        velocity_limit = t.where(reacquire[:, self.group_ids],
+                                 t.minimum(velocity_limit, t.full_like(velocity_limit,
+                                           p["reacquisition_velocity_limit_rad_s"])), velocity_limit)
+        nominal = t.minimum(t.maximum(nominal_hand_rad, lower), upper)
+        increment = (nominal-reference).clamp(min=-velocity_limit*dt, max=velocity_limit*dt)
+        reference = reference + t.where((safe & tracking)[:, None], increment, t.zeros_like(increment))
+        reference = t.minimum(t.maximum(reference, lower), upper)
+        # Palm lag suppresses all positional chasing. Measured force can still
+        # request opening, and current gravity remains within the total cap.
+        reference_for_impedance = t.where(tracking[:, None], reference, q)
+        spring_before_mask = p["joint_stiffness_nm_rad"]*(reference_for_impedance-q)
+        position_spring = t.where(normal_available[:, self.group_ids], t.zeros_like(q), spring_before_mask)
+        damping = -p["joint_damping_nm_s_rad"]*qd
+        impedance = position_spring+damping
+        # In current force mode the whole finger loses its free-space position
+        # spring, including tangential directions. Project damping through the
+        # exact truncated-SVD normal nullspace; do not retain a tangential pose
+        # spring that can push the Cube down while the normal force is correct.
+        _, singular, vh = t.linalg.svd(a, full_matrices=False)
+        rank = singular >= p["normal_jacobian_rank_tolerance_m"]
+        normal_projection = t.einsum("nri,nr,nrj->nij", vh, rank.to(q.dtype), vh)
+        identity = t.eye(7, device=q.device, dtype=q.dtype)[None]
+        posture = t.einsum("nij,nj->ni", identity-normal_projection, impedance)
+        targets = t.tensor(p["group_force_targets_n"], device=q.device, dtype=q.dtype)[None].expand(n, -1)
+        error = targets-force
+        inward_velocity = t.einsum("ngi,ni->ng", a, qd)
+        command = (targets+p["normal_force_feedback_gain"]*error-
+                   p["normal_velocity_damping_n_s_m"]*inward_velocity).clamp(
+                       p["group_force_command_lower_n"], p["group_force_command_upper_n"])
+        overforce = safe[:, None] & (force > p["group_force_limit_n"])
+        command = t.where(overforce, t.full_like(command, p["group_force_command_lower_n"]), command)
+        command = t.where(tracking[:, None] | overforce, command.clamp(max=p["group_force_command_upper_n"]),
+                          command.clamp(max=0))
+        command = t.where(normal_available, command, t.zeros_like(command))
+        force_torque = t.einsum("ngi,ng->ni", a, command)
+        caps = t.tensor(p["joint_torque_limits_nm"], device=q.device, dtype=q.dtype)[None].expand(n, -1)
+        gravity_clipped = g.clamp(min=-caps, max=caps)
+        overforce_joint = overforce[:, self.group_ids]
+        # Emergency unloading outranks gravity/posture on the affected finger.
+        # Known closing axes allow opening even if no current normal exists.
+        gravity_command = t.where(overforce_joint, t.zeros_like(g), gravity_clipped)
+        posture = t.where(overforce_joint, t.zeros_like(posture), posture)
+        opening_fallback = t.where(overforce_joint & ~normal_available[:, self.group_ids] & force_axis[None],
+                                   -axis[None]*p["overforce_opening_torque_nm"], t.zeros_like(g))
+        non_gravity = posture+force_torque+opening_fallback
+        denominator = t.where(non_gravity != 0, non_gravity, t.ones_like(non_gravity))
+        room = t.where(non_gravity > 0, (caps-gravity_command)/denominator,
+                       t.where(non_gravity < 0, (-caps-gravity_command)/denominator,
+                               t.ones_like(non_gravity)))
+        alpha = room.amin(-1).clamp(0, 1)
+        unclipped_total = g+impedance+force_torque+opening_fallback
+        requested_total = gravity_command+non_gravity
+        effort_before_emergency_axis_guard = gravity_command+alpha[:, None]*non_gravity
+        # A current normal may have an unexpected per-joint sign. An overload
+        # never keeps a positive known-closing-axis torque on a squeeze joint.
+        remove_closing = (overforce_joint & force_axis[None] &
+                          (effort_before_emergency_axis_guard*axis[None] > 0))
+        effort = t.where(remove_closing, t.zeros_like(g), effort_before_emergency_axis_guard)
+        effort = effort.clamp(min=-caps, max=caps)
+        # Before the first valid feedback witness, apply only bounded gravity
+        # and damping, without moving the nominal trajectory or faking contact.
+        waiting = ~self.seen_valid_feedback & ~unsafe
+        waiting_effort = (gravity_clipped-p["joint_damping_nm_s_rad"]*qd).clamp(min=-caps, max=caps)
+        effort = t.where((~safe & ~unsafe)[:, None], waiting_effort, effort)
+        if duplicate:
+            effort = self.last_effort.clone()
+        effort = t.where(unsafe[:, None], t.zeros_like(effort), effort)
+        if not duplicate:
+            self.reference = t.where(safe[:, None], reference, self.reference)
+            self.previous_normal_available = t.where(safe[:, None], normal_available,
+                                                      self.previous_normal_available)
+            self.last_effort = effort.clone()
+        projected_residual = t.einsum("ngi,ni->ng", a, posture)
+        opening_joint = (effort*axis[None] < 0) & force_axis[None]
+        relief = t.stack((opening_joint[:, :3].any(-1), opening_joint[:, 3:5].any(-1),
+                          opening_joint[:, 5:].any(-1)), dim=-1) & overforce
+        evidence = {
+            "controller_version": self.contract["version"], "controller_contract_sha256": self.contract_sha256,
+            "controller_contract": self.contract, "native_sample_id": sample_id,
+            "next_native_sample_id": sample_id+1, "sample_duplicate_hold": duplicate,
+            "sample_discontinuity": discontinuity, "episode_reset_hold": changed,
+            "duplicate_sample_episode_conflict": duplicate_epoch_conflict,
+            "measurement_fresh_for_effort": safe, "waiting_for_first_valid_measurement": waiting,
+            "measurement_lost_after_valid": lost_measurement,
+            "current_normal_available_by_group": normal_available,
+            "current_normal_declared_available_by_group": group_contact_valid,
+            "current_normal_degenerate_by_group": group_contact_valid & (row_norm < p["normal_jacobian_rank_tolerance_m"]),
+            "physical_loaded_by_group_passthrough": group_physical_loaded,
+            "control_normal_does_not_qualify_physical_support": True,
+            "raw_group_normal_force_n": raw_group_force_n, "group_force_target_n": targets,
+            "group_force_error_n": error, "group_force_command_n": command,
+            "raw_force_over_limit_by_group": raw_group_force_n > p["group_force_limit_n"],
+            "force_relief_by_group": relief, "contact_mode_latched_by_group": self.contact_latched,
+            "reacquisition_active_by_group": reacquire, "lost_current_normal_by_group": lost_current_normal,
+            "inward_normal_jacobian_m": a, "inward_velocity_m_s": inward_velocity,
+            "normal_jacobian_singular_values_m": singular, "normal_jacobian_retained_rank": rank.sum(-1),
+            "reference_hand_rad": reference, "bounded_nominal_hand_rad": nominal,
+            "reference_velocity_limit_rad_s": velocity_limit,
+            "actual_geometry_lower_violation_rad": (geometry_lower_hand_rad-measured_hand_rad).clamp_min(0),
+            "actual_geometry_upper_violation_rad": (measured_hand_rad-geometry_upper_hand_rad).clamp_min(0),
+            "actual_native_joint_lower_violation_rad": (joint_lower_hand_rad-measured_hand_rad).clamp_min(0),
+            "actual_native_joint_upper_violation_rad": (measured_hand_rad-joint_upper_hand_rad).clamp_min(0),
+            "geometry_and_velocity_boxes_constrain_reference_not_actual_motion": True,
+            "native_mechanical_tolerance_and_height_gates_remain_external": True,
+            "joint_impedance_before_normal_projection_nm": impedance,
+            "position_spring_before_contact_mode_mask_nm": spring_before_mask,
+            "position_spring_after_contact_mode_mask_nm": position_spring,
+            "position_spring_disabled_by_current_normal_joint": normal_available[:, self.group_ids],
+            "joint_velocity_damping_before_normal_projection_nm": damping,
+            "posture_torque_after_normal_projection_nm": posture,
+            "normal_posture_residual_m_nm": projected_residual,
+            "normal_force_torque_nm": force_torque, "gravity_input_nm": gravity_hand_nm,
+            "gravity_command_nm": gravity_command, "gravity_saturated_by_joint": g.abs() > caps,
+            "gravity_removed_for_overforce_by_joint": overforce_joint,
+            "opening_fallback_torque_nm": opening_fallback,
+            "unprojected_total_torque_nm": unclipped_total, "requested_total_torque_nm": requested_total,
+            "non_gravity_common_scale": alpha, "actual_bounded_effort_target_nm": effort,
+            "total_torque_caps_nm": caps, "overforce_closing_axis_torque_removed": remove_closing,
+            "unsafe_requires_zero_effort": unsafe, "invalid_reference_bounds": invalid_bounds,
+            "cross_group_jacobian_rejected": cross_group_jacobian,
+            "requires_zero_native_position_velocity_drives": True,
+            "other_36_native_drives_not_changed_by_this_controller": True,
+            "requested_torque_bounds_are_not_measured_force_bounds": True,
+            "force_target_distribution_is_not_verified_wrench_balance": True,
+        }
+        return effort, evidence, unsafe

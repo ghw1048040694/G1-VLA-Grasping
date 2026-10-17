@@ -24,7 +24,7 @@ from .rl_probe_protocol import validate_probe_settings, verify_probe_reference
 
 
 DIAGNOSTIC_VERSION = "g1_frozen_actor_opposing_closure_control_v4"
-STAGED_PLANS = ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3", "compliant_pinch_v4", "physics_pinch_v5")
+STAGED_PLANS = ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3", "compliant_pinch_v4", "physics_pinch_v5", "balanced_effort_v6")
 POSE_SERVO = {"position_gain_per_s": 4.0, "orientation_gain_per_s": 2.0,
               "dls_regularizer": 0.02, "position_speed_max_m_s": 0.01,
               "angular_speed_max_rad_s": 0.1,
@@ -83,6 +83,126 @@ def _orientation_error(torch, reference, current):
            torch.cross(left, right, dim=-1))
     w = reference[:, 3] * current[:, 3] - (left * right).sum(-1)
     return 2 * xyz * torch.where(w >= 0, 1., -1.)[:, None]
+
+
+class EffortGraspGuide:
+    """Measured phase progression plus palm pose/probe reference; no motor effort.
+
+    The actual hand commands are exclusively the native 2ms effort controller.
+    Contact equilibrium, rather than an unreachable penetrating position goal,
+    releases the preload gate. Original contact/support scoring is unchanged.
+    """
+
+    def __init__(self, torch, settings, initial_hand, state, candidate):
+        self.torch, self.settings = torch, settings
+        q = state["q_action_rad"]
+        self.seed = torch.as_tensor(initial_hand, dtype=q.dtype, device=q.device)[None].expand(q.shape[0], -1).clone()
+        frames = candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+        source = torch.as_tensor(frames[0].get("hand_target_rad", frames[0].get("target_rad")), dtype=q.dtype, device=q.device)
+        if not torch.allclose(self.seed, source[None].expand_as(self.seed), atol=1e-4, rtol=0):
+            raise ValueError("Effort grasp trajectory source differs from native reset")
+        self.goals = torch.as_tensor([f.get("hand_target_rad", f.get("target_rad")) for f in frames[1:]], dtype=q.dtype, device=q.device)
+        self.durations = torch.as_tensor([f["duration_s"] for f in frames[1:]], dtype=q.dtype, device=q.device)
+        if not bool(torch.isfinite(self.goals).all() and torch.isfinite(self.durations).all() and (self.durations > 0).all()):
+            raise ValueError("Effort grasp requires finite positive trajectory durations")
+        limits = state["joint_limits_action_rad"][:, 7:]
+        if bool(((self.goals[None] < limits[:, None, :, 0]) | (self.goals[None] > limits[:, None, :, 1])).any()):
+            raise ValueError("Effort grasp trajectory violates mechanical limits")
+        self.names = [f["name"] for f in frames[1:]]
+        prior = torch.cat((self.seed[:1], self.goals[:-1]), 0)
+        self.active = (self.goals-prior).abs() > 1e-8
+        self.ids = state["episode_id"].clone()
+        self.stage = torch.zeros_like(self.ids)
+        self.elapsed = torch.zeros_like(q[:, 0])
+        self.start = self.seed.clone()
+        self.palm = state["palm_position_world_m"].clone()
+        self.rotation = state["palm_quaternion_xyzw"].clone()
+        self.ready_count = torch.zeros_like(self.ids)
+        self.probe = torch.zeros_like(q[:, 0])
+        self.precontact_count = torch.zeros_like(self.ids)
+        self.low = torch.minimum(self.seed, self.goals.amin(0)[None])
+        self.high = torch.maximum(self.seed, self.goals.amax(0)[None])
+        self.axis = torch.as_tensor(candidate.get("closing_axis_hand7", [-1., 0., 0., 1., 1., 1., 1.]), device=q.device, dtype=q.dtype)
+
+    def actions(self, actor_actions, state, action_source, dt, force_limit):
+        t = self.torch
+        changed = self.ids != state["episode_id"]
+        self.ids = state["episode_id"].clone()
+        self.stage[changed] = 0
+        self.elapsed[changed] = 0
+        self.start[changed] = self.seed[changed]
+        self.palm[changed] = state["palm_position_world_m"][changed]
+        self.rotation[changed] = state["palm_quaternion_xyzw"][changed]
+        self.ready_count[changed] = 0
+        self.probe[changed] = 0
+        self.precontact_count[changed] = 0
+        delta = self.palm-state["palm_position_world_m"]
+        angle = _orientation_error(t, self.rotation, state["palm_quaternion_xyzw"])
+        tracking = (t.linalg.vector_norm(delta, dim=-1) <= .003) & (t.linalg.vector_norm(angle, dim=-1) <= .05)
+        metrics = state["metrics"]
+        overforce = (state["group_normal_force_n"] > force_limit).any(-1)
+        progress = tracking & ~overforce & ~state["unsafe_latched"]
+        index = self.stage.clone()
+        goal = self.goals[index]
+        self.elapsed += t.where(progress, dt, 0.)
+        fraction = (self.elapsed/self.durations[index]).clamp(0, 1)
+        blend = fraction.square()*(3-2*fraction)
+        nominal = self.start+(goal-self.start)*blend[:, None]
+        measured_error = (state["q_action_rad"][:, 7:]-goal).abs().amax(-1)
+        active_error = t.where(self.active[index], (state["q_action_rad"][:, 7:]-goal).abs(), 0.).amax(-1)
+        final = index == len(self.names)-1
+        physical = metrics.get("contact_safe", t.zeros_like(progress))
+        contact_geometry = ((metrics["group_physical_loaded_contact_count"] > 0).all(-1) &
+            (metrics["opposition_dot"] <= -.6) & (metrics["maximum_abs_normal_z"] <= .6) &
+            (metrics["maximum_penetration_m"] <= .003) & ~overforce)
+        pair_physical = (metrics["group_physical_loaded_contact_count"][:, 1:] > 0).all(-1)
+        precontact_geometry = (active_error <= .05) | (pair_physical & (metrics["maximum_abs_normal_z"] <= .6))
+        precontact = ((index == 0) & (fraction >= 1) & tracking & ~overforce &
+            precontact_geometry & (state["group_normal_force_n"][:, 1:] >= .05).all(-1))
+        self.precontact_count = t.where(precontact, self.precontact_count+1, t.zeros_like(self.precontact_count))
+        near = (active_error <= .025) | physical | contact_geometry | ((index == 0) & (self.precontact_count >= 2))
+        arrived = (fraction >= 1) & progress & near
+        advance = arrived & ~final
+        self.start[advance] = goal[advance]
+        self.stage[advance] += 1
+        self.elapsed[advance] = 0
+        actual_hand = state["q_action_rad"][:, 7:]
+        in_domain = ((actual_hand >= self.low-.025) & (actual_hand <= self.high+.025)).all(-1)
+        orientation_arrived = (actual_hand[:, 1:3]-self.goals[-1, 1:3]).abs().amax(-1) <= .025
+        complete = final & (fraction >= 1) & physical & tracking & in_domain
+        ready = state["preload_contact_ready"] & complete
+        self.ready_count = t.where(ready, self.ready_count+1, t.zeros_like(self.ready_count))
+        permit = self.ready_count >= self.settings["guided_preload_controls"]
+        self.probe = t.where(permit, (self.probe+self.settings["guided_probe_speed_m_s"]*dt).clamp(
+            max=self.settings["guided_probe_height_m"]), self.probe)
+        palm_goal = self.palm.clone()
+        palm_goal[:, 2] += self.probe
+        linear = _bounded_vector(t, (palm_goal-state["palm_position_world_m"])*POSE_SERVO["position_gain_per_s"], .01)
+        linear[:, 2] = t.where((~permit) & (self.probe > 0), linear[:, 2].clamp(max=0), linear[:, 2])
+        angular = _bounded_vector(t, angle*POSE_SERVO["orientation_gain_per_s"], .1)
+        jac = state["palm_point_jacobian_w"]
+        regular = t.eye(6, dtype=jac.dtype, device=jac.device)[None]*POSE_SERVO["dls_regularizer"]**2
+        velocity = (jac.transpose(1, 2) @ t.linalg.solve(jac@jac.transpose(1, 2)+regular,
+            t.cat((linear, angular), -1)[:, :, None])).squeeze(-1)
+        result = t.zeros_like(actor_actions)
+        desired_arm = state["target_action_rad"][:, :7]+velocity*dt
+        result[:, :7] = ((desired_arm-state["target_action_rad"][:, :7])/state["per_step_action_rad"][..., :7]).clamp(-1, 1)
+        return result, {"action_source": action_source, "guided_target_hand_rad": nominal,
+            "geometry_lower_hand_rad": self.low, "geometry_upper_hand_rad": self.high,
+            "force_admittance_closing_axis_hand7": self.axis,
+            "closure_stage_index": index, "closure_stage_fraction": fraction, "closure_stage_names": self.names,
+            "stage_measured_error_max_rad": measured_error, "stage_advance_after_this_request": advance,
+            "stage_active_measured_error_max_rad": active_error, "stage0_precontact_raw_force_controls": self.precontact_count,
+            "stage0_precontact_signal_is_not_physical_acceptance": True,
+            "stage_final_actual_geometry_domain": in_domain, "stage_final_thumb_orientation_arrived": orientation_arrived,
+            "stage_contact_geometry_is_control_signal_not_acceptance": contact_geometry,
+            "stage_final_free_space_joint_goal_required_in_force_mode": False,
+            "stage_final_orientation_uses_original_measured_opposition_and_side_gates": True,
+            "closure_path_complete": complete, "preload_contact_ready": ready,
+            "preload_control_boundary_count": self.ready_count, "probe_advance_permitted": permit,
+            "probe_offset_m": self.probe, "palm_pose_reference_world_m": palm_goal,
+            "palm_rotation_reference_xyzw": self.rotation, "hand_position_target_not_applied": True,
+            "physical_contact_equilibrium_not_support": True}
 
 
 class GuidedClosure:
@@ -280,6 +400,7 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     observations = environment.get_observations().to(cfg["rl_teacher"]["device"])
     audit = _environment_audit(environment)
     audit["source_tree_sha256"] = source_tree_identity()
+    effort_mode = settings["profile_plan"] == "balanced_effort_v6"
     if settings["profile_plan"] in ("compliant_pinch_v4", "physics_pinch_v5"):
         # This is an explicit software-control declaration, not a measured
         # contact or a change to the environment's physical policy contract.
@@ -295,7 +416,7 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
                 load.get("native_friction_properties", {}).get("available") is not True or
                 pair.get("available") is not True):
             raise RuntimeError("Geometry retest requires available native load/readback and explicit self-pair routing before physics")
-    before = module_state_sha256(actor, torch)
+    before = module_state_sha256(actor, torch) if actor is not None else "not_loaded_controller_only"
     initial_hand = [audit["initial_state"]["joint_positions_rad"][name] for name in RIGHT_HAND]
     candidate = None
     if settings.get("profile_plan") in STAGED_PLANS:
@@ -303,9 +424,12 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
         if hashlib.sha256(payload).hexdigest() != settings["candidate_sha256"]:
             raise ValueError("Geometry candidate changed after native reference verification")
         candidate = json.loads(payload)
-    guided = GuidedClosure(torch, settings, initial_hand, native.control_diagnostic_state(), candidate)
+    guide_type = EffortGraspGuide if effort_mode else GuidedClosure
+    guided = guide_type(torch, settings, initial_hand, native.control_diagnostic_state(), candidate)
     if settings["profile_plan"] == "physics_pinch_v5":
         native.configure_physics_pinch(settings["compliant_pinch_controller"])
+    if effort_mode:
+        native.configure_effort_grasp(settings["effort_grasp_controller"])
     quota = EvaluationQuota(settings["num_envs"], settings["num_envs"] * settings["episodes_per_env"])
     steps = 0
     environment._g1_last_step_audit = _json_safe(native.step_audit())
@@ -313,11 +437,11 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     while not quota.complete and steps < settings["max_control_steps"]:
         deadline.check()
         state = native.control_diagnostic_state()
-        requested = actor(observations)
+        requested = actor(observations) if actor is not None else torch.zeros(settings["num_envs"], 14, device=environment.device)
         _assert_finite(requested, torch, "frozen actor request")
         evidence = {"action_source": profile["action_source"], "frozen_actor_request": requested,
                     "actor_observation_81": observations["policy"],
-                    "actor_normalized_observation_81": actor.get_latent(observations),
+                    "actor_normalized_observation_81": actor.get_latent(observations) if actor is not None else None,
                     "episode_id": state["episode_id"], "episode_control_steps": state["episode_control_steps"],
                     "native_physics_step_count": state["native_physics_step_count"],
                     "action_pipeline": "actor -> intervention -> wrapper[-1,1] -> shared bounds -> probe guard; control_commands.raw_action is wrapper output"}
@@ -328,6 +452,13 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
             if settings["profile_plan"] == "physics_pinch_v5":
                 native.set_physics_pinch_reference(
                     nominal_hand_rad=extra["guided_target_hand_rad"],
+                    geometry_lower_hand_rad=extra["geometry_lower_hand_rad"],
+                    geometry_upper_hand_rad=extra["geometry_upper_hand_rad"],
+                    closing_axis_hand7=extra["force_admittance_closing_axis_hand7"],
+                    palm_reference_world_m=extra["palm_pose_reference_world_m"],
+                    palm_reference_quaternion_xyzw=extra["palm_rotation_reference_xyzw"])
+            if effort_mode:
+                native.set_effort_grasp_reference(nominal_hand_rad=extra["guided_target_hand_rad"],
                     geometry_lower_hand_rad=extra["geometry_lower_hand_rad"],
                     geometry_upper_hand_rad=extra["geometry_upper_hand_rad"],
                     closing_axis_hand7=extra["force_admittance_closing_axis_hand7"],
@@ -344,12 +475,12 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
         video = native.step_audit()["evaluation_video"]
         if video["failure"] is not None or not video["enabled"] or video["frames"] - first_frame != steps:
             raise RuntimeError("Diagnostic camera evidence is incomplete; physical results remain partial")
-    after = module_state_sha256(actor, torch)
+    after = module_state_sha256(actor, torch) if actor is not None else "not_loaded_controller_only"
     if before != after:
         raise RuntimeError("Diagnostic inference changed actor weights or normalization")
     final = _json_safe(native.step_audit())
     channel = verify_contact_measurements(final, require_table_witness=True)
-    summary = {**quota.report(), "profile": profile, "control_steps": steps,
+    summary = {**quota.report(), "profile": profile, "control_steps": steps, "actor_loaded": actor is not None,
                "optimizer_steps": 0, "source_identical_trained_eval": False,
                "frozen_actor_state_sha256_before": before, "frozen_actor_state_sha256_after": after,
                "reference_bridge": reference, "environment_audit": audit,
@@ -400,11 +531,17 @@ def run_native_diagnostics(config, run_dir):
         memory = _gpu_memory(torch, config["rl_teacher"]["device"])
         result["memory_before_build"] = memory
         streams["memory"].write({"num_envs": settings["num_envs"], "phase": "before_build", "memory": memory})
-        checkpoint = Path(settings["reference_checkpoint_path"])
-        if file_sha256(checkpoint) != settings["reference_checkpoint_sha256"]:
-            raise ValueError("Diagnostic checkpoint hash changed")
-        saved = torch.load(checkpoint, map_location=config["rl_teacher"]["device"], weights_only=False)
-        result["reference_checkpoint_metadata"] = verify_probe_reference(config, checkpoint_infos=saved.get("infos", {}))
+        controller_only = settings["profile_plan"] == "balanced_effort_v6"
+        saved = None
+        if controller_only:
+            result.update(actor_loaded=False, diagnostic_version="g1_balanced_effort_grasp_native_v1",
+                reference_checkpoint_metadata={"loaded": False, "reason": "controller/model calibration has no learned actor"})
+        else:
+            checkpoint = Path(settings["reference_checkpoint_path"])
+            if file_sha256(checkpoint) != settings["reference_checkpoint_sha256"]:
+                raise ValueError("Diagnostic checkpoint hash changed")
+            saved = torch.load(checkpoint, map_location=config["rl_teacher"]["device"], weights_only=False)
+            result["reference_checkpoint_metadata"] = verify_probe_reference(config, checkpoint_infos=saved.get("infos", {}))
         with inference_only(torch):
             environment = build_environment(config, num_envs=settings["num_envs"],
                 device=config["rl_teacher"]["device"], asset_path=config["rl_teacher"]["asset_path"],
@@ -416,11 +553,11 @@ def run_native_diagnostics(config, run_dir):
             streams["memory"].write({"num_envs": settings["num_envs"], "phase": "after_build", "memory": memory})
             if memory.get("host_available_ram_bytes", 0) < 2**30 or memory.get("free_bytes", 0) < 2**30:
                 raise MemoryError("Diagnostic world lacks its declared 1GiB host/device reserve")
-            actor = make_frozen_actor(torch, environment.get_observations(), saved, config["rl_teacher"])
+            actor = None if controller_only else make_frozen_actor(torch, environment.get_observations(), saved, config["rl_teacher"])
             for profile in settings["profiles"]:
                 deadline.check()
                 summary = _profile_summary(environment, actor, torch, config, settings,
-                    streams, deadline, profile, saved["infos"])
+                    streams, deadline, profile, saved["infos"] if saved is not None else None)
                 result["profiles"].append(summary)
                 print("G1_CONTROL_PROFILE=" + json.dumps({"name": profile["name"],
                     "completed": summary["completed_episodes"], "successes": summary["successes"],

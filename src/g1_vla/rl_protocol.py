@@ -9,6 +9,7 @@ from pathlib import Path
 RL_PROTOCOL = "g1_official_dex3_fixed_root_pregrasp_privileged_v2"
 RL_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v3"
 RL_PHYSICS_FIXED_PALM_ADJACENCY = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v4_fixed_palm_adjacency"
+RL_PHYSICS_EFFORT_GRASP = "physx_unitree_official_usd_fixed_root_effort_grasp_v5"
 RIGHT_ACTION_JOINTS = [
     "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
     "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
@@ -98,7 +99,7 @@ def validate_rl_settings(settings):
                 "probe_height_cap_m", "probe_overshoot_tolerance_m", "qualification_required"):
         if settings[key] != RL_TEACHER_DEFAULTS[key]:
             raise ValueError(key + " requires an explicitly new protocol before it can change")
-    if settings["physics_protocol"] not in (RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY):
+    if settings["physics_protocol"] not in (RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY, RL_PHYSICS_EFFORT_GRASP):
         raise ValueError("physics_protocol requires an explicitly supported physical model")
     for key in ("palm_friction", "max_depenetration_velocity_m_s",
                 "migration_position_tolerance_m", "migration_rotation_tolerance_rad", "recursive_leaf_pattern_match",

@@ -724,5 +724,374 @@ class PhysicsStepPinchTests(unittest.TestCase):
         self.assertFalse(e["closure_path_complete"].any())
 
 
+@unittest.skipUnless(TORCH, "real torch is required for explicit effort-control math")
+class BalancedEffortGraspTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        from g1_vla.rl_effort_protocol import balanced_effort_controller_contract
+        self.t = torch
+        self.parameters = balanced_effort_controller_contract()["parameters"]
+        self.seed = torch.zeros(2, 7)
+        self.ids = torch.zeros(2, dtype=torch.long)
+        self.controller = BalancedEffortGraspController(torch, self.seed, self.ids)
+        self.sample = 0
+        self.a = torch.zeros(2, 3, 7)
+        self.a[:, 0, 0] = -.04
+        self.a[:, 1, 3:5] = torch.tensor([.03, .02])
+        self.a[:, 2, 5:7] = torch.tensor([.03, .02])
+        self.kw = {
+            "episode_id": self.ids, "dt": .002, "measured_hand_rad": self.seed.clone(),
+            "measured_hand_velocity_rad_s": torch.zeros(2, 7), "nominal_hand_rad": self.seed.clone(),
+            "gravity_hand_nm": torch.zeros(2, 7), "inward_normal_jacobian": self.a,
+            "group_contact_valid": torch.ones(2, 3, dtype=torch.bool),
+            "group_physical_loaded": torch.ones(2, 3, dtype=torch.bool),
+            "raw_group_force_n": torch.tensor([[.8, .4, .4]]*2),
+            "contact_measurement_valid": torch.ones(2, dtype=torch.bool),
+            "tracking": torch.ones(2, dtype=torch.bool), "unsafe_latched": torch.zeros(2, dtype=torch.bool),
+            "joint_lower_hand_rad": torch.full((2, 7), -2.), "joint_upper_hand_rad": torch.full((2, 7), 2.),
+            "geometry_lower_hand_rad": torch.full((2, 7), -1.),
+            "geometry_upper_hand_rad": torch.full((2, 7), 1.),
+            "nominal_velocity_limit_hand_rad_s": torch.full((2, 7), .9),
+            "penetration_m": torch.zeros(2), "closing_axis_hand7": torch.tensor([-1., 0., 0., 1., 1., 1., 1.]),
+        }
+        self.step()  # No first-sample force may leak into the new controller.
+
+    def step(self):
+        result = self.controller.update(sample_id=self.sample, **self.kw)
+        self.sample += 1
+        return result
+
+    def test_current_normal_sign_and_declared_three_group_balance(self):
+        effort, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertAlmostEqual(float(effort[0, 0]), -.032, places=6)
+        self.assertAlmostEqual(float(effort[0, 3]), .012, places=6)
+        self.assertAlmostEqual(float(effort[0, 4]), .008, places=6)
+        self.assertTrue(self.t.allclose(e["group_force_command_n"], self.kw["raw_group_force_n"]))
+        # Opposing x normals (-1,+1,+1) yield zero reference net x force.
+        normals = self.t.tensor([[-1., 0., 0.], [1., 0., 0.], [1., 0., 0.]])
+        reference_net = e["group_force_command_n"] @ normals
+        self.assertTrue(self.t.allclose(reference_net, self.t.zeros_like(reference_net)))
+        self.assertTrue(e["force_target_distribution_is_not_verified_wrench_balance"])
+        self.kw["inward_normal_jacobian"] = -self.a
+        reversed_effort, _, _ = self.step()
+        self.assertTrue(self.t.allclose(reversed_effort, -effort))
+
+    def test_no_hidden_position_spring_along_current_contact_normal(self):
+        # Deliberately huge position error along the three force rows must not
+        # add squeezing torque. This detects retaining the old 9 Nm/rad PD law.
+        self.kw["nominal_hand_rad"] = self.a.sum(1)*5
+        self.kw["nominal_velocity_limit_hand_rad_s"][:] = 1000.
+        effort, e, _ = self.step()
+        expected = self.t.tensor([[-.032, 0., 0., .012, .008, .012, .008]]*2)
+        self.assertTrue(self.t.allclose(effort, expected, atol=1e-7, rtol=0))
+        self.assertGreater(float(e["position_spring_before_contact_mode_mask_nm"].abs().max()), .01)
+        self.assertTrue(self.t.equal(e["position_spring_after_contact_mode_mask_nm"], self.t.zeros_like(effort)))
+        self.assertLess(float(e["normal_posture_residual_m_nm"].abs().max()), 1e-8)
+        self.assertTrue(e["requires_zero_native_position_velocity_drives"])
+
+    def test_current_force_mode_does_not_chase_tangential_thumb_reorientation_nominal(self):
+        self.kw["nominal_hand_rad"][:, 1] = .2
+        self.kw["nominal_velocity_limit_hand_rad_s"][:] = 1000.
+        effort, e, _ = self.step()
+        self.assertEqual(float(effort[0, 1]), 0.)
+        self.assertAlmostEqual(float(effort[0, 0]), -.032, places=6)
+        self.assertGreater(float(e["position_spring_before_contact_mode_mask_nm"][0, 1]), .02)
+        self.assertTrue(e["position_spring_disabled_by_current_normal_joint"].all())
+        self.assertLess(float(e["normal_posture_residual_m_nm"].abs().max()), 1e-8)
+
+    def test_large_tangential_index_error_cannot_add_contact_downward_drive(self):
+        # [2,-3] is orthogonal to this index normal row [.03,.02]. The old
+        # normal-only position projection kept this error and chased the cube
+        # tangentially despite a perfectly balanced normal-force reading.
+        nominal = self.t.tensor([0., .5, -.4, .4, -.6, .4, -.6])
+        self.assertAlmostEqual(float((self.a[0, 1]*nominal).sum()), 0., places=7)
+        self.kw["nominal_hand_rad"][:] = nominal
+        self.kw["nominal_velocity_limit_hand_rad_s"][:] = 1000.
+        effort, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        expected = self.t.tensor([[-.032, 0., 0., .012, .008, .012, .008]]*2)
+        self.assertTrue(self.t.allclose(effort, expected, atol=1e-7, rtol=0))
+        self.assertGreater(float(e["position_spring_before_contact_mode_mask_nm"].abs().max()), .05)
+        self.assertTrue(self.t.equal(e["posture_torque_after_normal_projection_nm"], self.t.zeros_like(effort)))
+
+    def test_contact_mode_retains_damping_for_tangential_motion_without_position_spring(self):
+        self.kw["nominal_hand_rad"][:, 1] = .8
+        self.kw["nominal_velocity_limit_hand_rad_s"][:] = 1000.
+        self.kw["measured_hand_velocity_rad_s"][:, 1] = .5
+        effort, e, _ = self.step()
+        self.assertAlmostEqual(float(effort[0, 1]), -.015*.5, places=7)
+        self.assertEqual(float(e["position_spring_after_contact_mode_mask_nm"][0, 1]), 0.)
+        self.assertLess(float(effort[0, 1]*self.kw["measured_hand_velocity_rad_s"][0, 1]), 0.)
+
+    def test_gravity_is_inside_total_cap_and_shared_scaling_preserves_force_ratios(self):
+        self.kw["gravity_hand_nm"][:, 0] = -.05
+        effort, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertAlmostEqual(float(effort[0, 0]), -.06, places=6)
+        alpha = float(e["non_gravity_common_scale"][0])
+        self.assertGreater(alpha, 0)
+        self.assertLess(alpha, 1)
+        self.assertAlmostEqual(float(effort[0, 3])/.012, alpha, places=6)
+        self.assertAlmostEqual(float(effort[0, 5])/.012, alpha, places=6)
+        self.kw["gravity_hand_nm"][:] = .2
+        effort, e, _ = self.step()
+        caps = self.t.tensor(self.parameters["joint_torque_limits_nm"])
+        self.assertTrue((effort.abs() <= caps).all())
+        self.assertTrue(e["gravity_saturated_by_joint"].all())
+
+    def test_overforce_unclipped_negative_command_and_actual_opening_with_palm_lag(self):
+        self.kw["raw_group_force_n"][:] = self.t.tensor([54., 2., 3.])
+        self.kw["tracking"][:] = False
+        self.kw["gravity_hand_nm"][:] = self.kw["closing_axis_hand7"][None]*.03
+        self.kw["nominal_hand_rad"][:] = self.kw["closing_axis_hand7"][None]
+        effort, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())  # Force-cap failure is recorded, never hidden as safe force.
+        self.assertEqual(float(e["raw_group_normal_force_n"][0, 0]), 54.)
+        self.assertTrue(e["raw_force_over_limit_by_group"].all())
+        self.assertTrue((e["group_force_command_n"] < 0).all())
+        self.assertTrue(e["gravity_removed_for_overforce_by_joint"].all())
+        closing_work = effort*self.kw["closing_axis_hand7"][None]
+        self.assertTrue((closing_work <= 0).all())
+        self.assertTrue((closing_work[:, [0, 3, 4, 5, 6]] < 0).all())
+        self.assertTrue(e["requested_torque_bounds_are_not_measured_force_bounds"])
+
+    def test_no_current_normal_uses_axis_opening_for_overforce(self):
+        self.kw["group_contact_valid"][:] = False
+        self.kw["inward_normal_jacobian"][:] = 0
+        self.kw["raw_group_force_n"][:] = 2.
+        effort, e, _ = self.step()
+        expected = -.02*self.kw["closing_axis_hand7"]
+        self.assertTrue(self.t.allclose(effort, expected[None].expand_as(effort)))
+        self.assertFalse(e["current_normal_available_by_group"].any())
+        self.assertTrue(self.t.equal(e["normal_force_torque_nm"], self.t.zeros_like(effort)))
+
+    def test_candidate_specific_closing_axes_control_only_missing_direction_emergency(self):
+        # The new side-contact reset closes thumb1/2 and index1 in directions
+        # different from the old geometry. No legacy signs may be substituted.
+        axis = self.t.tensor([-1., -1., -1., 1., -1., 1., 1.])
+        self.kw["closing_axis_hand7"] = axis
+        self.kw["group_contact_valid"][:] = False
+        self.kw["raw_group_force_n"][:] = 2.
+        effort, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(self.t.allclose(effort, (-.02*axis)[None].expand_as(effort)))
+        self.assertGreater(float(effort[0, 1]), 0)
+        self.assertGreater(float(effort[0, 4]), 0)
+        self.assertTrue((effort*axis[None] < 0).all())
+        for invalid in ([-1., -1., -.5, 1., -1., 1., 1.],
+                        [0., 0., 0., 1., -1., 1., 1.],
+                        [-1., -1., -1., 0., 0., 1., 1.],
+                        [-1., -1., -1., 1., -1., float("nan"), 1.]):
+            self.kw["closing_axis_hand7"] = self.t.tensor(invalid)
+            with self.assertRaises(ValueError):
+                self.step()
+
+    def test_speculative_current_point_can_control_but_never_becomes_physical_evidence(self):
+        self.kw["group_physical_loaded"][:] = False
+        self.kw["raw_group_force_n"][:] = 0
+        effort, e, _ = self.step()
+        self.assertTrue(e["current_normal_available_by_group"].all())
+        self.assertFalse(e["physical_loaded_by_group_passthrough"].any())
+        self.assertAlmostEqual(float(e["group_force_command_n"][0, 0]), 1.2, places=6)
+        self.assertLess(float(effort[0, 0]), 0)
+        self.assertTrue(e["control_normal_does_not_qualify_physical_support"])
+        self.assertNotIn("support_qualified", e)
+
+    def test_loss_of_current_normal_discards_old_direction_and_reacquires_slowly(self):
+        self.step()
+        self.kw["group_contact_valid"][:] = False
+        self.kw["inward_normal_jacobian"][:] = 0
+        self.kw["raw_group_force_n"][:] = 0
+        self.kw["group_physical_loaded"][:] = False
+        self.kw["nominal_hand_rad"][:] = self.kw["closing_axis_hand7"][None]*.5
+        first, e, _ = self.step()
+        self.assertTrue(e["lost_current_normal_by_group"].all())
+        self.assertTrue(e["contact_mode_latched_by_group"].all())
+        self.assertTrue(e["reacquisition_active_by_group"].all())
+        self.assertTrue(self.t.equal(e["normal_force_torque_nm"], self.t.zeros_like(first)))
+        self.assertLess(float(first.abs().max()), .0001)
+        previous_ref = e["reference_hand_rad"].clone()
+        for _ in range(30):
+            _, e, _ = self.step()
+            delta = (e["reference_hand_rad"]-previous_ref).abs()
+            self.assertLessEqual(float(delta.max()), .04*.002+1e-8)
+            previous_ref = e["reference_hand_rad"].clone()
+        self.assertLess(float(previous_ref.abs().max()), .003)
+        self.assertFalse(e["current_normal_available_by_group"].any())
+
+    def test_zero_force_with_current_normal_keeps_feedback_and_velocity_damping(self):
+        self.step()
+        self.kw["raw_group_force_n"][:] = 0
+        self.kw["measured_hand_velocity_rad_s"][:, 0] = -2.
+        effort, e, _ = self.step()
+        self.assertTrue(e["contact_mode_latched_by_group"].all())
+        self.assertTrue(e["current_normal_available_by_group"].all())
+        self.assertGreater(float(e["group_force_command_n"][0, 0]), 0)
+        self.assertLess(float(e["group_force_command_n"][0, 0]), 1.2)
+        self.assertGreater(float(e["inward_velocity_m_s"][0, 0]), 0)
+        self.assertLess(float(effort[0, 0]), 0)
+
+    def test_lost_thumb_normal_resets_all_group_references_and_reacquires_orientation_slowly(self):
+        self.kw["nominal_hand_rad"][:, 1:3] = self.t.tensor([.8, -.8])
+        self.kw["nominal_velocity_limit_hand_rad_s"][:] = 1000.
+        for _ in range(3):
+            _, e, _ = self.step()
+        self.assertTrue((e["reference_hand_rad"][:, 1:3].abs() > .5).all())
+        self.kw["measured_hand_rad"][:, 1:3] = self.t.tensor([.08, -.08])
+        self.kw["group_contact_valid"][:, 0] = False
+        self.kw["raw_group_force_n"][:, 0] = 0
+        effort, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(e["reacquisition_active_by_group"][:, 0].all())
+        delta = (e["reference_hand_rad"][:, 1:3]-self.kw["measured_hand_rad"][:, 1:3]).abs()
+        self.assertTrue((delta <= .04*.002+1e-8).all())
+        self.assertTrue((effort[:, 1:3].abs() <= .15*.04*.002+1e-8).all())
+        self.assertTrue(self.t.equal(e["normal_force_torque_nm"][:, :3], self.t.zeros(2, 3)))
+
+    def test_zero_force_current_point_then_point_loss_never_returns_to_fast_free_chasing(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        self.controller = BalancedEffortGraspController(self.t, self.seed, self.ids)
+        self.sample = 0
+        self.kw["raw_group_force_n"][:] = 0
+        self.kw["group_physical_loaded"][:] = False
+        self.step()
+        _, e, _ = self.step()
+        self.assertTrue(e["current_normal_available_by_group"].all())
+        self.assertTrue(e["contact_mode_latched_by_group"].all())
+        self.kw["group_contact_valid"][:] = False
+        self.kw["inward_normal_jacobian"][:] = 0
+        self.kw["nominal_hand_rad"][:] = self.kw["closing_axis_hand7"][None]*.5
+        _, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(e["reacquisition_active_by_group"].all())
+        self.assertLessEqual(float(e["reference_hand_rad"].abs().max()), .04*.002+1e-8)
+
+    def test_free_approach_has_bounded_reference_and_no_position_target_output(self):
+        self.kw["group_contact_valid"][:] = False
+        self.kw["raw_group_force_n"][:] = 0
+        self.kw["nominal_hand_rad"][:] = self.kw["closing_axis_hand7"][None]*.5
+        self.kw["geometry_lower_hand_rad"][:, 0] = -.01
+        self.kw["geometry_upper_hand_rad"][:, 3:] = .01
+        previous_ref = self.controller.reference.clone()
+        for _ in range(20):
+            effort, e, unsafe = self.step()
+            self.assertFalse(unsafe.any())
+            delta = (e["reference_hand_rad"]-previous_ref).abs()
+            self.assertTrue((delta <= .9*.002+1e-7).all())
+            previous_ref = e["reference_hand_rad"].clone()
+        self.assertAlmostEqual(float(previous_ref[0, 0]), -.01, places=6)
+        self.assertTrue((previous_ref[:, 3:] <= .01).all())
+        self.assertGreater(float(effort[0, 3]), 0)
+        self.assertNotIn("next_hand_target_rad", e)
+
+    def test_actual_geometry_excursion_is_reported_separately_from_bounded_reference(self):
+        self.kw["geometry_lower_hand_rad"][:, 0] = -.01
+        self.kw["geometry_upper_hand_rad"][:, 1] = 0.
+        self.kw["measured_hand_rad"][:, 0] = -.012
+        self.kw["measured_hand_rad"][:, 1] = .004
+        _, e, unsafe = self.step()
+        # Geometry is a reference envelope. Native mechanical tolerance and
+        # actual contact/height gates are independent environment checks.
+        self.assertFalse(unsafe.any())
+        self.assertAlmostEqual(float(e["actual_geometry_lower_violation_rad"][0, 0]), .002, places=7)
+        self.assertAlmostEqual(float(e["actual_geometry_upper_violation_rad"][0, 1]), .004, places=7)
+        self.assertTrue(e["geometry_and_velocity_boxes_constrain_reference_not_actual_motion"])
+        self.assertTrue((e["reference_hand_rad"] >= self.kw["geometry_lower_hand_rad"]).all())
+        self.assertTrue((e["reference_hand_rad"] <= self.kw["geometry_upper_hand_rad"]).all())
+
+    def test_first_valid_delay_then_lost_measurement_and_nonfinite_fail_closed(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        self.controller = BalancedEffortGraspController(self.t, self.seed, self.ids)
+        self.sample = 0
+        self.kw["contact_measurement_valid"][:] = False
+        self.kw["gravity_hand_nm"][:] = .005
+        self.kw["nominal_hand_rad"][:] = .5
+        for _ in range(5):
+            effort, e, unsafe = self.step()
+            self.assertFalse(unsafe.any())
+            self.assertTrue(e["waiting_for_first_valid_measurement"].all())
+            self.assertTrue(self.t.equal(e["reference_hand_rad"], self.seed))
+            self.assertTrue(self.t.allclose(effort, self.t.full_like(effort, .005)))
+        self.kw["contact_measurement_valid"][:] = True
+        _, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(e["measurement_fresh_for_effort"].all())
+        self.kw["contact_measurement_valid"][0] = False
+        self.kw["measured_hand_velocity_rad_s"][1, 2] = float("nan")
+        effort, e, unsafe = self.step()
+        self.assertTrue(unsafe.all())
+        self.assertTrue(self.t.equal(effort, self.t.zeros_like(effort)))
+        self.assertTrue(bool(e["measurement_lost_after_valid"][0]))
+
+    def test_duplicate_gap_and_reset_do_not_reuse_old_force_or_integrate_twice(self):
+        effort, e, _ = self.step()
+        previous_ref = self.controller.reference.clone()
+        duplicate, e, unsafe = self.controller.update(sample_id=self.sample-1, **self.kw)
+        self.assertTrue(e["sample_duplicate_hold"])
+        self.assertTrue(self.t.equal(duplicate, effort))
+        self.assertTrue(self.t.equal(self.controller.reference, previous_ref))
+        self.assertFalse(unsafe.any())
+        self.kw["episode_id"] = self.t.ones_like(self.ids)
+        self.kw["contact_measurement_valid"][:] = False
+        self.kw["raw_group_force_n"][:] = 54.
+        reset, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(e["episode_reset_hold"].all())
+        self.assertFalse(e["contact_mode_latched_by_group"].any())
+        self.assertTrue(self.t.equal(reset, self.t.zeros_like(reset)))
+        self.sample += 1
+        effort, e, unsafe = self.step()
+        self.assertTrue(unsafe.all())
+        self.assertTrue(e["sample_discontinuity"])
+        self.assertTrue(self.t.equal(effort, self.t.zeros_like(effort)))
+
+    def test_invalid_jacobian_depth_or_bound_cannot_emit_effort(self):
+        self.kw["inward_normal_jacobian"][0, 0, 3] = .01
+        self.kw["penetration_m"][1] = .0031
+        effort, e, unsafe = self.step()
+        self.assertTrue(unsafe.all())
+        self.assertTrue(self.t.equal(effort, self.t.zeros_like(effort)))
+        self.assertTrue(bool(e["cross_group_jacobian_rejected"][0]))
+        self.kw["inward_normal_jacobian"][0, 0, 3] = 0
+        self.kw["penetration_m"][:] = 0
+        self.kw["geometry_lower_hand_rad"][:] = 3.
+        effort, e, unsafe = self.step()
+        self.assertTrue(unsafe.all())
+        self.assertTrue(e["invalid_reference_bounds"].all())
+        self.assertTrue(self.t.equal(effort, self.t.zeros_like(effort)))
+
+    def test_duplicate_cannot_sneak_a_new_episode_into_cached_force_state(self):
+        self.step()
+        self.kw["episode_id"] = self.t.tensor([1, 0])
+        result, e, unsafe = self.controller.update(sample_id=self.sample-1, **self.kw)
+        self.assertTrue(bool(unsafe[0]))
+        self.assertFalse(bool(unsafe[1]))
+        self.assertTrue(bool(e["duplicate_sample_episode_conflict"][0]))
+        self.assertEqual(int(self.controller.ids[0]), 0)
+        self.assertTrue(self.t.equal(result[0], self.t.zeros(7)))
+        self.kw["contact_measurement_valid"][0] = False
+        result, e, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(bool(e["episode_reset_hold"][0]))
+        self.assertFalse(bool(e["contact_mode_latched_by_group"][0].any()))
+        self.assertTrue(self.t.equal(result[0], self.t.zeros(7)))
+
+    def test_parameters_are_explicitly_declared_and_native_gate_cannot_be_relaxed(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        parameters = copy.deepcopy(self.parameters)
+        parameters["joint_stiffness_nm_rad"] = .2
+        changed = BalancedEffortGraspController(self.t, self.seed, self.ids, parameters=parameters)
+        self.assertNotEqual(changed.contract_sha256, self.controller.contract_sha256)
+        parameters["group_force_limit_n"] = 2.
+        with self.assertRaises(ValueError):
+            BalancedEffortGraspController(self.t, self.seed, self.ids, parameters=parameters)
+        parameters = copy.deepcopy(self.parameters)
+        parameters["normal_force_feedback_gain"] = True
+        with self.assertRaises(ValueError):
+            BalancedEffortGraspController(self.t, self.seed, self.ids, parameters=parameters)
+
+
 if __name__ == "__main__":
     unittest.main()

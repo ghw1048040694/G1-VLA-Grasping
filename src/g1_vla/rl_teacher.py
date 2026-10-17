@@ -41,7 +41,8 @@ def _snapshot_release(config, run_dir, assets, diagnostic=False):
         from .rl_probe_protocol import reference_snapshot_files
         files += reference_snapshot_files(config)
     selected = config["rl_teacher"]
-    if selected["checkpoint_path"]:
+    controller_only = diagnostic and config["rl_diagnostics"].get("profile_plan") == "balanced_effort_v6"
+    if selected["checkpoint_path"] and not controller_only:
         checkpoint = Path(selected["checkpoint_path"])
         if not checkpoint.is_absolute():
             checkpoint = root / checkpoint
@@ -81,7 +82,7 @@ def _snapshot_release(config, run_dir, assets, diagnostic=False):
         "source_asset_manifest_sha256": assets["manifest_sha256"],
         "source_seed_sha256": assets["seed_sha256"],
         "native_installation_reused": True, "old_ACT_payload_exported": False,
-        "selected_RL_checkpoint_exported": bool(selected["checkpoint_path"])})
+        "selected_RL_checkpoint_exported": bool(selected["checkpoint_path"]) and not controller_only})
     return digest, win_release, destination
 
 
@@ -242,6 +243,9 @@ def run_rl_teacher_stage(stage, config, run_dir):
     if stage not in ("rl-audit", "rl-smoke", "rl-train", "rl-eval", "rl-diagnose"):
         raise ValueError("unsupported privileged RL stage")
     assets = verify_rl_assets(config)
+    if (config["rl_teacher"]["physics_protocol"] == "physx_unitree_official_usd_fixed_root_effort_grasp_v5" and
+            stage != "rl-diagnose"):
+        raise ValueError("The new effort/material model is admitted only by rl-diagnose; no old actor training/evaluation route")
     run_dir = Path(run_dir)
     if config["train"]["enabled"] or config["wm"]["enabled"]:
         raise ValueError("this RL route must not simultaneously enable ACT or world-model training")

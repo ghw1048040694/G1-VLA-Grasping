@@ -1,6 +1,6 @@
 # G1 VLA Grasping
 
-G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. The current stage trains a privileged state-based RL teacher in a separately versioned PhysX model. ACT and world-model optimization remain disabled. Existing source-native ACT results, data and the MuJoCo teacher remain separate research evidence.
+G1 is being rebuilt as a fixed-stance, strict-contact manipulation system. There is one active configuration and one package entry point. The active stage is controller and physics calibration with no optimizer and no learned actor. ACT, world-model and additional RL training remain disabled. Existing checkpoints, source-native ACT results, data and the MuJoCo teacher remain separate research evidence.
 
 ## Workspace
 
@@ -8,9 +8,21 @@ The development directory is `/home/ubuntu/VLA-Learning/projects/G1-VLA-Grasping
 
 All experiment history and new implementation records belong in `../../notes/Lerobot.md`. This README describes operation and boundaries, not a second experiment journal.
 
-## Privileged RL teacher
+## Active explicit-effort grasp route
 
-Run from WSL using the same configuration and entry point. The dispatcher freezes project sources, asset hashes and configuration, then reuses the installed native Windows Isaac runtime. It does not modify IsaacLab or launch legacy experiment scripts.
+Use `python -m g1_vla.cli experiment --config configs/experiment.json --stage rl-diagnose`. The `balanced_effort_v6` plan selects its geometry/reset resource and complete `effort_grasp_controller` declaration in the central configuration. It does not load an old actor or treat a changed actuator/material/reset model as an old-policy evaluation.
+
+The seven right-hand joints use explicit effort with native stiffness and damping verified zero. Gravity compensation, posture impedance and current contact-normal Jacobian force feedback share a declared per-joint torque-command budget; the other 36 drives retain their original PD values. The current contact point shifts the link-origin Jacobian. Stale point normals are never paired with a newer force sample. A speculative contact point may steer control but cannot qualify as physically loaded. Torque-command caps do not bound real contact forces or passive/constraint torques.
+
+Declare `hard_v4_control` or `finger_compliant_v5` as a material comparison. `hard_v4_control` labels the material only: both new variants use the explicit43 reset, effort drive and bilateral30 mechanical-adjacency exclusions, so neither is identical to the historical v4 environment. All other self-collisions remain enabled. The compliant variant is a distal-pad proxy with explicit stiffness in N/m and damping in N*s/m, not an unmeasured real-robot material claim. Cube, Table and non-pad links remain rigid. Every affected native material binding is read back. The existing rigid runs remain preserved; model changes have their own physics and source identities.
+
+`calibration8_v1` is eight original offsets with one six-second episode each (91 macro controls); `acceptance32_v1` is the original eight offsets with four episodes each (364 controls). Calibration scores never count as the formal 32. The original 1.5N, 3mm, opposition/side-normal, positive-gap, conservative full-partner friction certificate, 100 consecutive 2ms samples, clearance, speed, drift and height gates remain unchanged. Software completion and grasp qualification are reported separately. Main lifting and added training remain disabled.
+
+The complete 2ms compact stream retains measured states, episode/sample identity, actual effort writes and physical gates. Raw point/friction data use bounded trigger windows, with omissions and truncation counted. RGB and its original frame ledger remain evidence; neither generated media nor reward can replace physical support.
+
+## Historical privileged RL teacher route
+
+The historical routes below require their matching original model and checkpoint declarations. The active new effort model is admitted only through `rl-diagnose`; it cannot accidentally train or evaluate the historical actor. Run from WSL using the same configuration and entry point. The dispatcher freezes project sources, asset hashes and configuration, then reuses the installed native Windows Isaac runtime. It does not modify IsaacLab or launch legacy experiment scripts.
 
 ```sh
 python -m g1_vla.cli experiment --config configs/experiment.json --stage rl-audit
