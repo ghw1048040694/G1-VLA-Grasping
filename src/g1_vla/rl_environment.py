@@ -1606,20 +1606,23 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     acceleration = api.GetCompliantContactAccelerationSpringAttr().Get()
                     pad = binding["body"] in mat["compliance_candidate_body_names"]
                     want_k, want_c = expected_pad if pad else (0., 0.)
-                    if (float(stiffness or 0) != want_k or float(damping or 0) != want_c or bool(acceleration)):
+                    if (not math.isclose(float(stiffness or 0), want_k, rel_tol=0., abs_tol=1e-6) or
+                            not math.isclose(float(damping or 0), want_c, rel_tol=0., abs_tol=1e-6) or bool(acceleration)):
                         raise RLEnvironmentError("native hand contact spring differs from declared stiffness/damping: " + path)
                     if pad and (str(api.GetRestitutionCombineModeAttr().Get()) != mat["restitution_combine_mode"] or
                             str(api.GetDampingCombineModeAttr().Get()) != mat["damping_combine_mode"]):
                         raise RLEnvironmentError("native compliant contact combination mode mismatch")
                     physics_material = UsdPhysics.MaterialAPI(material_prim)
                     friction = settings["palm_friction"] if binding["body"] == palm_contact_body else settings["hand_friction"]
-                    if (float(physics_material.GetStaticFrictionAttr().Get()) != friction or
-                            float(physics_material.GetDynamicFrictionAttr().Get()) != friction or
+                    actual_friction = [float(physics_material.GetStaticFrictionAttr().Get()),
+                                       float(physics_material.GetDynamicFrictionAttr().Get())]
+                    if (any(not math.isclose(value, friction, rel_tol=0., abs_tol=1e-6) for value in actual_friction) or
                             float(physics_material.GetRestitutionAttr().Get()) != 0.):
                         raise RLEnvironmentError("effort model changed undeclared friction/restitution")
                     records.append({"collider": path, "body": binding["body"], "material": bound[0],
                         "stiffness_n_m": stiffness, "damping_ns_m": damping,
-                        "acceleration_spring": acceleration, "soft_candidate": pad})
+                        "acceleration_spring": acceleration, "soft_candidate": pad,
+                        "static_dynamic_friction": actual_friction, "friction_readback_float_tolerance": 1e-6})
             external_records, rigid_body_records = [], []
             for i in range(self.num_envs):
                 for body_name in mat["always_rigid_body_names"]:
