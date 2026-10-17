@@ -778,6 +778,124 @@ class BalancedEffortGraspTests(unittest.TestCase):
         reversed_effort, _, _ = self.step()
         self.assertTrue(self.t.allclose(reversed_effort, -effort))
 
+    def test_explicit_zero_support_is_bitwise_identical_to_omitted_input(self):
+        omitted = self.controller.__class__(self.t, self.seed, self.ids)
+        explicit = self.controller.__class__(self.t, self.seed, self.ids)
+        omitted.update(sample_id=0, **self.kw)
+        explicit.update(sample_id=0, **self.kw)
+        for sample in range(1, 6):
+            inputs = {k: v.clone() if self.t.is_tensor(v) else v for k, v in self.kw.items()}
+            inputs["gravity_hand_nm"][:] = .003*sample
+            inputs["measured_hand_velocity_rad_s"][:] = .01*sample
+            if sample == 2:
+                inputs["group_contact_valid"][:] = False
+            if sample == 3:
+                inputs["raw_group_force_n"][:, 1] = 3.
+            if sample == 4:
+                inputs["tracking"][:] = False
+            if sample == 5:
+                inputs["unsafe_latched"][0] = True
+            left = omitted.update(sample_id=sample, **inputs)
+            right = explicit.update(sample_id=sample, object_support_torque_nm=self.t.zeros(2, 7), **inputs)
+            self.assertTrue(self.t.equal(left[0].view(self.t.int32), right[0].view(self.t.int32)))
+            self.assertTrue(self.t.equal(left[2], right[2]))
+            for key in left[1]:
+                if self.t.is_tensor(left[1][key]):
+                    self.assertTrue(self.t.equal(left[1][key], right[1][key]), key)
+
+    def test_object_weight_support_reaches_normal_nullspace_without_position_spring(self):
+        # Thumb joint1 has no normal leverage in this fixture. Object support
+        # is an explicit world-load torque, so normal projection must not erase it.
+        baseline, _, _ = self.step()
+        support = self.t.zeros(2, 7)
+        support[:, 1] = .01
+        original = support.clone()
+        self.kw["object_support_torque_nm"] = support
+        effort, evidence, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(self.t.allclose(effort-baseline, support, atol=1e-8, rtol=0))
+        self.assertTrue(self.t.equal(evidence["position_spring_after_contact_mode_mask_nm"], self.t.zeros_like(support)))
+        for key in ("object_support_torque_input_nm", "object_support_torque_requested_nm",
+                    "object_support_torque_after_safety_mask_nm", "object_support_torque_after_common_scale_nm"):
+            self.assertTrue(self.t.equal(evidence[key], support), key)
+        self.assertTrue(self.t.equal(original, support))
+
+    def test_support_and_normal_share_remaining_torque_budget_after_gravity(self):
+        support = self.t.zeros(2, 7)
+        support[:, 0] = -.01
+        support[:, 1] = .2
+        self.kw["object_support_torque_nm"] = support
+        self.kw["gravity_hand_nm"][:, 0] = -.05
+        effort, evidence, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(self.t.allclose(evidence["non_gravity_common_scale"], self.t.full((2,), .2), atol=1e-7, rtol=0))
+        self.assertAlmostEqual(float(effort[0, 0]), -.05+.2*(-.032-.01), places=7)
+        self.assertAlmostEqual(float(effort[0, 1]), .04, places=7)
+        self.assertAlmostEqual(float(effort[0, 3]), .2*.012, places=7)
+        self.assertTrue(self.t.allclose(evidence["object_support_torque_after_common_scale_nm"], .2*support, atol=1e-8, rtol=0))
+        caps = self.t.tensor(self.parameters["joint_torque_limits_nm"])
+        self.assertTrue((effort.abs() <= caps).all())
+        self.assertTrue(evidence["object_support_shares_non_gravity_alpha_and_total_caps"])
+
+    def test_group_overforce_removes_entire_finger_support_before_common_scale(self):
+        self.kw["raw_group_force_n"][0, 0] = 2.
+        self.kw["raw_group_force_n"][1, 1] = 2.
+        baseline = self.controller.__class__(self.t, self.seed, self.ids)
+        baseline.update(sample_id=0, **self.kw)
+        old_effort, _, _ = baseline.update(sample_id=self.sample, **self.kw)
+        self.kw["object_support_torque_nm"] = self.t.full((2, 7), .005)
+        effort, evidence, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        masked = evidence["object_support_torque_after_safety_mask_nm"]
+        self.assertTrue(self.t.equal(masked[0, :3], self.t.zeros(3)))
+        self.assertTrue(self.t.equal(masked[1, 3:5], self.t.zeros(2)))
+        self.assertTrue(self.t.equal(effort[0, :3], old_effort[0, :3]))
+        self.assertTrue(self.t.equal(effort[1, 3:5], old_effort[1, 3:5]))
+        self.assertTrue((masked[0, 3:] > 0).all())
+        self.assertTrue((masked[1, [0, 1, 2, 5, 6]] > 0).all())
+
+    def test_nonfinite_support_fails_closed_per_environment(self):
+        for invalid in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(invalid=invalid):
+                support = self.t.full((2, 7), .005)
+                support[0, 2] = invalid
+                self.kw["object_support_torque_nm"] = support
+                effort, evidence, unsafe = self.step()
+                self.assertTrue(bool(unsafe[0]))
+                self.assertFalse(bool(unsafe[1]))
+                self.assertTrue(self.t.isfinite(effort).all())
+                self.assertTrue(self.t.equal(effort[0], self.t.zeros(7)))
+                self.assertTrue(self.t.equal(evidence["object_support_torque_after_common_scale_nm"][0], self.t.zeros(7)))
+
+    def test_support_shape_type_and_dtype_are_explicit(self):
+        for invalid in ([0.]*7, self.t.zeros(7), self.t.zeros(2, 6),
+                        self.t.zeros(2, 7, dtype=self.t.bool),
+                        self.t.zeros(2, 7, dtype=self.t.float64)):
+            with self.subTest(type=type(invalid), shape=getattr(invalid, "shape", None)):
+                self.kw["object_support_torque_nm"] = invalid
+                with self.assertRaises(ValueError):
+                    self.step()
+
+    def test_support_cannot_bypass_bootstrap_duplicate_or_unsafe_hold(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        self.controller = BalancedEffortGraspController(self.t, self.seed, self.ids)
+        self.sample = 0
+        self.kw["object_support_torque_nm"] = self.t.full((2, 7), .01)
+        first, evidence, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(self.t.equal(first, self.t.zeros_like(first)))
+        self.assertFalse(evidence["object_support_torque_after_safety_mask_nm"].any())
+        active, _, _ = self.step()
+        duplicate, evidence, _ = self.controller.update(sample_id=1, **self.kw)
+        self.assertTrue(self.t.equal(active, duplicate))
+        self.assertTrue(evidence["sample_duplicate_hold"])
+        self.assertFalse(evidence["object_support_torque_after_safety_mask_nm"].any())
+        self.kw["unsafe_latched"][:] = True
+        effort, evidence, unsafe = self.step()
+        self.assertTrue(unsafe.all())
+        self.assertTrue(self.t.equal(effort, self.t.zeros_like(effort)))
+        self.assertFalse(evidence["object_support_torque_after_common_scale_nm"].any())
+
     def test_no_hidden_position_spring_along_current_contact_normal(self):
         # Deliberately huge position error along the three force rows must not
         # add squeezing torque. This detects retaining the old 9 Nm/rad PD law.

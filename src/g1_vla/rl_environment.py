@@ -1626,12 +1626,33 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             for name, view in (("Robot", self.robot.root_view), ("Cube", self.cube.root_view), ("Table", self.table.root_view)):
                 contact_before = tensor(view.get_contact_offsets()).clone()
                 rest_before = tensor(view.get_rest_offsets()).clone()
-                shape_count = len(self._effort_contact_offset_schema[name])
+                authored_count = len(self._effort_contact_offset_schema[name])
+                # CollisionAPI prims and cooked native shapes are distinct
+                # counts (for example compound/cooked geometry). The native
+                # view's whole max_shapes array, never the USD count, sets the
+                # parameter-buffer width. No native entry is discarded.
+                shape_count = int(view.max_shapes)
                 shape = (self.num_envs, shape_count)
-                if (int(view.count) != self.num_envs or int(view.max_shapes) != shape_count or
+                paths = list(view.prim_paths)
+                binding_ok = (len(paths) == self.num_envs and all(
+                    path == "/World/envs/env_{}/{}".format(i, name) or
+                    (name == "Robot" and path.startswith("/World/envs/env_{}/Robot/".format(i)))
+                    for i, path in enumerate(paths)))
+                homogeneous = getattr(view, "is_homogeneous", None) if name == "Robot" else None
+                diagnostic = {"body": name, "view_count": int(view.count), "max_shapes": shape_count,
+                    "native_contact_offset_shape": list(contact_before.shape),
+                    "native_rest_offset_shape": list(rest_before.shape),
+                    "authored_collider_api_count": authored_count,
+                    "contact_offsets_finite": bool(torch.isfinite(contact_before).all()),
+                    "rest_offsets_finite": bool(torch.isfinite(rest_before).all()),
+                    "native_prim_paths": paths, "exact_per_env_binding": binding_ok,
+                    "native_articulation_is_homogeneous": homogeneous,
+                    "contact_offsets_values": str(contact_before), "rest_offsets_values": str(rest_before)}
+                if (int(view.count) != self.num_envs or shape_count < 1 or authored_count < 1 or not binding_ok or
+                        (name == "Robot" and homogeneous is not True) or
                         tuple(contact_before.shape) != shape or tuple(rest_before.shape) != shape or
                         not bool(torch.isfinite(contact_before).all()) or not bool(torch.isfinite(rest_before).all())):
-                    raise RLEnvironmentError("native all-shape offset binding/count/finite mismatch: "+name)
+                    raise RLEnvironmentError("native all-shape offset binding/count/finite mismatch: "+json.dumps(diagnostic))
                 desired_contact = torch.full(shape, declaration["contact_offset_m"], dtype=torch.float32, device="cpu")
                 desired_rest = torch.full(shape, declaration["rest_offset_m"], dtype=torch.float32, device="cpu")
                 already_matched = (bool(torch.isclose(contact_before.cpu(), desired_contact, atol=1e-12, rtol=0).all()) and
@@ -1649,8 +1670,18 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     bool(torch.isclose(contact_after.cpu(), desired_contact, atol=1e-12, rtol=0).all()) and
                     bool(torch.isclose(rest_after.cpu(), desired_rest, atol=1e-12, rtol=0).all()))
                 if not passed:
-                    raise RLEnvironmentError("native contact/rest offsets differ from declared zero-margin model: "+name)
+                    diagnostic.update(contact_offsets_after_shape=list(contact_after.shape),
+                        rest_offsets_after_shape=list(rest_after.shape),
+                        contact_offsets_after_values=str(contact_after), rest_offsets_after_values=str(rest_after),
+                        wanted_contact_offset_m=declaration["contact_offset_m"], wanted_rest_offset_m=declaration["rest_offset_m"])
+                    raise RLEnvironmentError("native contact/rest offsets differ from declared zero-margin model: "+json.dumps(diagnostic))
                 native[name] = {"verified": True, "view_count": int(view.count), "native_shape_count_per_env": shape_count,
+                    "authored_collision_api_prim_count_per_env": authored_count,
+                    "native_minus_authored_count": shape_count-authored_count,
+                    "source_to_native_one_to_one_shape_mapping_claimed": False,
+                    "all_native_shape_entries_checked": self.num_envs*shape_count,
+                    "native_prim_paths": paths, "exact_per_env_binding": binding_ok,
+                    "native_articulation_is_homogeneous": homogeneous,
                     "source_collision_shapes": self._effort_contact_offset_schema[name],
                     "contact_offsets_before_m": contact_before, "rest_offsets_before_m": rest_before,
                     "prephysics_native_setters_applied": not already_matched,
@@ -2028,6 +2059,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._effort_grasp = BalancedEffortGraspController(torch,
                 tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]], self._episode_ids,
                 parameters=contract["controller"]["parameters"])
+            self._object_support_scale = torch.zeros(self.num_envs, device=self.device)
+            self._object_support_episode_ids = self._episode_ids.clone()
+            self._object_support_last_sample = None
             self._write_control_probe({"event": "effort_grasp_controller_installed", "contract": contract,
                 "native_physics_step_count": int(self.sim.get_physics_step_count()),
                 "episode_id": self._episode_ids, "drive_readback": self._effort_drive_readback,
@@ -2068,22 +2102,62 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             valid &= torch.isfinite(norm) & (norm > .5)
             inward = inward/norm.clamp_min(1e-12)[..., None]
             weights = (hand["point_force"][:, :7].abs()+.001)*valid
-            a, centers, normals, availability = [], [], [], []
+            a, centers, normals, availability, point_jacobians = [], [], [], [], []
             for first, last in ((0, 3), (3, 5), (5, 7)):
                 w = weights[:, first:last]
                 total = w.sum(dim=(1, 2))
                 w = w/total.clamp_min(1e-12)[:, None, None]
                 row = (inward[:, first:last, :, :, None]*point_j[:, first:last]).sum(-2)
                 a.append((w[..., None]*row).sum(dim=(1, 2)))
+                point_jacobians.append((w[..., None, None]*point_j[:, first:last]).sum(dim=(1, 2)))
                 centers.append((w[..., None]*point[:, first:last]).sum(dim=(1, 2)))
                 normals.append((w[..., None]*inward[:, first:last]).sum(dim=(1, 2)))
                 availability.append(total > 0)
             self._effort_geometry = {"normal_jacobian": torch.stack(a, 1).detach().clone(),
+                "point_jacobian_world_m": torch.stack(point_jacobians, 1).detach().clone(),
                 "point_world_m": torch.stack(centers, 1).detach().clone(),
                 "inward_normal_world": torch.stack(normals, 1).detach().clone(),
                 "current_normal_available": torch.stack(availability, 1).detach().clone(),
                 "episode_id": self._episode_ids.clone(),
                 "native_step": int(self.sim.get_physics_step_count())}
+
+        def _object_weight_support_torque(self, *, valid, tracking, geometry, current):
+            """Request object weight through fresh physical points, never an attachment.
+
+            This is a desired static support wrench. The hand controller must
+            still put it inside its common scale/caps and measured support gates.
+            """
+            declaration = effort_contract["actuation"]["object_weight_support"]
+            changed = self._object_support_episode_ids != self._episode_ids
+            self._object_support_scale[changed] = 0
+            self._object_support_episode_ids = self._episode_ids.clone()
+            native_step = int(self.sim.get_physics_step_count())
+            gate = valid & tracking & ~self._unsafe & current.all(-1) & self._grip_locked
+            gate &= preload_contact_ready(torch, self._last_metrics, self.num_envs, self.device)
+            point_j = torch.zeros(self.num_envs, 3, 3, 7, device=self.device)
+            if geometry is not None:
+                point_j = geometry["point_jacobian_world_m"]
+                if tuple(point_j.shape) != (self.num_envs, 3, 3, 7) or not bool(torch.isfinite(point_j).all()):
+                    raise RLEnvironmentError("object support requires finite current native group point Jacobians")
+                gate &= (geometry["episode_id"] == self._episode_ids) & (geometry["native_step"] == native_step)
+            else:
+                gate &= False
+            self._object_support_scale = torch.where(gate, self._object_support_scale,
+                                                      torch.zeros_like(self._object_support_scale))
+            if self._object_support_last_sample != native_step:
+                self._object_support_scale = torch.where(gate,
+                    (self._object_support_scale+self.physics_dt/declaration["ramp_s"]).clamp(max=1),
+                    self._object_support_scale)
+            self._object_support_last_sample = native_step
+            shares = torch.tensor(declaration["group_weight_shares"], device=self.device, dtype=point_j.dtype)
+            up = torch.tensor(declaration["world_up_axis"], device=self.device, dtype=point_j.dtype)
+            group_force = (self._object_support_scale[:, None, None]*declaration["object_mass_kg"]*
+                           declaration["gravity_m_s2"]*shares[None, :, None]*up[None, None])
+            torque = torch.einsum("ngci,ngc->ni", point_j, group_force)
+            return torque, {"contract": declaration, "gate": gate,
+                "ramp_scale": self._object_support_scale.clone(), "current_group_requested_force_world_n": group_force,
+                "requested_hand_object_support_torque_before_common_cap_nm": torque,
+                "request_is_not_measured_object_support_or_friction_certification": True}
 
         def _update_effort_grasp(self):
             ref = self._effort_reference
@@ -2113,6 +2187,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         (2*torch.acos(dot) <= .05))
             physical = metrics.get("group_physical_loaded_contact_count", torch.zeros(self.num_envs, 3, device=self.device)) > 0
             gravity = tensor(self.robot.data.gravity_compensation_forces)[:, ids]
+            support_torque, support_evidence = self._object_weight_support_torque(
+                valid=valid, tracking=tracking, geometry=geometry, current=current)
             effort, evidence, unsafe = self._effort_grasp.update(sample_id=native_step,
                 episode_id=self._episode_ids, dt=self.physics_dt, measured_hand_rad=q,
                 measured_hand_velocity_rad_s=tensor(self.robot.data.joint_vel)[:, ids],
@@ -2125,7 +2201,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 geometry_lower_hand_rad=ref["geometry_lower_hand_rad"], geometry_upper_hand_rad=ref["geometry_upper_hand_rad"],
                 nominal_velocity_limit_hand_rad_s=self._velocity[7:][None].expand_as(q),
                 penetration_m=metrics.get("maximum_penetration_m", torch.zeros(self.num_envs, device=self.device)),
-                closing_axis_hand7=ref["closing_axis_hand7"])
+                closing_axis_hand7=ref["closing_axis_hand7"], object_support_torque_nm=support_torque)
             self._unsafe |= unsafe
             self._last_written_hand_effort = effort.clone()
             self._effort_update_count += 1
@@ -2141,6 +2217,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 "contact_measurement_current_episode": fresh, "measured_hand_rad": q,
                 "next_hand_effort_target_nm": effort, "current_normal_geometry": geometry,
                 "estimated_normal_only_object_wrench_before_torque_saturation": predicted_wrench,
+                "object_weight_support_request": support_evidence,
                 "wrench_estimate_excludes_friction_and_is_not_verified_balance": True,
                 "evidence": evidence, "requires_unsafe": unsafe,
                 "hand_position_drive_disabled": True, "torque_command_cap_is_not_physical_force_cap": True})

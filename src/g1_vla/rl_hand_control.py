@@ -796,7 +796,7 @@ class BalancedEffortGraspController:
                raw_group_force_n, contact_measurement_valid, tracking, unsafe_latched,
                joint_lower_hand_rad, joint_upper_hand_rad, geometry_lower_hand_rad,
                geometry_upper_hand_rad, nominal_velocity_limit_hand_rad_s,
-               penetration_m, closing_axis_hand7):
+               penetration_m, closing_axis_hand7, object_support_torque_nm=None):
         """Use completed native sample k to request efforts for k+1 exactly once."""
         t, p, n = self.torch, self.parameters, self.num_envs
         if (type(sample_id) is not int or sample_id < 0 or type(dt) not in (int, float) or
@@ -808,6 +808,16 @@ class BalancedEffortGraspController:
                  nominal_velocity_limit_hand_rad_s)
         if any(not t.is_tensor(v) or tuple(v.shape) != (n, 7) for v in hands):
             raise ValueError("Balanced effort needs native N by seven state/reference/bound tensors")
+        if object_support_torque_nm is None:
+            support_input = t.zeros_like(self.seed)
+        else:
+            if (not t.is_tensor(object_support_torque_nm) or
+                    tuple(object_support_torque_nm.shape) != (n, 7) or
+                    not object_support_torque_nm.is_floating_point() or
+                    object_support_torque_nm.dtype != self.seed.dtype or
+                    object_support_torque_nm.device != self.seed.device):
+                raise ValueError("Object support torque requires native N by seven matching floating tensors")
+            support_input = object_support_torque_nm
         if (not t.is_tensor(episode_id) or tuple(episode_id.shape) != (n,) or
                 episode_id.dtype not in (t.int32, t.int64) or
                 tuple(inward_normal_jacobian.shape) != (n, 3, 7) or
@@ -829,6 +839,7 @@ class BalancedEffortGraspController:
         finite = t.ones(n, dtype=t.bool, device=self.seed.device)
         for value in hands:
             finite &= t.isfinite(value).all(-1)
+        finite &= t.isfinite(support_input).all(-1)
         finite &= t.isfinite(inward_normal_jacobian).all(dim=(-1, -2))
         finite &= t.isfinite(raw_group_force_n).all(-1) & (raw_group_force_n >= 0).all(-1)
         finite &= t.isfinite(penetration_m) & (penetration_m >= 0)
@@ -862,6 +873,7 @@ class BalancedEffortGraspController:
         q = t.where(finite[:, None], measured_hand_rad, self.seed)
         qd = t.where(finite[:, None], measured_hand_velocity_rad_s, t.zeros_like(self.seed))
         g = t.where(finite[:, None], gravity_hand_nm, t.zeros_like(self.seed))
+        support_requested = t.where(finite[:, None], support_input, t.zeros_like(self.seed))
         force = t.where((finite & contact_measurement_valid)[:, None], raw_group_force_n,
                         t.zeros_like(raw_group_force_n))
         a_input = t.where(finite[:, None, None], inward_normal_jacobian,
@@ -928,12 +940,24 @@ class BalancedEffortGraspController:
         opening_fallback = t.where(overforce_joint & ~normal_available[:, self.group_ids] & force_axis[None],
                                    -axis[None]*p["overforce_opening_torque_nm"], t.zeros_like(g))
         non_gravity = posture+force_torque+opening_fallback
+        # The environment supplies current-point Jz.T times its declared share
+        # of object weight. It must qualify/ramp that request independently.
+        # Emergency unloading removes the whole affected finger's support,
+        # and no support request bypasses the existing common alpha or caps.
+        support_after_mask = t.where((safe[:, None] & ~overforce_joint),
+                                     support_requested, t.zeros_like(support_requested))
+        # Select the original value at exactly zero input, including signed
+        # zero, so both the omitted and explicit-zero API retain its bits.
+        non_gravity = t.where(support_after_mask != 0,
+                              non_gravity+support_after_mask, non_gravity)
         denominator = t.where(non_gravity != 0, non_gravity, t.ones_like(non_gravity))
         room = t.where(non_gravity > 0, (caps-gravity_command)/denominator,
                        t.where(non_gravity < 0, (-caps-gravity_command)/denominator,
                                t.ones_like(non_gravity)))
         alpha = room.amin(-1).clamp(0, 1)
         unclipped_total = g+impedance+force_torque+opening_fallback
+        unclipped_total = t.where(support_after_mask != 0,
+                                 unclipped_total+support_after_mask, unclipped_total)
         requested_total = gravity_command+non_gravity
         effort_before_emergency_axis_guard = gravity_command+alpha[:, None]*non_gravity
         # A current normal may have an unexpected per-joint sign. An overload
@@ -998,6 +1022,13 @@ class BalancedEffortGraspController:
             "gravity_command_nm": gravity_command, "gravity_saturated_by_joint": g.abs() > caps,
             "gravity_removed_for_overforce_by_joint": overforce_joint,
             "opening_fallback_torque_nm": opening_fallback,
+            "object_support_torque_input_nm": support_input,
+            "object_support_torque_requested_nm": support_requested,
+            "object_support_torque_after_safety_mask_nm": support_after_mask,
+            "object_support_torque_after_common_scale_nm": alpha[:, None]*support_after_mask,
+            "object_support_removed_for_overforce_by_joint": overforce_joint,
+            "object_support_scaled_component_precedes_final_hold_or_unsafe_overrides": True,
+            "object_support_shares_non_gravity_alpha_and_total_caps": True,
             "unprojected_total_torque_nm": unclipped_total, "requested_total_torque_nm": requested_total,
             "non_gravity_common_scale": alpha, "actual_bounded_effort_target_nm": effort,
             "total_torque_caps_nm": caps, "overforce_closing_axis_torque_removed": remove_closing,

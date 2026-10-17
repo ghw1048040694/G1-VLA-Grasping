@@ -11,7 +11,7 @@ from copy import deepcopy
 import math
 
 
-EFFORT_GRASP_VERSION = "g1_explicit_effort_grasp_protocol_v3_physical_contact"
+EFFORT_GRASP_VERSION = "g1_explicit_effort_grasp_protocol_v4_object_support"
 RIGHT_ARM_JOINT_NAMES = tuple("right_" + name + "_joint" for name in (
     "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw"))
 RIGHT_HAND_JOINT_NAMES = tuple(
@@ -26,7 +26,7 @@ ALWAYS_RIGID_BODY_NAMES = (
 _NATIVE_EFFORT_UPPER_NM = (2.45, 1.4, 1.4, 1.4, 1.4, 1.4, 1.4)
 _KINDS = "explicit_hand_effort_and_material_calibration"
 _BALANCED_DEFAULTS = {
-    "version": "g1_balanced_normal_jacobian_effort_grasp_v1",
+    "version": "g1_balanced_normal_and_object_support_effort_grasp_v2",
     "kind": "explicit_joint_effort_from_current_contact_normal_jacobian",
     "parameters": {
         "physics_dt_s": 0.002,
@@ -55,6 +55,7 @@ _BALANCED_DEFAULTS = {
         "overforce_priority": "raw_force_above_original_1p5N_cancels_positive_inward_force_and_group_gravity_posture_contributions_requests_opening",
         "overforce_without_current_direction": "known_joint_closing_axes_opening_fallback_bounded_by_declared_opening_torque_and_final_total_cap",
         "gravity_compensation": "included_in_the_same_total_per_joint_cap_never_added_after_clipping",
+        "object_weight_support": "fresh_current_point_world_z_jacobian_torque_inside_same_alpha_and_total_cap_removed_on_group_overforce_not_measured_support",
         "reacquisition_velocity": "bounded_reference_motion_not_a_real_force_or_motion_guarantee",
         "physical_qualification": "unchanged_legacy_contact_gap_friction_force_geometry_and_100_sample_support_gates_independent_of_controller",
         "telemetry": "commanded_total_effort_is_not_claimed_as_isolated_measured_drive_torque",
@@ -122,6 +123,18 @@ _DEFAULTS = {
         "gravity_compensation_within_total_cap": True,
         "unclipped_and_clipped_total_torque_logged": True,
         "position_target_is_not_force_limit": True,
+        "object_weight_support": {
+            "version": "g1_current_contact_object_weight_feedforward_v1",
+            "object_mass_kg": 0.08,
+            "gravity_m_s2": 9.81,
+            "world_up_axis": [0., 0., 1.],
+            "group_weight_shares": [0.5, 0.25, 0.25],
+            "ramp_s": 0.198,
+            "requires_original_contact_safe_and_grip_lock": True,
+            "fresh_point_jacobian_required": True,
+            "inside_total_hand_torque_budget": True,
+            "object_state_writes_or_attachments": False,
+        },
         "posture_gravity_feedforward": {
             "version": "g1_native_arm7_waist3_gravity_feedforward_v1",
             "joint_order": list(RIGHT_ARM_JOINT_NAMES) + ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],

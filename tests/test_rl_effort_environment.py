@@ -44,7 +44,7 @@ class NativeEffortAdapterTests(unittest.TestCase):
         import torch
         self.t = torch
         self.scope = {"torch": torch, "tensor": lambda v: v, "RLEnvironmentError": RuntimeError,
-                      "math": math,
+                      "math": math, "json": json,
                       "settings": {"contact_offset_m": .001, "max_abs_normal_z": .6}}
 
     def guide_fixture(self):
@@ -340,6 +340,8 @@ class NativeEffortAdapterTests(unittest.TestCase):
         class View:
             def __init__(self, name, count):
                 self.name, self.count, self.max_shapes = name, 2, count
+                self.prim_paths = ["/World/envs/env_{}/{}".format(i, name)+( "/root_joint" if name == "Robot" else "") for i in range(2)]
+                self.is_homogeneous = True
                 self.contact = t.full((2, count), 0. if already_matched else .001)
                 self.rest = t.full((2, count), -1e-6 if already_matched else 0.)
                 self.ignore_contact_write = False
@@ -446,6 +448,30 @@ class NativeEffortAdapterTests(unittest.TestCase):
         method(env)
         self.assertEqual(calls, [])
         self.assertTrue(env._effort_contact_generation_readback["verified"])
+
+    def test_zero_margin_native_cooked_shape_count_can_differ_but_every_entry_is_set_and_checked(self):
+        env, _, views, _, method = self.generation_fixture()
+        v = views["Robot"]
+        v.max_shapes = 5  # Three authored collider APIs need not cook into three native shapes.
+        v.contact = self.t.full((2, 5), .001)
+        v.rest = self.t.zeros(2, 5)
+        method(env)
+        row = env._effort_contact_generation_readback["native_shape_offsets"]["Robot"]
+        self.assertEqual(row["native_shape_count_per_env"], 5)
+        self.assertEqual(row["authored_collision_api_prim_count_per_env"], 3)
+        self.assertEqual(row["native_minus_authored_count"], 2)
+        self.assertEqual(row["all_native_shape_entries_checked"], 10)
+        self.assertFalse(row["source_to_native_one_to_one_shape_mapping_claimed"])
+        self.assertTrue((v.contact == 0).all())
+        self.assertTrue((v.rest == self.t.full_like(v.rest, -1e-6)).all())
+
+    def test_zero_margin_rejects_cross_env_binding_and_heterogeneous_native_articulations(self):
+        for mode in ("cross_env", "heterogeneous"):
+            env, _, views, _, method = self.generation_fixture()
+            if mode == "cross_env": views["Robot"].prim_paths[1] = "/World/envs/env_0/Robot/root_joint"
+            else: views["Robot"].is_homogeneous = False
+            with self.subTest(mode=mode), self.assertRaisesRegex(RuntimeError, "authored_collider_api_count"):
+                method(env)
 
     def test_zero_margin_native_shape_count_nonfinite_or_ignored_write_fail_closed(self):
         for failure in ("shape", "nonfinite", "ignored"):
@@ -560,6 +586,7 @@ class NativeEffortAdapterTests(unittest.TestCase):
             _unsafe=t.zeros(2, dtype=t.bool), _limits=t.tensor([[[-2., 2.]]*43]*2),
             _velocity=t.full((14,), .9), _effort_update_count=0, _control_command_id=1,
             _effort_grasp=SimpleNamespace(update=effort_update), _write_control_probe=rows.append,
+            _object_weight_support_torque=lambda **kw: (t.zeros(2, 7), {"gate": t.zeros(2, dtype=t.bool)}),
             sim=SimpleNamespace(get_physics_step_count=lambda: 9), physics_dt=.002,
             robot=SimpleNamespace(data=SimpleNamespace(joint_pos=t.zeros(2, 43), joint_vel=t.zeros(2, 43),
                 body_pos_w=t.zeros(2, 9, 3), body_quat_w=quat, gravity_compensation_forces=t.full((2, 43), .002))),
@@ -567,6 +594,72 @@ class NativeEffortAdapterTests(unittest.TestCase):
         # This fixture deliberately has identity rotations and zero offset.
         scope = dict(self.scope, quat_apply=lambda q, v: v, quat_mul=lambda q, r: q)
         return env, calls, rows, actual_method("_update_effort_grasp", scope)
+
+    def weight_support_fixture(self):
+        from g1_vla.rl_effort_protocol import effort_grasp_contract
+        from g1_vla.rl_environment import preload_contact_ready
+        t = self.t
+        ids = t.tensor([2, 3])
+        jac = t.zeros(2, 3, 3, 7)
+        jac[:, 0, 2, 0] = .02
+        jac[:, 1, 2, 3] = -.03
+        jac[:, 2, 2, 5] = .04
+        geometry = {"point_jacobian_world_m": jac, "episode_id": ids.clone(), "native_step": 9}
+        fields = ("contact_safe", "grip_reference_locked", "no_positive_gap_hand_load",
+                  "friction_partner_manifold_certified", "finite", "joint_safe")
+        env = SimpleNamespace(num_envs=2, device="cpu", physics_dt=.002,
+            _episode_ids=ids.clone(), _object_support_episode_ids=ids.clone(),
+            _object_support_scale=t.zeros(2), _object_support_last_sample=None,
+            _last_metrics={name: t.ones(2, dtype=t.bool) for name in fields},
+            _unsafe=t.zeros(2, dtype=t.bool), _grip_locked=t.ones(2, dtype=t.bool),
+            sim=SimpleNamespace(get_physics_step_count=lambda: geometry["native_step"]))
+        scope = dict(self.scope, effort_contract=effort_grasp_contract(), preload_contact_ready=preload_contact_ready)
+        args = {"valid": t.ones(2, dtype=t.bool), "tracking": t.ones(2, dtype=t.bool),
+                "geometry": geometry, "current": t.ones(2, 3, dtype=t.bool)}
+        return env, args, actual_method("_object_weight_support_torque", scope)
+
+    def test_object_weight_world_z_uses_current_point_jacobian_and_ramps_inside_requested_budget(self):
+        env, args, method = self.weight_support_fixture()
+        for sample in range(100):
+            args["geometry"]["native_step"] = 9+sample
+            tau, evidence = method(env, **args)
+        expected = self.t.tensor([[.007848, 0., 0., -.005886, 0., .007848, 0.]]*2)
+        self.assertTrue(self.t.allclose(tau, expected, atol=1e-8, rtol=0))
+        self.assertTrue(self.t.allclose(evidence["current_group_requested_force_world_n"].sum(1)[:, 2],
+                                        self.t.full((2,), .7848), atol=1e-7, rtol=0))
+        self.assertTrue(evidence["request_is_not_measured_object_support_or_friction_certification"])
+
+    def test_object_support_requires_all_original_contact_fields_current_epoch_and_tracking(self):
+        for failure in ("certificate", "missing_field", "stale", "normal_missing", "tracking", "unsafe"):
+            env, args, method = self.weight_support_fixture()
+            env._object_support_scale[:] = 1
+            if failure == "certificate": env._last_metrics["friction_partner_manifold_certified"][1] = False
+            elif failure == "missing_field": del env._last_metrics["contact_safe"]
+            elif failure == "stale": args["geometry"]["episode_id"][1] = 2
+            elif failure == "normal_missing": args["current"][1, 2] = False
+            elif failure == "tracking": args["tracking"][1] = False
+            else: env._unsafe[1] = True
+            with self.subTest(failure=failure):
+                tau, evidence = method(env, **args)
+                self.assertFalse(bool(evidence["gate"][1]))
+                self.assertTrue((tau[1] == 0).all())
+                self.assertEqual(float(env._object_support_scale[1]), 0.)
+
+    def test_object_support_duplicate_samples_do_not_speed_ramp_and_episode_change_clears_it(self):
+        env, args, method = self.weight_support_fixture()
+        first, _ = method(env, **args)
+        second, _ = method(env, **args)
+        self.assertTrue(self.t.equal(first, second))
+        env._object_support_scale[:] = 1
+        env._episode_ids[1] = 4  # Geometry from episode3 must never support episode4.
+        _, evidence = method(env, **args)
+        self.assertEqual(float(evidence["ramp_scale"][1]), 0.)
+
+    def test_object_support_rejects_nonfinite_point_jacobian(self):
+        env, args, method = self.weight_support_fixture()
+        args["geometry"]["point_jacobian_world_m"][0, 1, 2, 3] = float("nan")
+        with self.assertRaisesRegex(RuntimeError, "finite current"):
+            method(env, **args)
 
     def test_causal_adapter_preserves_unclipped_force_and_marks_old_episode_feedback_unavailable(self):
         env, calls, rows, method = self.update_fixture()
