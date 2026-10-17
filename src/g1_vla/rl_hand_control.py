@@ -9,6 +9,8 @@ this module. In particular, a contact-mode latch never certifies physical suppor
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 
 from .rl_probe_protocol import compliant_pinch_controller_contract
@@ -366,3 +368,366 @@ class CompliantPinchController:
             "adaptive_thumb_search_uses_unchanged_force_error_law": True,
         }
         return desired, fraction, evidence
+
+
+def _physics_contract_and_parameters(parameters):
+    from .rl_probe_protocol import physics_pinch_controller_contract
+    contract = physics_pinch_controller_contract()
+    expected = contract["parameters"]
+    if parameters is not None and (
+            not isinstance(parameters, dict) or set(parameters) != set(expected) or
+            any(type(parameters[k]) is not type(v) or parameters[k] != v
+                for k, v in expected.items())):
+        raise ValueError("Physics pinch parameters differ from the declared controller contract")
+    return contract, copy.deepcopy(expected)
+
+
+class PhysicsPinchTrajectory:
+    """66ms candidate reference/phase machine; it never integrates force targets.
+
+    Its independent physics-step follower owns all actual hand writes. This
+    machine only advances declared geometry phases and checks the original
+    path/preload prerequisites. A raw-force near-contact signal may release the
+    thumb phases; it never becomes a physical-contact or support certificate.
+    """
+
+    def __init__(self, torch, initial_hand, state, candidate, *, parameters=None):
+        self.contract, self.parameters = _physics_contract_and_parameters(parameters)
+        # Reuse the unchanged candidate parser and native-limit validation only.
+        # Never call the v1 force target method or keep its force latch/integral.
+        geometry = CompliantPinchController(torch, initial_hand, state, candidate)
+        for name in ("torch", "num_envs", "seed", "goals", "candidate_durations",
+                     "names", "active", "axis", "group_ids"):
+            setattr(self, name, getattr(geometry, name))
+        self.durations = self.candidate_durations.clone()
+        self.durations[0] = self.parameters["stage0_duration_s"]
+        if bool((self.goals[-1, 0]-self.parameters["adaptive_thumb0_closing_budget_rad"] <
+                 state["joint_limits_action_rad"][:, 7, 0]).any()):
+            raise ValueError("Physics pinch adaptive thumb budget violates native joint limits")
+        self.ids = state["episode_id"].clone()
+        self.stage_index = torch.zeros_like(self.ids)
+        self.stage_elapsed = torch.zeros_like(self.seed[:, 0])
+        self.stage_start = self.seed.clone()
+        self.stage0_contact_ready_count = torch.zeros_like(self.ids)
+
+    _measurements = CompliantPinchController._measurements
+
+    def reference(self, state, changed, dt, force_limit, tracking):
+        t, p, n = self.torch, self.parameters, self.num_envs
+        if (type(dt) not in (int, float) or not math.isfinite(dt) or not 0 < dt <= .1 or
+                type(force_limit) not in (int, float) or not math.isfinite(force_limit) or
+                force_limit <= p["force_target_n"]):
+            raise ValueError("Physics pinch reference needs finite control dt and force limit")
+        if (tuple(changed.shape) != (n,) or tuple(tracking.shape) != (n,) or
+                tracking.dtype != t.bool):
+            raise ValueError("Physics pinch reference needs per-environment reset/tracking flags")
+        actual, applied = state["q_action_rad"][:, 7:], state["target_action_rad"][:, 7:]
+        changed = changed.bool() | (state["episode_id"] != self.ids)
+        if bool(changed.any()) and not bool(t.allclose(
+                actual[changed], self.seed[changed], atol=1e-4, rtol=0)):
+            raise ValueError("Physics pinch reference reset differs from measured source hand")
+        self.ids = state["episode_id"].clone()
+        self.stage_index[changed] = 0
+        self.stage_elapsed[changed] = 0
+        self.stage_start[changed] = self.seed[changed]
+        self.stage0_contact_ready_count[changed] = 0
+        m = self._measurements(state)
+        available = m["available"] & t.isfinite(actual).all(-1) & t.isfinite(applied).all(-1)
+        force = t.where(available[:, None], m["force"], t.zeros_like(m["force"]))
+        force_safe = (force <= force_limit).all(-1)
+        safe = available & ~m["unsafe"] & (m["depth"] <= p["maximum_penetration_m"])
+        progress = safe & tracking & force_safe
+        index = self.stage_index.clone()
+        goal = self.goals[index]
+        self.stage_elapsed += t.where(progress, dt, 0.)
+        fraction = (self.stage_elapsed/self.durations[index]).clamp(0, 1)
+        smooth = fraction.square()*(3-2*fraction)
+        nominal = self.stage_start+(goal-self.stage_start)*smooth[:, None]
+        final = index == len(self.names)-1
+        search = final & (fraction >= 1)
+        floor = self.goals[-1, 0]-p["adaptive_thumb0_closing_budget_rad"]
+        low, high = t.minimum(self.seed, nominal), t.maximum(self.seed, nominal)
+        low[:, 0] = t.where(search, floor, low[:, 0])
+        errors = (actual-goal).abs()
+        active_error = t.where(self.active[index], errors, 0.).amax(-1)
+        all_error = errors.amax(-1)
+        tolerance = t.where(index == 0, p["stage0_near_arrival_rad"], p["stage_active_arrival_rad"])
+        kinematic = active_error <= tolerance
+        near_signal = ((index == 0) & (fraction >= 1) & progress &
+            (active_error <= p["stage0_contact_near_arrival_rad"]) &
+            (force[:, 1:] >= p["stage0_contact_force_min_n"]).all(-1))
+        self.stage0_contact_ready_count = t.where(near_signal,
+            (self.stage0_contact_ready_count+1).clamp(max=p["stage0_contact_ready_controls"]),
+            t.zeros_like(self.stage0_contact_ready_count))
+        near_arrival = self.stage0_contact_ready_count >= p["stage0_contact_ready_controls"]
+        physical = ((force > p["contact_feedback_onset_n"]).all(-1) & force_safe &
+            (m["physical"] > 0).all(-1) & m["no_gap"] & m["manifold"] & safe)
+        nominal_final_arrival = final & (all_error <= p["final_joint_arrival_rad"])
+        equilibrium_low = t.minimum(self.seed, self.goals[-1][None]).clone()
+        equilibrium_high = t.maximum(self.seed, self.goals[-1][None]).clone()
+        equilibrium_low[:, 0] = floor
+        equilibrium_tolerance = p["final_contact_equilibrium_arrival_rad"]
+        force_axes = self.axis != 0
+        actual_force_axes_in_domain = (
+            (actual[:, force_axes] >= equilibrium_low[:, force_axes]-equilibrium_tolerance) &
+            (actual[:, force_axes] <= equilibrium_high[:, force_axes]+equilibrium_tolerance)).all(-1)
+        orientation_error = errors[:, ~force_axes].amax(-1)
+        adaptive_geometry = (search & actual_force_axes_in_domain &
+            ((actual-applied).abs().amax(-1) <= equilibrium_tolerance) &
+            (orientation_error <= equilibrium_tolerance))
+        opposed_side = t.zeros(n, dtype=t.bool, device=actual.device)
+        metrics = state.get("metrics", {})
+        if (all(t.is_tensor(metrics.get(k)) and tuple(metrics[k].shape) == (n,)
+                for k in ("contact_safe", "opposition_dot", "maximum_abs_normal_z")) and
+                metrics["contact_safe"].dtype == t.bool):
+            opposed_side = (metrics["contact_safe"] & t.isfinite(metrics["opposition_dot"]) &
+                t.isfinite(metrics["maximum_abs_normal_z"]) &
+                (metrics["opposition_dot"] <= -.6) & (metrics["opposition_dot"] >= -1) &
+                (metrics["maximum_abs_normal_z"] >= 0) & (metrics["maximum_abs_normal_z"] <= .6))
+        equilibrium = final & physical & opposed_side & adaptive_geometry
+        arrival = t.where(final, nominal_final_arrival | equilibrium, kinematic)
+        arrival |= (index == 0) & near_arrival
+        arrived = (fraction >= 1) & progress & arrival
+        advance = arrived & ~final
+        self.stage_start[advance] = goal[advance]
+        self.stage_index[advance] += 1
+        self.stage_elapsed[advance] = 0
+        evidence = {
+            "physics_pinch_controller": copy.deepcopy(self.contract),
+            "macro_reference_only_no_force_target_update": True,
+            "guided_target_hand_rad": nominal,
+            "nominal_hand_rad": nominal,
+            "geometry_lower_hand_rad": low, "geometry_upper_hand_rad": high,
+            "force_admittance_closing_axis_hand7": self.axis,
+            "closure_stage_index": index, "closure_stage_fraction": fraction,
+            "closure_stage_names": self.names, "stage_goal_hand_rad": goal,
+            "stage_active_joints": self.active[index],
+            "stage_active_measured_error_max_rad": active_error,
+            "stage_measured_error_max_rad": all_error,
+            "stage_arrival_tolerance_rad": tolerance,
+            "stage_kinematic_arrival": kinematic,
+            "stage0_kinematic_near_arrival": (index == 0) & kinematic,
+            "stage0_raw_force_precontact_signal": near_signal,
+            "stage0_raw_force_precontact_control_count": self.stage0_contact_ready_count.clone(),
+            "stage0_raw_force_precontact_arrival": near_arrival,
+            "stage0_raw_force_precontact_is_not_physical_contact_or_support": True,
+            "stage_advance_after_this_request": advance,
+            "closure_path_complete": arrived & final,
+            "stage_final_joint_arrival": nominal_final_arrival,
+            "stage_final_physical_contact_equilibrium": equilibrium,
+            "stage_final_adaptive_equilibrium_geometry": adaptive_geometry,
+            "stage_final_original_opposition_and_side_gates": opposed_side,
+            "stage_final_equilibrium_thumb_source_to_extended_goal_interval_rad":
+                t.stack((floor.expand_as(self.seed[:, 0]), self.seed[:, 0]), dim=-1),
+            "stage_final_equilibrium_force_axis_nominal_domain_lower_rad": equilibrium_low,
+            "stage_final_equilibrium_force_axis_nominal_domain_upper_rad": equilibrium_high,
+            "stage_final_equilibrium_force_axis_actual_domain_tolerance_rad": equilibrium_tolerance,
+            "stage_final_equilibrium_actual_force_axes_in_domain": actual_force_axes_in_domain,
+            "stage_final_equilibrium_orientation_goal_error_rad": orientation_error,
+            "stage_final_equilibrium_all_joint_applied_tracking_error_rad":
+                (actual-applied).abs().amax(-1),
+            "stage_final_equilibrium_other_six_goal_error_rad": errors[:, 1:].amax(-1),
+            "stage_final_physical_contact_equilibrium_is_not_support": True,
+            "closure_paused_for_palm_tracking": ~tracking,
+            "closure_paused_for_invalid_or_unsafe_measurements": ~safe,
+            "closure_paused_for_force_excess": ~force_safe,
+            "contact_measurement_available": available,
+            "force_feedback_raw_group_normal_force_n": m["force"],
+            "force_feedback_group_physical_loaded_count": m["physical"],
+            "force_feedback_physical_contact_ready": physical,
+            "adaptive_thumb_search_started": search,
+            "adaptive_thumb_minimum_joint_rad": floor,
+            "closure_candidate_stage_durations_s": self.candidate_durations,
+            "closure_executed_stage_durations_s": self.durations,
+        }
+        return nominal, fraction, evidence
+
+
+class PhysicsStepForceAdmittance:
+    """Causal 2ms target follower around unchanged native joint PD drives.
+
+    Force at sample k informs the requested target for k+1. Repeated samples
+    never integrate twice. All reference, step, macro, lead and retreat bounds
+    constrain targets only; measured force and motion keep their original gates.
+    """
+
+    def __init__(self, torch, initial_applied_hand_rad, episode_id, *, parameters=None):
+        self.contract, self.parameters = _physics_contract_and_parameters(parameters)
+        self.torch = torch
+        if (initial_applied_hand_rad.ndim != 2 or initial_applied_hand_rad.shape[1] != 7 or
+                not bool(torch.isfinite(initial_applied_hand_rad).all())):
+            raise ValueError("Physics admittance needs finite actually applied seven-joint targets")
+        self.seed = initial_applied_hand_rad.detach().clone()
+        self.num_envs = self.seed.shape[0]
+        if tuple(episode_id.shape) != (self.num_envs,):
+            raise ValueError("Physics admittance needs one episode identity per environment")
+        self.ids = episode_id.clone()
+        self.most_closed_applied = self.seed.clone()
+        self.contact_latched = torch.zeros(self.num_envs, 3, dtype=torch.bool, device=self.seed.device)
+        self.seen_valid_feedback = torch.zeros(self.num_envs, dtype=torch.bool, device=self.seed.device)
+        self.group_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2], device=self.seed.device)
+        self.sample_id = None
+        payload = json.dumps(self.contract, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False).encode()
+        self.contract_sha256 = hashlib.sha256(payload).hexdigest()
+
+    def update(self, *, sample_id, episode_id, dt, measured_hand_rad, applied_hand_rad,
+               nominal_hand_rad, geometry_lower_hand_rad, geometry_upper_hand_rad,
+               step_lower_hand_rad, step_upper_hand_rad, macro_lower_hand_rad, macro_upper_hand_rad,
+               raw_group_force_n, contact_measurement_valid, tracking, unsafe_latched,
+               penetration_m, closing_axis_hand7):
+        t, p, n = self.torch, self.parameters, self.num_envs
+        if (type(sample_id) is not int or sample_id < 0 or type(dt) not in (int, float) or
+                not math.isfinite(dt) or dt != p["physics_dt_s"]):
+            raise ValueError("Physics admittance requires the declared 2ms native sample identity")
+        hand_values = (measured_hand_rad, applied_hand_rad, nominal_hand_rad,
+                       geometry_lower_hand_rad, geometry_upper_hand_rad, step_lower_hand_rad,
+                       step_upper_hand_rad, macro_lower_hand_rad, macro_upper_hand_rad)
+        if any(not t.is_tensor(x) or tuple(x.shape) != (n, 7) for x in hand_values):
+            raise ValueError("Physics admittance requires native N by seven target/bound tensors")
+        if (tuple(episode_id.shape) != (n,) or tuple(raw_group_force_n.shape) != (n, 3) or
+                tuple(penetration_m.shape) != (n,) or tuple(closing_axis_hand7.shape) != (7,) or
+                any(tuple(x.shape) != (n,) or x.dtype != t.bool
+                    for x in (contact_measurement_valid, tracking, unsafe_latched))):
+            raise ValueError("Physics admittance feedback dimensions or boolean types are invalid")
+        axis = closing_axis_hand7.to(device=self.seed.device, dtype=self.seed.dtype)
+        if (not bool(t.isfinite(axis).all()) or not bool(((axis == 0) | (axis.abs() == 1)).all()) or
+                bool((axis[1:3] != 0).any()) or axis[0] == 0 or
+                not bool((axis[3:5] != 0).any()) or not bool((axis[5:] != 0).any())):
+            raise ValueError("Physics admittance force axes must exclude thumb1/2 reorientation")
+        changed = episode_id != self.ids
+        self.ids = episode_id.clone()
+        self.contact_latched[changed] = False
+        self.most_closed_applied[changed] = self.seed[changed]
+        self.seen_valid_feedback[changed] = False
+        initial = self.sample_id is None
+        duplicate = not initial and sample_id == self.sample_id
+        discontinuity = not initial and not duplicate and sample_id != self.sample_id+1
+        if not duplicate:
+            self.sample_id = sample_id
+        finite = t.ones(n, dtype=t.bool, device=self.seed.device)
+        for value in hand_values:
+            finite &= t.isfinite(value).all(-1)
+        finite &= t.isfinite(raw_group_force_n).all(-1) & (raw_group_force_n >= 0).all(-1)
+        finite &= t.isfinite(penetration_m) & (penetration_m >= 0)
+        reset_matches = ((applied_hand_rad-self.seed).abs().amax(-1) <= 1e-4) | ~changed
+        depth_safe = penetration_m <= p["maximum_penetration_m"]
+        unavailable_unexpected = (~contact_measurement_valid & self.seen_valid_feedback &
+                                  ~changed & (not duplicate))
+        unsafe = (unsafe_latched | ~finite | ~reset_matches | ~depth_safe |
+                  unavailable_unexpected | discontinuity)
+        fresh = t.full((n,), not (initial or duplicate or discontinuity), dtype=t.bool,
+                       device=self.seed.device) & ~changed
+        safe = fresh & finite & contact_measurement_valid & ~unsafe
+        self.seen_valid_feedback |= (finite & contact_measurement_valid & ~unsafe & ~changed &
+                                     (not duplicate) & (not discontinuity))
+        force = t.where((finite & contact_measurement_valid)[:, None],
+                        raw_group_force_n, t.zeros_like(raw_group_force_n))
+        self.contact_latched |= safe[:, None] & (force > p["contact_feedback_onset_n"])
+        # The macro final envelope, not a force observation, permits searching
+        # past the final thumb nominal. This mode never certifies physical touch.
+        adaptive_search = ((geometry_lower_hand_rad[:, 0] < nominal_hand_rad[:, 0]-1e-7) &
+                           (axis[0] < 0))
+        mode = self.contact_latched.clone()
+        mode[:, 0] |= adaptive_search
+        feedback = mode[:, self.group_ids] & (axis[None] != 0)
+        more_closed = (applied_hand_rad-self.most_closed_applied)*axis[None] > 0
+        self.most_closed_applied = t.where(safe[:, None] & feedback & more_closed,
+                                           applied_hand_rad, self.most_closed_applied)
+        error = p["force_target_n"]-force
+        velocity = (error*p["admittance_gain_rad_s_per_n"]).clamp(
+            min=-p["retreat_speed_max_rad_s"], max=p["close_speed_max_rad_s"])
+        deadband = error.abs() <= p["force_deadband_n"]
+        velocity = t.where(deadband, 0., velocity)
+        lead = t.where(mode[:, self.group_ids], p["contact_target_lead_max_rad"],
+                       p["free_target_lead_max_rad"])
+        old_lead = applied_hand_rad-measured_hand_rad
+        lead_recovery = mode[:, self.group_ids] & (old_lead.abs() > lead+1e-7)
+        signed_lead = old_lead*axis[None]
+        effective_signed_velocity = velocity[:, self.group_ids].clone()
+        # Contracting the lead on first touch cannot instantaneously move an
+        # already written target through the native velocity box. Recover by
+        # opening a too-closed target; other lagging targets hold until measured
+        # joints catch up. Never reverse a high-force opening request to close.
+        too_closed = lead_recovery & feedback & (signed_lead > lead)
+        recovery_velocity = -((signed_lead-lead).clamp_min(0)/dt).clamp(
+            max=p["retreat_speed_max_rad_s"])
+        effective_signed_velocity = t.where(too_closed,
+            t.minimum(effective_signed_velocity, recovery_velocity),
+            t.where(lead_recovery & feedback, effective_signed_velocity.clamp(max=0),
+                    effective_signed_velocity))
+        force_trial = applied_hand_rad+axis[None]*effective_signed_velocity*dt
+        desired = t.where(feedback, force_trial, nominal_hand_rad)
+        desired = t.where(lead_recovery & ~feedback, applied_hand_rad, desired)
+        force_excess = (force > 1.5)[:, self.group_ids] & (axis[None] != 0)
+        lead_force_priority = force_excess & feedback & (effective_signed_velocity < 0)
+        relaxed_lead = lead_recovery | lead_force_priority
+        low = t.maximum(t.maximum(geometry_lower_hand_rad, step_lower_hand_rad), macro_lower_hand_rad)
+        high = t.minimum(t.minimum(geometry_upper_hand_rad, step_upper_hand_rad), macro_upper_hand_rad)
+        low = t.where(relaxed_lead, low, t.maximum(low, measured_hand_rad-lead))
+        high = t.where(relaxed_lead, high, t.minimum(high, measured_hand_rad+lead))
+        retreat_edge = self.most_closed_applied-axis[None]*p["maximum_retreat_rad"]
+        force_low = t.maximum(t.minimum(applied_hand_rad, force_trial),
+                             t.where(axis[None] > 0, retreat_edge, low))
+        force_high = t.minimum(t.maximum(applied_hand_rad, force_trial),
+                              t.where(axis[None] < 0, retreat_edge, high))
+        low = t.where(feedback, t.maximum(low, force_low), low)
+        high = t.where(feedback, t.minimum(high, force_high), high)
+        feasible_joints = low <= high
+        # An impossible intersection is an explicit physical protocol failure;
+        # retaining the last target is a fail-closed response, not a safe proof.
+        infeasible = safe & ~feasible_joints.all(-1)
+        unsafe |= infeasible
+        enabled = safe[:, None] & ~unsafe[:, None] & feasible_joints & (
+            tracking[:, None] | force_excess)
+        bounded = t.minimum(t.maximum(desired, low), high)
+        hold = t.where(t.isfinite(applied_hand_rad), applied_hand_rad, self.seed)
+        target = t.where(enabled, bounded, hold)
+        relief_joints = enabled & ((target-applied_hand_rad)*axis[None] < -1e-9)
+        relief = t.stack([relief_joints[:, self.group_ids == g].any(-1) for g in range(3)], -1)
+        evidence = {
+            "controller_version": self.contract["version"],
+            "controller_contract_sha256": self.contract_sha256,
+            "force_sample_id": sample_id, "target_for_native_sample_id": sample_id+1,
+            "physics_dt_s": dt, "first_sample_hold": initial,
+            "duplicate_sample_hold": duplicate, "sample_discontinuity": discontinuity,
+            "episode_reset_hold": changed, "reset_applied_target_matches_source": reset_matches,
+            "contact_measurement_available": contact_measurement_valid & finite,
+            "seen_valid_feedback_for_current_episode": self.seen_valid_feedback.clone(),
+            "waiting_for_first_valid_measurement": ~self.seen_valid_feedback,
+            "previously_valid_measurement_lost": unavailable_unexpected,
+            "fresh_sample_for_current_episode": fresh,
+            "unsafe": unsafe, "request_constraints_infeasible": infeasible,
+            "request_constraints_feasible_by_joint": feasible_joints,
+            "request_held_by_joint": ~enabled,
+            "force_feedback_contact_mode_latched": self.contact_latched.clone(),
+            "force_feedback_mode_including_final_thumb_search": mode,
+            "force_feedback_raw_group_normal_force_n": raw_group_force_n,
+            "force_feedback_error_n": error, "force_feedback_deadband": deadband,
+            "force_admittance_group_velocity_rad_s": velocity,
+            "force_admittance_effective_signed_joint_velocity_rad_s": effective_signed_velocity,
+            "contact_lead_recovery_by_joint": lead_recovery,
+            "contact_lead_recovery": lead_recovery.any(-1),
+            "contact_lead_recovery_too_closed_by_joint": too_closed,
+            "contact_lead_high_force_retreat_priority_by_joint": lead_force_priority,
+            "actual_requested_lead_not_yet_met_by_joint": (target-measured_hand_rad).abs() > lead+1e-7,
+            "actual_requested_lead_not_yet_met": ((target-measured_hand_rad).abs() > lead+1e-7).any(-1),
+            "force_admittance_closing_axis_hand7": axis,
+            "force_admittance_previous_actually_written_hand_target_rad": applied_hand_rad,
+            "force_admittance_most_closed_actual_applied_target_hand_rad": self.most_closed_applied.clone(),
+            "force_admittance_unbounded_hand_target_rad": force_trial,
+            "nominal_hand_rad": nominal_hand_rad,
+            "bounded_hand_target_rad": target,
+            "geometry_lower_hand_rad": geometry_lower_hand_rad,
+            "geometry_upper_hand_rad": geometry_upper_hand_rad,
+            "intersected_lower_hand_rad": low, "intersected_upper_hand_rad": high,
+            "measured_hand_rad": measured_hand_rad,
+            "guided_target_lead_max_rad": lead,
+            "raw_force_over_limit_by_group": force > 1.5,
+            "force_relief_by_group": relief,
+            "adaptive_thumb_search_active": adaptive_search,
+            "force_request_bounds_are_not_measured_force_bounds": True,
+            "contact_mode_is_not_support_qualification": True,
+            "reference": "last_actually_written_target_one_update_per_native_sample",
+        }
+        return target, evidence, unsafe

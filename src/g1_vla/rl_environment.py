@@ -1180,6 +1180,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._control_transition_recorded = 0
             self._control_guard_correction_count = 0
             self._control_guard_unsafe_count = 0
+            self._physics_pinch = None
+            self._physics_pinch_reference = None
+            self._physics_pinch_update_count = 0
+            self._physics_pinch_last_sample = None
             self._contact_crosscheck = {"protocol": CONTACT_COLLECTION_VERSION,
                                        "required_physics_samples": CONTACT_CROSSCHECK["physics_samples"],
                                        "enabled": num_envs == CONTACT_CROSSCHECK["num_envs"],
@@ -1210,7 +1214,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 raise RLEnvironmentError("native physics did not recognize the imported robot as fixed-root")
             if self._evaluation_camera is not None:
                 pinch_closeup = (self._control_probe_profile is not None and
-                                 self._control_probe_profile["name"] == "compliant_pinch_pose_hold")
+                                 self._control_probe_profile["name"] in ("compliant_pinch_pose_hold", "physics_pinch_pose_hold"))
                 eye_offset = [0.635, -0.262, 1.045] if pinch_closeup else [1.05, -0.65, 1.30]
                 target_offset = [0.32, 0.055, 0.82] if pinch_closeup else [0.35, 0.055, 0.80]
                 eye = self.scene.env_origins[0] + torch.tensor(eye_offset, device=self.device)
@@ -1268,6 +1272,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._max_clearance = torch.full((self.num_envs,), -float("inf"), device=self.device)
             self._max_support_samples = torch.zeros_like(self._support_count)
             self._last_metrics = {}
+            self._last_contact_episode_ids = torch.full_like(self._episode_ids, -1)
+            self._last_contact_native_step = -1
+            self._last_written_hand_target = self._targets[:, self._action_ids[7:]].clone()
             self._reward_terms = {}
             self._train_generator = torch.Generator(device=self.device).manual_seed(int(train_seed))
             self._eval_generator = torch.Generator(device=self.device).manual_seed(int(settings["eval_seed"]))
@@ -1482,6 +1489,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._previous_actions[:] = self._actions
             self._action_origin, self._next_action_origin = self._next_action_origin, "policy_or_zero_target_hold"
             self._actions[:] = actions.clamp(-1.0, 1.0)
+            if self._physics_pinch is not None:
+                self._action_origin = "declared_macro_pose_and_geometry_reference_plus_native_2ms_force_admittance"
             per_step = torch.minimum(self._velocity * self.step_dt,
                                      torch.full_like(self._velocity, float(config["rl_teacher"]["action_scale_rad"])))
             previous = self._targets[:, self._action_ids]
@@ -1539,6 +1548,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._control_guard_unsafe_count += int(guard_unsafe.sum().item())
                 self._shield_count += int((evidence["factor"] < 1).sum().item()) if version == "legacy_scalar_v1" else int(corrected.sum().item())
                 self._control_command_id += 1
+                macro_full_reference = desired.clone()
+                macro_reference = desired[:, 7:].clone()
+                if self._physics_pinch is not None:
+                    if self._physics_pinch_reference is None:
+                        raise RLEnvironmentError("2ms pinch requires an explicit macro geometry reference")
+                    self._physics_pinch_macro_low = low[:, 7:].clone()
+                    self._physics_pinch_macro_high = high[:, 7:].clone()
+                    # The macro request has never been written to the drive.
+                    # Preserve the last real write; only _apply_action may move
+                    # the hand through the declared per-physics-step controller.
+                    desired[:, 7:] = self._last_written_hand_target
                 self._write_control_probe({
                     "event": "control_command", "command_id": self._control_command_id,
                     "native_physics_step_count": int(self.sim.get_physics_step_count()),
@@ -1551,6 +1571,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "per_step_action_rad": per_step, "lower_action_bound_rad": low, "upper_action_bound_rad": high,
                     "unbounded_candidate_action_rad": previous+self._actions*per_step,
                     "limited_candidate_action_rad": candidate, "post_guard_target_action_rad": desired,
+                    "macro_hand_reference_before_physics_feedback_rad": macro_reference,
+                    "unwritten_macro_reference_action_rad": macro_full_reference if self._physics_pinch is not None else None,
+                    "guard_evidence_scope": "macro_arm_guard_and_unwritten_hand_reference_before_inner_feedback" if self._physics_pinch is not None else "macro_applied_target",
+                    "hand_target_execution": "2ms_feedback_after_completed_sample" if self._physics_pinch is not None else "macro_target_hold",
                     "point_jz": point_jz, "palm_position_world_m": tensor(self.robot.data.body_pos_w)[:, self._palm_id]+offset_w,
                     "palm_point_jacobian_w": offset_point_jacobian(torch, palm_jac, offset_w),
                     "start_palm_z_m": self._start_palm_z, "guard_evidence": evidence,
@@ -1563,8 +1587,106 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         def _apply_action(self):
             if self._pending_physics_sample:
                 self._sample_physics()
+            if self._physics_pinch is not None:
+                self._update_physics_pinch()
             self.robot.set_joint_position_target_index(target=self._targets)
+            if self._physics_pinch is not None:
+                self._last_written_hand_target = self._targets[:, self._action_ids[7:]].clone()
             self._pending_physics_sample = True
+
+        def configure_physics_pinch(self, contract):
+            from .rl_probe_protocol import physics_pinch_controller_contract
+            from .rl_hand_control import PhysicsStepForceAdmittance
+            expected = physics_pinch_controller_contract()
+            if (contract != expected or self._control_probe_profile["name"] != "physics_pinch_pose_hold" or
+                    not math.isclose(self.physics_dt, expected["parameters"]["physics_dt_s"], abs_tol=1e-12)):
+                raise RLEnvironmentError("Physics pinch contract/profile/cadence mismatch")
+            if self._physics_pinch is not None:
+                raise RLEnvironmentError("Physics pinch cannot be replaced during a run")
+            self._physics_pinch = PhysicsStepForceAdmittance(torch,
+                self._last_written_hand_target, self._episode_ids,
+                parameters=contract["parameters"])
+            self._physics_pinch_contract = contract
+            self._write_control_probe({"event": "physics_pinch_controller_installed",
+                "contract": contract, "native_physics_step_count": int(self.sim.get_physics_step_count()),
+                "episode_id": self._episode_ids, "physics_steps_executed": self._physics_samples})
+
+        def set_physics_pinch_reference(self, *, nominal_hand_rad, geometry_lower_hand_rad,
+                geometry_upper_hand_rad, closing_axis_hand7, palm_reference_world_m,
+                palm_reference_quaternion_xyzw):
+            if self._physics_pinch is None:
+                raise RLEnvironmentError("Physics pinch is not installed")
+            matrices = (nominal_hand_rad, geometry_lower_hand_rad, geometry_upper_hand_rad)
+            if (any(tuple(x.shape) != (self.num_envs, 7) or not bool(torch.isfinite(x).all()) for x in matrices) or
+                    bool((geometry_lower_hand_rad > geometry_upper_hand_rad).any()) or
+                    tuple(closing_axis_hand7.shape) != (7,) or
+                    tuple(palm_reference_world_m.shape) != (self.num_envs, 3) or
+                    tuple(palm_reference_quaternion_xyzw.shape) != (self.num_envs, 4)):
+                raise RLEnvironmentError("Malformed physics-pinch reference")
+            self._physics_pinch_reference = {
+                "nominal_hand_rad": nominal_hand_rad.detach().clone(),
+                "geometry_lower_hand_rad": geometry_lower_hand_rad.detach().clone(),
+                "geometry_upper_hand_rad": geometry_upper_hand_rad.detach().clone(),
+                "closing_axis_hand7": closing_axis_hand7.detach().clone(),
+                "palm_reference_world_m": palm_reference_world_m.detach().clone(),
+                "palm_reference_quaternion_xyzw": palm_reference_quaternion_xyzw.detach().clone(),
+                "episode_id": self._episode_ids.clone()}
+
+        def _update_physics_pinch(self):
+            reference = self._physics_pinch_reference
+            if reference is None:
+                raise RLEnvironmentError("Missing physics-pinch reference")
+            native_step = int(self.sim.get_physics_step_count())
+            ids = self._action_ids[7:]
+            measured = tensor(self.robot.data.joint_pos)[:, ids]
+            actual_applied = self._last_written_hand_target
+            # A completed sample belongs to the reset epoch that generated it.
+            # episode_length_buf increments only every33 steps and cannot test
+            # first-macro freshness for the inner loop.
+            fresh = ((self._last_contact_episode_ids == self._episode_ids) &
+                     (reference["episode_id"] == self._episode_ids) &
+                     (self._last_contact_native_step == native_step))
+            body_rotation = tensor(self.robot.data.body_quat_w)[:, self._palm_id]
+            palm_position = tensor(self.robot.data.body_pos_w)[:, self._palm_id] + quat_apply(body_rotation, self._palm_local)
+            palm_rotation = quat_mul(body_rotation, self._palm_local_rotation)
+            dot = (palm_rotation*reference["palm_reference_quaternion_xyzw"]).sum(-1).abs().clamp(0, 1)
+            tracking = ((torch.linalg.vector_norm(palm_position-reference["palm_reference_world_m"], dim=-1) <= .003) &
+                        (2*torch.acos(dot) <= .05))
+            anchor = float(config["control"]["max_anchor_delta_rad"])
+            per_step = self._velocity[7:]*self.physics_dt
+            low = torch.maximum(torch.maximum(actual_applied-per_step, measured-anchor), self._limits[:, ids, 0])
+            high = torch.minimum(torch.minimum(actual_applied+per_step, measured+anchor), self._limits[:, ids, 1])
+            metrics = self._last_metrics
+            valid = fresh & metrics.get("finite", torch.zeros_like(fresh)) & metrics.get("joint_safe", torch.zeros_like(fresh))
+            valid &= metrics.get("table_pair_measurement_supported", torch.zeros_like(fresh))
+            target, evidence, unsafe = self._physics_pinch.update(
+                sample_id=native_step, episode_id=self._episode_ids, dt=self.physics_dt,
+                measured_hand_rad=measured, applied_hand_rad=actual_applied,
+                nominal_hand_rad=reference["nominal_hand_rad"],
+                geometry_lower_hand_rad=reference["geometry_lower_hand_rad"],
+                geometry_upper_hand_rad=reference["geometry_upper_hand_rad"],
+                step_lower_hand_rad=low, step_upper_hand_rad=high,
+                macro_lower_hand_rad=self._physics_pinch_macro_low,
+                macro_upper_hand_rad=self._physics_pinch_macro_high,
+                raw_group_force_n=metrics.get("group_normal_force_n", torch.zeros(self.num_envs, 3, device=self.device)),
+                contact_measurement_valid=valid, tracking=tracking, unsafe_latched=self._unsafe,
+                penetration_m=metrics.get("maximum_penetration_m", torch.zeros(self.num_envs, device=self.device)),
+                closing_axis_hand7=reference["closing_axis_hand7"])
+            self._targets[:, ids] = target
+            self._unsafe |= unsafe
+            self._physics_pinch_update_count += 1
+            self._physics_pinch_last_sample = native_step
+            self._write_control_probe({"event": "physics_hand_target", "command_id": self._control_command_id,
+                "native_physics_step_count": native_step, "force_measurement_native_step": self._last_contact_native_step,
+                "episode_id": self._episode_ids, "force_measurement_episode_id": self._last_contact_episode_ids,
+                "contact_measurement_current_episode": fresh, "measured_hand_rad": measured,
+                "previous_actually_written_hand_rad": actual_applied, "next_hand_target_rad": target,
+                "macro_lower_hand_rad": self._physics_pinch_macro_low,
+                "macro_upper_hand_rad": self._physics_pinch_macro_high,
+                "native_2ms_lower_hand_rad": low, "native_2ms_upper_hand_rad": high,
+                "force_normal_n": metrics.get("group_normal_force_n"),
+                "tracking": tracking, "requires_unsafe": unsafe, "evidence": evidence,
+                "target_bounds_are_not_actual_force_bounds": True})
 
         def _contact_values(self, sensor, object_up_world, filter_index=0):
             data = sensor.data
@@ -1930,6 +2052,18 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                   "finite": finite, "joint_safe": joint_safe, "contact_safe": contact_safe,
                                   "support_current": support, "support_qualified": self._support_qualified,
                                   "unsafe_probe_overshoot": self._probe_overshoot, "success": self._local_success}
+            self._last_contact_episode_ids = self._episode_ids.clone()
+            self._last_contact_native_step = int(self.sim.get_physics_step_count())
+            if self._physics_pinch is not None:
+                self._write_control_probe({"event": "physics_hand_measurement",
+                    "command_id": self._control_command_id,
+                    "native_physics_step_count": self._last_contact_native_step,
+                    "episode_id": self._episode_ids, "episode_control_steps": self.episode_length_buf,
+                    "measured_hand_rad": tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]],
+                    "measured_hand_velocity_rad_s": tensor(self.robot.data.joint_vel)[:, self._action_ids[7:]],
+                    "actually_written_hand_target_rad": self._last_written_hand_target,
+                    "metrics": self._last_metrics, "unsafe_latched": self._unsafe,
+                    "sample_scope": "every_completed_2ms_sample_including_terminal_pre_reset_no_force_decimation"})
             self._physics_samples += 1
             if self._record:
                 count = min(8, self.num_envs)
@@ -2193,6 +2327,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self.cube.write_root_pose_to_sim_index(root_pose=cube, env_ids=env_ids)
             self.cube.write_root_velocity_to_sim_index(root_velocity=torch.zeros(n, 6, device=self.device), env_ids=env_ids)
             self._targets[env_ids] = q
+            self._last_written_hand_target[env_ids] = q[:, self._action_ids[7:]]
+            self._last_contact_episode_ids[env_ids] = -1
             self._actions[env_ids] = 0
             self._previous_actions[env_ids] = 0
             self._episode_ids[env_ids] += 1
@@ -2541,6 +2677,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "native_physics_step_count": int(self.sim.get_physics_step_count()),
                     "actual_physics_dt_s": float(self.sim.get_physics_dt()),
                     "control_period_s": float(self.step_dt),
+                    "physics_pinch_feedback": {"enabled": self._physics_pinch is not None,
+                        "update_calls": self._physics_pinch_update_count,
+                        "last_feedback_sample": self._physics_pinch_last_sample,
+                        "declared_feedback_period_s": self.physics_dt if self._physics_pinch is not None else None},
                     "contact_data_unavailable_reason": self._force_unavailable,
                     "contact_extraction_backend": CONTACT_COLLECTION_VERSION,
                     "contact_collection_crosscheck": dict(self._contact_crosscheck),

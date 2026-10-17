@@ -366,5 +366,339 @@ class CompliantPinchControllerTests(unittest.TestCase):
             self.step()
 
 
+@unittest.skipUnless(TORCH, "real torch is required for 2ms controller sequence tests")
+class PhysicsStepPinchTests(unittest.TestCase):
+    def setUp(self):
+        CompliantPinchControllerTests.setUp(self)
+        from g1_vla.rl_hand_control import PhysicsStepForceAdmittance, PhysicsPinchTrajectory
+        frames = self.candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+        for frame in frames[2:]:
+            frame["target_rad"][1] = -.55
+        for frame in frames[3:]:
+            frame["target_rad"][2] = -.02
+        frames[4]["target_rad"][0] = 1.044
+        frames[5]["target_rad"][0] = .97
+        self.goals = self.t.tensor([f["target_rad"] for f in frames[1:]])
+        self.trajectory = PhysicsPinchTrajectory(self.t, self.seed, self.state, self.candidate)
+        self.applied = self.t.tensor(self.seed)[None].repeat(2, 1)
+        self.measured = self.applied.clone()
+        self.nominal = self.applied.clone()
+        self.axis = self.t.tensor([-1., 0., 0., 1., 1., 1., 1.])
+        self.inner = PhysicsStepForceAdmittance(self.t, self.applied, self.state["episode_id"])
+        self.state["metrics"].update(contact_safe=self.t.ones(2, dtype=self.t.bool),
+            opposition_dot=self.t.full((2,), -.7), maximum_abs_normal_z=self.t.full((2,), .2))
+
+    def inputs(self, sample):
+        return {"sample_id": sample, "episode_id": self.state["episode_id"].clone(), "dt": .002,
+            "measured_hand_rad": self.measured.clone(), "applied_hand_rad": self.applied.clone(),
+            "nominal_hand_rad": self.nominal.clone(),
+            "geometry_lower_hand_rad": self.t.tensor(self.seed)[None].repeat(2, 1)-.5,
+            "geometry_upper_hand_rad": self.t.tensor(self.seed)[None].repeat(2, 1)+.5,
+            "step_lower_hand_rad": self.applied-.001, "step_upper_hand_rad": self.applied+.001,
+            "macro_lower_hand_rad": self.t.tensor(self.seed)[None].repeat(2, 1)-.2,
+            "macro_upper_hand_rad": self.t.tensor(self.seed)[None].repeat(2, 1)+.2,
+            "raw_group_force_n": self.t.zeros(2, 3),
+            "contact_measurement_valid": self.t.ones(2, dtype=self.t.bool),
+            "tracking": self.t.ones(2, dtype=self.t.bool),
+            "unsafe_latched": self.t.zeros(2, dtype=self.t.bool),
+            "penetration_m": self.t.zeros(2), "closing_axis_hand7": self.axis}
+
+    def prime(self):
+        inputs = self.inputs(0)
+        inputs["contact_measurement_valid"][:] = False
+        target, evidence, unsafe = self.inner.update(**inputs)
+        self.assertTrue(self.t.equal(target, self.applied))
+        self.assertFalse(unsafe.any())
+        self.assertTrue(evidence["first_sample_hold"])
+
+    def commit(self, target):
+        self.applied = target.clone()
+        self.measured = target.clone()
+
+    def test_free_reference_follows_original_speed_box_without_force_close_cap(self):
+        self.prime()
+        self.nominal[:, 3] += .2
+        target, evidence, unsafe = self.inner.update(**self.inputs(1))
+        self.assertAlmostEqual(float(target[0, 3]-self.applied[0, 3]), .001, places=6)
+        self.assertGreater(float(target[0, 3]-self.applied[0, 3]), .04*.002)
+        self.assertFalse(evidence["force_feedback_contact_mode_latched"].any())
+        self.assertFalse(unsafe.any())
+
+    def test_force_spike_changes_next_two_ms_target_and_not_the_measured_sample(self):
+        self.prime()
+        inputs = self.inputs(1)
+        inputs["raw_group_force_n"][:] = 2.
+        inputs["tracking"][:] = False
+        target, evidence, unsafe = self.inner.update(**inputs)
+        self.assertGreater(float(target[0, 0]), float(self.applied[0, 0]))
+        self.assertLess(float(target[0, 3]), float(self.applied[0, 3]))
+        self.assertLessEqual(float((target-self.applied).abs().max()), .08*.002+1e-7)
+        self.assertEqual(evidence["force_sample_id"], 1)
+        self.assertEqual(evidence["target_for_native_sample_id"], 2)
+        self.assertTrue(evidence["raw_force_over_limit_by_group"].all())
+        self.assertTrue(evidence["force_request_bounds_are_not_measured_force_bounds"])
+        self.assertFalse(unsafe.any())
+
+    def test_contact_loss_alternation_keeps_mode_and_never_switches_to_fast_free_motion(self):
+        self.prime()
+        self.nominal[:, 3] += .1
+        for sample in range(1, 61):
+            inputs = self.inputs(sample)
+            inputs["raw_group_force_n"][:] = .7 if sample % 2 else 0.
+            target, evidence, unsafe = self.inner.update(**inputs)
+            self.assertTrue(evidence["force_feedback_contact_mode_latched"].all())
+            self.assertFalse(unsafe.any())
+            self.assertLessEqual(float((target[:, [0, 3, 4, 5, 6]]-
+                self.applied[:, [0, 3, 4, 5, 6]]).abs().max()), .04*.002+1e-7)
+            self.commit(target)
+
+    def test_force_deadband_holds_targets_but_thumb_reorientation_remains_independent(self):
+        self.prime()
+        self.nominal[:, 1] += .02
+        inputs = self.inputs(1)
+        inputs["raw_group_force_n"][:] = .39
+        target, evidence, unsafe = self.inner.update(**inputs)
+        self.assertTrue(evidence["force_feedback_deadband"].all())
+        self.assertTrue(self.t.equal(target[:, [0, 3, 4, 5, 6]], self.applied[:, [0, 3, 4, 5, 6]]))
+        self.assertGreater(float(target[0, 1]), float(self.applied[0, 1]))
+        self.assertFalse(unsafe.any())
+
+    def test_duplicate_sample_does_not_integrate_a_second_force_response(self):
+        self.prime()
+        inputs = self.inputs(1)
+        inputs["raw_group_force_n"][:] = .8
+        target, _, _ = self.inner.update(**inputs)
+        self.commit(target)
+        duplicate = self.inputs(1)
+        duplicate["raw_group_force_n"][:] = .8
+        same, evidence, unsafe = self.inner.update(**duplicate)
+        self.assertTrue(self.t.equal(same, self.applied))
+        self.assertTrue(evidence["duplicate_sample_hold"])
+        self.assertFalse(unsafe.any())
+        skipped, evidence, unsafe = self.inner.update(**self.inputs(3))
+        self.assertTrue(self.t.equal(skipped, self.applied))
+        self.assertTrue(evidence["sample_discontinuity"])
+        self.assertTrue(unsafe.all())
+
+    def test_first_contact_recovers_tighter_lead_continuously_without_false_infeasibility(self):
+        self.prime()
+        self.applied[:, 3] += .015
+        initial_applied = self.applied.clone()
+        for sample in range(1, 101):
+            inputs = self.inputs(sample)
+            inputs["raw_group_force_n"][:, 1] = .1  # Force law alone requests closing.
+            target, evidence, unsafe = self.inner.update(**inputs)
+            self.assertFalse(unsafe.any())
+            self.assertLessEqual(float((target-self.applied).abs().max()), .08*.002+1e-7)
+            if sample == 1:
+                self.assertTrue(evidence["contact_lead_recovery"].all())
+                self.assertTrue(evidence["actual_requested_lead_not_yet_met"].all())
+                self.assertLess(float(target[0, 3]), float(self.applied[0, 3]))
+            self.applied = target.clone()
+            # Measured q deliberately does not instantaneously follow target.
+        self.assertLess(float(self.applied[0, 3]-self.measured[0, 3]), .003001)
+        self.assertLess(float(self.applied[0, 3]), float(initial_applied[0, 3]))
+
+    def test_high_force_retreat_is_not_reversed_to_meet_tight_lead(self):
+        self.prime()
+        self.applied[:, 3] -= .01  # Applied target already open relative to q.
+        inputs = self.inputs(1)
+        inputs["raw_group_force_n"][:, 1] = 2.
+        target, evidence, unsafe = self.inner.update(**inputs)
+        self.assertLess(float(target[0, 3]), float(self.applied[0, 3]))
+        self.assertTrue(evidence["contact_lead_high_force_retreat_priority_by_joint"][:, 3].all())
+        self.assertTrue(evidence["actual_requested_lead_not_yet_met"].all())
+        self.assertFalse(unsafe.any())
+
+    def test_native_box_conflict_still_fails_closed_during_lead_recovery(self):
+        self.prime()
+        self.applied[:, 3] += .015
+        inputs = self.inputs(1)
+        inputs["raw_group_force_n"][:, 1] = 2.
+        inputs["macro_lower_hand_rad"][:, 3] = self.applied[:, 3]+.01
+        target, evidence, unsafe = self.inner.update(**inputs)
+        self.assertTrue(self.t.equal(target, self.applied))
+        self.assertTrue(evidence["request_constraints_infeasible"].all())
+        self.assertTrue(unsafe.all())
+
+    def test_missing_nan_depth_or_unsafe_feedback_does_not_write_a_new_target(self):
+        for case in ("missing", "nan", "depth", "unsafe"):
+            with self.subTest(case=case):
+                self.setUp()
+                self.prime()
+                self.inner.update(**self.inputs(1))  # Establish actual valid feedback first.
+                inputs = self.inputs(2)
+                inputs["raw_group_force_n"][:] = 2.
+                if case == "missing":
+                    inputs["contact_measurement_valid"][0] = False
+                elif case == "nan":
+                    inputs["raw_group_force_n"][0, 0] = float("nan")
+                elif case == "depth":
+                    inputs["penetration_m"][0] = .00301
+                else:
+                    inputs["unsafe_latched"][0] = True
+                target, _, unsafe = self.inner.update(**inputs)
+                self.assertTrue(self.t.equal(target[0], self.applied[0]))
+                self.assertTrue(bool(unsafe[0]))
+                self.assertFalse(bool(unsafe[1]))
+
+    def test_initial_measurement_handshake_can_wait_but_loss_after_valid_feedback_is_unsafe(self):
+        self.prime()
+        self.nominal[:, 3] += .1
+        for sample in range(1, 8):
+            inputs = self.inputs(sample)
+            inputs["contact_measurement_valid"][:] = False
+            target, e, unsafe = self.inner.update(**inputs)
+            self.assertTrue(self.t.equal(target, self.applied))
+            self.assertTrue(e["waiting_for_first_valid_measurement"].all())
+            self.assertFalse(unsafe.any())
+        target, e, unsafe = self.inner.update(**self.inputs(8))
+        self.assertFalse(e["waiting_for_first_valid_measurement"].any())
+        self.assertTrue(e["seen_valid_feedback_for_current_episode"].all())
+        self.assertGreater(float(target[0, 3]), float(self.applied[0, 3]))
+        self.assertFalse(unsafe.any())
+        self.commit(target)
+        inputs = self.inputs(9)
+        inputs["contact_measurement_valid"][:] = False
+        target, e, unsafe = self.inner.update(**inputs)
+        self.assertTrue(self.t.equal(target, self.applied))
+        self.assertTrue(e["previously_valid_measurement_lost"].all())
+        self.assertTrue(unsafe.all())
+
+    def test_physics_retreat_budget_has_no_windup_and_load_withdrawal_recloses_slowly(self):
+        self.prime()
+        initial = self.applied.clone()
+        for sample in range(1, 501):
+            inputs = self.inputs(sample)
+            inputs["raw_group_force_n"][:] = .8
+            target, _, unsafe = self.inner.update(**inputs)
+            self.assertFalse(unsafe.any())
+            self.assertLessEqual(float((target-initial).abs().max()), .040001)
+            self.commit(target)
+        prior = self.applied.clone()
+        target, e, unsafe = self.inner.update(**self.inputs(501))
+        self.assertTrue(e["force_feedback_contact_mode_latched"].all())
+        self.assertGreater(float(((target-prior)*self.axis).max()), 0.)
+        self.assertLessEqual(float((target-prior).abs().max()), .04*.002+1e-7)
+        self.assertFalse(unsafe.any())
+
+    def test_partial_episode_reset_clears_contact_and_stale_force_without_resetting_other_env(self):
+        self.prime()
+        inputs = self.inputs(1)
+        inputs["raw_group_force_n"][:] = .8
+        target, _, _ = self.inner.update(**inputs)
+        self.commit(target)
+        self.state["episode_id"][0] += 1
+        self.applied[0] = self.t.tensor(self.seed)
+        self.measured[0] = self.applied[0]
+        inputs = self.inputs(2)
+        inputs["raw_group_force_n"][:] = .8
+        inputs["raw_group_force_n"][0] = 100.
+        inputs["contact_measurement_valid"][0] = False
+        target, evidence, unsafe = self.inner.update(**inputs)
+        self.assertTrue(self.t.equal(target[0], self.t.tensor(self.seed)))
+        self.assertFalse(evidence["force_feedback_contact_mode_latched"][0].any())
+        self.assertTrue(evidence["force_feedback_contact_mode_latched"][1].all())
+        self.assertFalse(unsafe.any())
+
+    def test_macro_reference_advances_near_contact_without_force_integrating_or_mutating_targets(self):
+        self.trajectory.stage_elapsed[:] = self.trajectory.durations[0]
+        self.state["q_action_rad"][:, 7:] = self.goals[0]
+        self.state["q_action_rad"][:, 10] -= .04
+        self.state["target_action_rad"][:, 7:] = self.state["q_action_rad"][:, 7:]
+        self.state["group_normal_force_n"][:, 1:] = .1
+        self.state["metrics"]["no_positive_gap_hand_load"][:] = False
+        before = self.state["target_action_rad"].clone()
+        for _ in range(2):
+            nominal, _, evidence = self.trajectory.reference(self.state, self.no_reset, .066, 1.5, self.tracking)
+        self.assertTrue(self.t.equal(before, self.state["target_action_rad"]))
+        self.assertTrue(self.t.equal(nominal, self.goals[0][None].repeat(2, 1)))
+        self.assertTrue(evidence["stage_advance_after_this_request"].all())
+        self.assertTrue(evidence["macro_reference_only_no_force_target_update"])
+        self.assertFalse(evidence["closure_path_complete"].any())
+        self.assertFalse(hasattr(self.trajectory, "contact_latched"))
+
+    def test_v5_final_equilibrium_accepts_real_contact_before_nominal_thumb_but_requires_side_gates(self):
+        self.trajectory.stage_index[:] = 4
+        self.trajectory.stage_elapsed[:] = self.trajectory.durations[4]
+        self.trajectory.stage_start[:] = self.goals[-2]
+        self.state["q_action_rad"][:, 7:] = self.goals[-1]
+        self.state["q_action_rad"][:, 7] = 1.024
+        self.state["target_action_rad"][:, 7:] = self.state["q_action_rad"][:, 7:]
+        self.state["group_normal_force_n"][:] = .4
+        self.state["metrics"]["group_physical_loaded_contact_count"][:] = 1
+        _, _, evidence = self.trajectory.reference(self.state, self.no_reset, .066, 1.5, self.tracking)
+        self.assertGreater(float(evidence["stage_measured_error_max_rad"].min()), .05)
+        self.assertTrue(evidence["stage_final_physical_contact_equilibrium"].all())
+        self.assertTrue(evidence["closure_path_complete"].all())
+        for key, value in (("opposition_dot", -.3), ("maximum_abs_normal_z", .7),
+                           ("no_positive_gap_hand_load", False), ("contact_safe", False)):
+            with self.subTest(key=key):
+                old = self.state["metrics"][key].clone()
+                self.state["metrics"][key][:] = value
+                _, _, e = self.trajectory.reference(self.state, self.no_reset, .066, 1.5, self.tracking)
+                self.assertFalse(e["closure_path_complete"].any())
+                self.state["metrics"][key] = old
+        del self.state["metrics"]["opposition_dot"]
+        _, _, e = self.trajectory.reference(self.state, self.no_reset, .066, 1.5, self.tracking)
+        self.assertFalse(e["closure_path_complete"].any())
+
+    def test_v5_final_equilibrium_cannot_hide_other_joint_or_actual_applied_tracking_error(self):
+        self.trajectory.stage_index[:] = 4
+        self.trajectory.stage_elapsed[:] = self.trajectory.durations[4]
+        self.trajectory.stage_start[:] = self.goals[-2]
+        self.state["q_action_rad"][:, 7:] = self.goals[-1]
+        self.state["q_action_rad"][:, 7] = 1.024
+        self.state["target_action_rad"][:, 7:] = self.state["q_action_rad"][:, 7:]
+        self.state["target_action_rad"][0, 7] -= .03
+        self.state["q_action_rad"][1, 8] += .03  # Thumb1 orientation must be attained.
+        self.state["target_action_rad"][1, 8] = self.state["q_action_rad"][1, 8]
+        self.state["group_normal_force_n"][:] = .4
+        self.state["metrics"]["group_physical_loaded_contact_count"][:] = 1
+        _, _, e = self.trajectory.reference(self.state, self.no_reset, .066, 1.5, self.tracking)
+        self.assertFalse(e["closure_path_complete"].any())
+
+    def test_middle_contact_may_stop_before_free_goal_only_with_real_opposed_contact_and_orientation(self):
+        from g1_vla.rl_hand_control import PhysicsPinchTrajectory
+        candidate = copy.deepcopy(self.candidate)
+        frames = candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+        frames[-1]["target_rad"][5] += .04
+        frames[-1]["target_rad"][6] += .04
+        trajectory = PhysicsPinchTrajectory(self.t, self.seed, self.state, candidate)
+        trajectory.stage_index[:] = 4
+        trajectory.stage_elapsed[:] = trajectory.durations[4]
+        trajectory.stage_start[:] = trajectory.goals[-2]
+        self.state["q_action_rad"][:, 7:] = trajectory.goals[-1]
+        self.state["q_action_rad"][:, 7] = 1.024
+        self.state["q_action_rad"][:, 12:14] -= .04
+        self.state["target_action_rad"][:, 7:] = self.state["q_action_rad"][:, 7:]
+        self.state["group_normal_force_n"][:] = .4
+        self.state["metrics"]["group_physical_loaded_contact_count"][:] = 1
+        _, _, e = trajectory.reference(self.state, self.no_reset, .066, 1.5, self.tracking)
+        self.assertGreater(float(e["stage_final_equilibrium_other_six_goal_error_rad"].min()), .025)
+        self.assertTrue(e["stage_final_physical_contact_equilibrium"].all())
+        self.assertTrue(e["closure_path_complete"].all())
+        self.state["metrics"]["group_physical_loaded_contact_count"][0, 2] = 0
+        self.state["q_action_rad"][1, 8] += .03
+        self.state["target_action_rad"][1, 8] = self.state["q_action_rad"][1, 8]
+        _, _, e = trajectory.reference(self.state, self.no_reset, .066, 1.5, self.tracking)
+        self.assertFalse(e["closure_path_complete"].any())
+
+    def test_current_v5_geometry_resource_produces_declared_caps_without_elapsed_time_acceptance(self):
+        from g1_vla.rl_hand_control import PhysicsPinchTrajectory
+        root = Path(__file__).resolve().parents[1]
+        candidate = json.loads((root/"resources/rl_geometry_candidates/opposed_contact_physics_pinch_v4.json").read_text())
+        trajectory = PhysicsPinchTrajectory(self.t, self.seed, self.state, candidate)
+        trajectory.stage_index[:] = 4
+        trajectory.stage_elapsed[:] = trajectory.durations[4]
+        trajectory.stage_start[:] = trajectory.goals[-2]
+        nominal, _, e = trajectory.reference(self.state, self.no_reset, .066, 1.5, self.tracking)
+        self.assertAlmostEqual(float(nominal[0, 0]), .94, places=6)
+        self.assertAlmostEqual(float(e["geometry_lower_hand_rad"][0, 0]), .92, places=6)
+        self.assertAlmostEqual(float(nominal[0, 1]), -.52, places=6)
+        self.assertAlmostEqual(float(nominal[0, 2]), -.04, places=6)
+        self.assertFalse(e["closure_path_complete"].any())
+
+
 if __name__ == "__main__":
     unittest.main()

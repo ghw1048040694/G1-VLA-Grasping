@@ -1,0 +1,502 @@
+{
+  "schema_version": 1,
+  "candidate_id": "g1_native_opposed_contact_physics_pinch_v4",
+  "asset_sha256": "d23b9bbc8b59cf20fa1983f55874f855a76e038b9e22eae39542e62be5b4ba3d",
+  "oldseed_sha256": "b4b6ed59d18624b5bf45eda9153bc4b86f31eceebbaa30be98d66dee00e75470",
+  "hand_joint_order": [
+    "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
+    "right_hand_index_0_joint",
+    "right_hand_index_1_joint",
+    "right_hand_middle_0_joint",
+    "right_hand_middle_1_joint"
+  ],
+  "target_rad": [
+    0.94,
+    -0.52,
+    -0.04,
+    0.835,
+    1.2266666666666668,
+    0.3833333333333333,
+    1.35
+  ],
+  "known_geometric_overlaps": [
+    {
+      "body_a": "right_hand_camera_base_link",
+      "body_b": "right_hand_palm_link",
+      "native_filter_status": "explicit pair in unchanged fixed-component15 physicsv4 filter contract04dd990d50f4632012408b13747313a5504614e47a13d05d9540c31ef66fb770; not an assertion of global collision freedom"
+    },
+    {
+      "body_a": "right_hand_camera_base_link",
+      "body_b": "right_hand_thumb_0_link",
+      "native_filter_status": "explicit pair in unchanged fixed-component15 physicsv4 filter contract; source native02 previously measured large reaction before filter, native03/04 use declared filtered model"
+    }
+  ],
+  "admission_limitations": [
+    "Offline candidate only; no new native simulation, training, force or success score used for selection.",
+    "Final and extra target poses intentionally intersect the Cube authored hull. They are bounded remote force-search targets, never reset states or necessary free-space arrival conditions.",
+    "Source+32 historical wrist/Cube near-onset normals and sampled no-unfiltered-self-intersection are not future PhysX cooked-manifold or dynamic reachability certification.",
+    "All original1.5N/3mm/actual-separation/opposition/complete-friction-manifold/2mm-clearance/100physics-sample support gates remain required; no-positive-gap support inference is allowed.",
+    "Coarse separating-translation upper bounds in geometry receipts are not penetration depth, minimum translation distance, measured force or proof of the3mm bound.",
+    "Self audit covers25 unfiltered pairs among9 authored right-hand hulls with fixed15 filter unchanged; whole-robot moving collision freedom is not inferred.",
+    "Only finite declared path/domain samples were checked; candidate cannot certify an unsampled continuous trajectory or actual target overshoot."
+  ],
+  "geometry_evidence": {
+    "protocol": "offline_native_usd_grasp_geometry_v1",
+    "qualification": "candidate_only_not_physics_qualified",
+    "units": "m_rad",
+    "hand_joint_limits_rad": [
+      [
+        -1.0471975511965976,
+        1.0471975511965976
+      ],
+      [
+        -1.0471975511965976,
+        0.6108651716189881
+      ],
+      [
+        -1.745329118836275,
+        0.0
+      ],
+      [
+        0.0,
+        1.5707963267948966
+      ],
+      [
+        0.0,
+        1.745329118836275
+      ],
+      [
+        0.0,
+        1.5707963267948966
+      ],
+      [
+        0.0,
+        1.745329118836275
+      ]
+    ],
+    "finger_surface_evidence": {
+      "thumb": {
+        "contact_body": "right_hand_thumb_2_link",
+        "minimum_distance_to_cube_m": 1.1102230246251565e-16,
+        "closest_point_world_m3": [
+          0.3250002633133969,
+          0.030000369008875944,
+          0.7920893342052956
+        ],
+        "cube_closest_point_world_m3": [
+          0.3250002633133969,
+          0.030000369008875944,
+          0.7920893342052955
+        ],
+        "closing_direction_world3": [
+          0.6977149863525234,
+          0.7163754586742112,
+          -5.330263345863004e-06
+        ],
+        "method": "Final source-wrist authored ConvexHull GJK intersection witness (not unique exterior skin point); closing direction is negative last-disjoint2um-gap surface normal along the declared finger approach. Neither witness nor direction is a measured PhysX contact manifold."
+      },
+      "index": {
+        "contact_body": "right_hand_index_1_link",
+        "minimum_distance_to_cube_m": 2.7755575615628914e-17,
+        "closest_point_world_m3": [
+          0.3277438191144844,
+          0.0800003067229565,
+          0.7802144289142174
+        ],
+        "cube_closest_point_world_m3": [
+          0.3277438191144844,
+          0.08000030672295652,
+          0.7802144289142174
+        ],
+        "closing_direction_world3": [
+          -1.1915087319587582e-06,
+          -0.9999999999869399,
+          4.969945179021277e-06
+        ],
+        "method": "Final source-wrist authored ConvexHull GJK intersection witness (not unique exterior skin point); closing direction is negative last-disjoint2um-gap surface normal along the declared finger approach. Neither witness nor direction is a measured PhysX contact manifold."
+      },
+      "middle": {
+        "contact_body": "right_hand_middle_1_link",
+        "minimum_distance_to_cube_m": 5.551115123125783e-17,
+        "closest_point_world_m3": [
+          0.37388271108342613,
+          0.0644469084953038,
+          0.7966272168005102
+        ],
+        "cube_closest_point_world_m3": [
+          0.3738827110834262,
+          0.0644469084953038,
+          0.7966272168005102
+        ],
+        "closing_direction_world3": [
+          -0.9999678868263233,
+          1.1516330001044004e-06,
+          -0.008014069800740618
+        ],
+        "method": "Final source-wrist authored ConvexHull GJK intersection witness (not unique exterior skin point); closing direction is negative last-disjoint2um-gap surface normal along the declared finger approach. Neither witness nor direction is a measured PhysX contact manifold."
+      }
+    },
+    "source_detail": {
+      "palm_reference": "unchanged source seed official_native_fk_reference; no wrist/object/root reset change",
+      "palm_offset_xyz_world_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "palm_offset_rpy_world_rad": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "no_object_state_change": true,
+      "precontact_waypoint_rad": [
+        1.044,
+        -0.52,
+        -0.04,
+        0.825,
+        1.2166666666666668,
+        0.3333333333333333,
+        1.3
+      ],
+      "bounded_force_goal_rad": [
+        0.94,
+        -0.52,
+        -0.04,
+        0.835,
+        1.2266666666666668,
+        0.3833333333333333,
+        1.35
+      ],
+      "stage_keyframes": [
+        {
+          "name": "source",
+          "target_rad": [
+            1.044999216953894,
+            -0.5631379848506369,
+            -0.001882270792060498,
+            0.5228475662574678,
+            1.1837266197069805,
+            0.26603581444523117,
+            1.1131477039115334
+          ]
+        },
+        {
+          "name": "index_middle_precontact_thumb_hold",
+          "target_rad": [
+            1.044999216953894,
+            -0.5631379848506369,
+            -0.001882270792060498,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "duration_s": 1.5
+        },
+        {
+          "name": "thumb1_relieve_before_reorientation",
+          "target_rad": [
+            1.044999216953894,
+            -0.52,
+            -0.001882270792060498,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "duration_s": 0.35
+        },
+        {
+          "name": "thumb2_small_curl_after_relief",
+          "target_rad": [
+            1.044999216953894,
+            -0.52,
+            -0.04,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "duration_s": 0.2
+        },
+        {
+          "name": "balanced_thumb_precontact",
+          "target_rad": [
+            1.044,
+            -0.52,
+            -0.04,
+            0.825,
+            1.2166666666666668,
+            0.3333333333333333,
+            1.3
+          ],
+          "duration_s": 0.4
+        },
+        {
+          "name": "force_limited_overtravel_not_reset_pose",
+          "target_rad": [
+            0.94,
+            -0.52,
+            -0.04,
+            0.835,
+            1.2266666666666668,
+            0.3833333333333333,
+            1.35
+          ],
+          "duration_s": 0.4
+        }
+      ],
+      "old_candidate_source": {
+        "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261016/stage16/balanced_thumb_force_limited_candidate_v3.json",
+        "bytes": 12907,
+        "sha256": "09ee1ae234ab143076c514273d1105b1ee3a939cb7c349a5e3a40901a765e81f"
+      },
+      "selected_variant": "B thumb1=-.52,thumb2=-.04; minimal tested pair with source and actual32 margin around-.65",
+      "selected_controller_plan": "physics_pinch_v5, not yet executed; root owns exact implementation/contract",
+      "planned_extra_thumb0_closing_budget_rad": 0.02,
+      "planned_minimum_thumb0_target_rad": 0.92,
+      "final_goal_semantics": "Remote force-search cap, not necessary free-space q arrival; actual contact equilibrium still must satisfy all original gates. Stage3near-entry1.044 stays outside source onset; final mode searches toward.94 and at most.92 with measured force feedback.",
+      "unchanged_stage0_nearcontact_hand4_rad": [
+        0.825,
+        1.2166666666666668,
+        0.3333333333333333,
+        1.3
+      ],
+      "middle_final_change_from_old_rad": [
+        0.04,
+        0.04
+      ],
+      "source_thumb_near_onset_dots": {
+        "index": -0.716376290024845,
+        "middle": -0.6976917127912686
+      },
+      "source_near_onset_evidence": {
+        "finger": {
+          "thumb": {
+            "available": true,
+            "fraction_from_opening_to_final": 0.18126201629638672,
+            "hand_q_rad": [
+              1.0259668471792893,
+              -0.52,
+              -0.04,
+              0.835,
+              1.2266666666666668,
+              0.3833333333333333,
+              1.35
+            ],
+            "surface": {
+              "distance_m": 2.000093977446707e-06,
+              "closest_hand_point_world_m": [
+                0.3249988833973236,
+                0.029998966714059626,
+                0.7982309375500269
+              ],
+              "closest_cube_point_world_m": [
+                0.32500027889286576,
+                0.03000039953230011,
+                0.7982309375393659
+              ],
+              "iterations": 9
+            },
+            "normal_world": [
+              -0.6977149863525234,
+              -0.7163754586742112,
+              5.330263345863004e-06
+            ],
+            "normal_cube": [
+              -0.6977141327990738,
+              -0.716376290012753,
+              1.664997580721129e-11
+            ],
+            "maximum_abs_normal_z": 5.330263345863004e-06
+          },
+          "index": {
+            "available": true,
+            "fraction_from_opening_to_final": 0.9700407981872559,
+            "hand_q_rad": [
+              0.94,
+              -0.52,
+              -0.04,
+              0.8256481622411682,
+              1.225380217133953,
+              0.3833333333333333,
+              1.35
+            ],
+            "surface": {
+              "distance_m": 2.003092283901568e-06,
+              "closest_hand_point_world_m": [
+                0.3268236253730323,
+                0.08000231186597806,
+                0.7804064500134466
+              ],
+              "closest_cube_point_world_m": [
+                0.3268236253706456,
+                0.08000030877369418,
+                0.7804064500234018
+              ],
+              "iterations": 11
+            },
+            "normal_world": [
+              1.1915087319587582e-06,
+              0.9999999999869399,
+              -4.969945179021277e-06
+            ],
+            "normal_cube": [
+              1.7330776816791804e-11,
+              0.9999999999999998,
+              1.766295237840038e-12
+            ],
+            "maximum_abs_normal_z": 4.969945179021277e-06
+          },
+          "middle": {
+            "available": true,
+            "fraction_from_opening_to_final": 0.7066221237182617,
+            "hand_q_rad": [
+              0.94,
+              -0.52,
+              -0.04,
+              0.835,
+              1.2266666666666668,
+              0.3489208363488248,
+              1.2805127763811122
+            ],
+            "surface": {
+              "distance_m": 2.0020991251178887e-06,
+              "closest_hand_point_world_m": [
+                0.3750023289975149,
+                0.06647113466456739,
+                0.8000500832836611
+              ],
+              "closest_cube_point_world_m": [
+                0.37500032696268354,
+                0.06647113466687307,
+                0.800050067238699
+              ],
+              "iterations": 11
+            },
+            "normal_world": [
+              0.9999678868263233,
+              -1.1516330001044004e-06,
+              0.008014069800740618
+            ],
+            "normal_cube": [
+              0.9999678664944417,
+              -9.36320759156805e-12,
+              0.008016606423796679
+            ],
+            "maximum_abs_normal_z": 0.008016606423796679
+          }
+        },
+        "thumb_opposition_dots": {
+          "index": -0.716376290024845,
+          "middle": -0.6976917127912686
+        },
+        "worst_opposition_dot": -0.6976917127912686
+      },
+      "actual32_near_onset_summary": {
+        "actual32_near_onset_all3_available": 32,
+        "actual32_near_onset_all_opposition_pass": 32,
+        "actual32_near_onset_worst_dot": -0.6531958432979377
+      },
+      "actual32_near_onset_maximum_abs_normal_z": 0.029320991006258033,
+      "actual32_final_all3_authored_intersections": 32,
+      "path_and_final_summary": {
+        "source_path_samples": 25,
+        "actual32_near_onset_all3_available": 32,
+        "actual32_near_onset_all_opposition_pass": 32,
+        "actual32_near_onset_worst_dot": -0.6531958432979377,
+        "source_minimum_table_clearance_m": 0.010842346291667804,
+        "source_minimum_unfiltered_self_gap_m": 0.008057129084274013,
+        "source_unfiltered_intersection_samples": 0,
+        "actual32_final_all3_authored_intersection": 32,
+        "actual32_final_minimum_table_clearance_m": 0.0096376024779804,
+        "actual32_final_minimum_unfiltered_self_gap_m": 0.008397777891523746,
+        "actual32_final_unfiltered_intersections": 0,
+        "actual32_finger_gap_max_m": {
+          "thumb": 6.377745716588144e-16,
+          "index": 9.930136612989092e-16,
+          "middle": 6.377745716588144e-16
+        },
+        "actual32_max_separating_translation_upper_bound_m": {
+          "thumb": 0.0063187716649832915,
+          "index": 0.0018387886714306134,
+          "middle": 0.005128442652189591
+        }
+      },
+      "bounded_thumb_domain_summary": {
+        "checks": 231,
+        "minimum_table_clearance_m": 0.009425487027270418,
+        "minimum_unfiltered_self_gap_m": 0.008057129084273746,
+        "unfiltered_intersection_samples": 0
+      },
+      "bounded_thumb0_sample_grid_rad": [
+        1.044999216953894,
+        1.02,
+        1.0,
+        0.98,
+        0.96,
+        0.94,
+        0.92
+      ],
+      "authored_hulls_file": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261016/stage16/official_hand_authored_convex_hulls_v1.json",
+      "authored_hulls_sha256": "5b5e0737f959d6fc50b1c3cc589213d3d4a162c0a7ea9625bbf792f0788e18d1",
+      "geometry_receipts": [
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/normal_coordinate_reconstruction_v1.json",
+          "bytes": 23448,
+          "sha256": "a3cf8be1926d375b4f8452074256514592b309c4138ffc2003b109faee88fe0a"
+        },
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/run04_six_actual_contacts_raw_v1.json",
+          "bytes": 1669360,
+          "sha256": "c320502995e5a24413eb3bf6d37f6ab19f08a6773bc2d85d880ec081a20d3c87"
+        },
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/thumb_orientation_bounded_search_v1.json",
+          "bytes": 26688,
+          "sha256": "335cfa0543c1f375e38409c60c2f13c14b8031d45790e512e63dca60fb5a99ca"
+        },
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/thumb32_orientation_candidate_check_v1.json",
+          "bytes": 175683,
+          "sha256": "b68ad4a3456d19f438578e97a538ea28e03668047d09a5ee7f6ab32e161b4850"
+        },
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/source_facet_search_v1.json",
+          "bytes": 20113,
+          "sha256": "a072377e7d5fa6841245c00c23f0e685271fb16a6c614dd63e4d2ce5821aefc6"
+        },
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/source_and_actual32_reconciled_candidates_v1.json",
+          "bytes": 140776,
+          "sha256": "caec5c298f0b0081cd39c1a5383fbfc095e19faeb3e397413dce326d2686ccc8"
+        },
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/middle_final_bounded_extension_v1.json",
+          "bytes": 32866,
+          "sha256": "40c65bb9d94e2f50700a5e3057a79587b06710cfd313e97c6c57b9d377c992c1"
+        },
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/selected_B_candidate_path_geometry_v1.json",
+          "bytes": 248348,
+          "sha256": "48254f12f652b342a7d254b885743c96d8ad9fec19b815178e7c678b1dbc9b72"
+        },
+        {
+          "path": "/Users/gggghw/Documents/ChatGPT/VLA开发/artifacts/g1-rebuild-20261017/stage18/selected_B_bounded_domain_geometry_v1.json",
+          "bytes": 511236,
+          "sha256": "23eb7b268ba449d8c1dd0341c69f36ad4ff3c430aadd436c22c7ab7eac90b285"
+        }
+      ],
+      "physics_qualification": "none; noApp/noSim. Proposed higher-frequency outer feedback does not hard-bound actual force. All actual support thresholds unchanged.",
+      "segment_time_semantics": "Candidate nominal durations copied unchanged from09ee. Any controller stage0 duration override remains an explicit separate controller contract;6s episode budget unchanged.",
+      "search_domain": "54 source thumb1/2 combinations, four reconciled source+actual32 settings after prior finite81 exploratory thumb settings; five middle extensions[0,.02,.04,.06,.08]. SelectedB then25source path samples plus33states×7q0 domain checks; no new physical outcomes consumed.",
+      "rejected_or_limited_checks": [
+        "thumb1=-.55,thumb2=-.02 passedactual32but source onset worstdotabout-.401; rejected in favor of source+actual32 pair.",
+        "Old middlefinal authored intersections28/32, +.02each31/32, +.04each32/32; chose first passing tested extension.",
+        "Earlier exploratory thumb0 source search included1.15 above native limit to find geometric onset; no such setting selected; selected stages and bounded domain are all inside native limits."
+      ]
+    }
+  }
+}

@@ -955,7 +955,7 @@
   },
   "rl_diagnostics": {
     "enabled": true,
-    "backend": "g1_control_physics_diagnostics_v4",
+    "backend": "g1_control_physics_diagnostics_v5",
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -964,19 +964,19 @@
     "training_allowed": false,
     "profiles": [
       {
-        "name": "compliant_pinch_pose_hold",
+        "name": "physics_pinch_pose_hold",
         "action_source": "guided_hand_pose_hold",
         "control_guard_version": "box_halfspace_projected_v2"
       }
     ],
     "guided_hand_target_rad": [
-      0.99,
-      -0.5,
-      -0.01,
+      0.94,
+      -0.52,
+      -0.04,
       0.835,
       1.2266666666666668,
-      0.3433333333333333,
-      1.31
+      0.3833333333333333,
+      1.35
     ],
     "guided_closure_ramp_s": 2.0,
     "guided_preload_controls": 3,
@@ -993,17 +993,17 @@
     "reference_source_tree_sha256": "6708889a39383ef82f084ac2ffb12809f3ef81ad666fd1ba4361e7fc868ef100",
     "reference_training_config_sha256": "673a383cd2491b611d51c8d5cbd06bbda4dda334e735c4b2f6e66b2bf282516b",
     "reference_policy_contract_sha256": "c2c60bef1a2afb22d6a6d704542e9beb42c2d6b9fe4af6449d66f14699ce0d0b",
-    "profile_plan": "compliant_pinch_v4",
-    "candidate_path": "resources/rl_geometry_candidates/balanced_thumb_force_limited_v3.json",
-    "candidate_sha256": "09ee1ae234ab143076c514273d1105b1ee3a939cb7c349a5e3a40901a765e81f",
-    "candidate_id": "g1_native_fixed_wrist_balanced_thumb_force_goal_v3",
+    "profile_plan": "physics_pinch_v5",
+    "candidate_path": "resources/rl_geometry_candidates/opposed_contact_physics_pinch_v4.json",
+    "candidate_sha256": "ab0b70d78c2a9a6807a7b4210c7793333b901a0c88914ff4b11c2adeabcc37d3",
+    "candidate_id": "g1_native_opposed_contact_physics_pinch_v4",
     "guided_target_lead_max_rad": null,
     "compliant_pinch_controller": {
-      "version": "g1_joint_target_force_admittance_pinch_v1",
-      "kind": "outer_force_admittance_joint_targets",
+      "version": "g1_physics_step_force_admittance_pinch_v2",
+      "kind": "physics_step_force_admittance_joint_targets",
       "parameters": {
-        "free_target_lead_max_rad": 0.04,
-        "contact_target_lead_max_rad": 0.012,
+        "free_target_lead_max_rad": 0.02,
+        "contact_target_lead_max_rad": 0.003,
         "contact_feedback_onset_n": 0.02,
         "force_target_n": 0.35,
         "admittance_gain_rad_s_per_n": 0.1,
@@ -1015,18 +1015,29 @@
         "final_joint_arrival_rad": 0.01,
         "final_contact_equilibrium_arrival_rad": 0.025,
         "maximum_penetration_m": 0.003,
-        "adaptive_thumb0_closing_budget_rad": 0.07,
+        "adaptive_thumb0_closing_budget_rad": 0.02,
         "stage0_duration_s": 0.9,
         "stage0_contact_near_arrival_rad": 0.05,
         "stage0_contact_force_min_n": 0.05,
-        "stage0_contact_ready_controls": 2
+        "stage0_contact_ready_controls": 2,
+        "physics_dt_s": 0.002,
+        "force_deadband_n": 0.05
       },
       "reference_semantics": {
         "maximum_retreat_rad": "actual_most_closed_applied_target",
         "adaptive_thumb0_closing_budget_rad": "explicit_extra_thumb0_closing_from_nominal_candidate_final",
         "stage0_duration_s": "explicit_control_schedule_override_only_total_episode_budget_unchanged",
         "force_feedback": "gain_times_force_target_minus_raw_normal_force_including_positive_gap_no_creep_override",
-        "stage0_contact_force_min_n": "raw_positive_gap_allowed_precontact_controller_signal_only_not_physically_loaded_or_support"
+        "stage0_contact_force_min_n": "raw_positive_gap_allowed_precontact_controller_signal_only_not_physically_loaded_or_support",
+        "feedback_cadence": "every_completed_native_2ms_sample_before_next_target_write_once_per_sample",
+        "outer_control": "66ms_trajectory_reference_only_no_outer_force_integration",
+        "applied_reference": "last_target_actually_written_to_native_drive_not_unwritten_macro_request",
+        "force_deadband_n": "hold_in_contact_force_error_deadband_no_acceptance_change",
+        "feedback_initialization": "hold_until_first_valid_current_episode_measurement_then_unexpected_missing_feedback_is_unsafe_original_deadline_unchanged",
+        "overforce_lead_priority": "above_original_1p5N_only_bounded_opening_may_temporarily_extend_open_side_lead_explicitly_unmet_no_closing_override_all_native_hard_bounds_remain",
+        "contact_lead_transition": "if_previous_actual_target_outside_new_contact_lead_allow_only_bounded_nonincreasing_target_excursion_toward_lead_recovery_explicitly_logged_not_yet_a_satisfied_lead_bound",
+        "request_bounds": "native_joint_measured_anchor_2ms_speed_macro_total_box_geometry_and_lead_intersection_not_real_force_bound",
+        "final_contact_equilibrium": "measured_force_axis_source_to_final_adaptive_interval_with_025rad_actual_tracking_tolerance_thumb1_thumb2_target_arrival_025rad_all_seven_actual_applied_tracking_025rad_and_original_physical_force_gap_manifold_opposition_side_normal_gates_not_support"
       }
     }
   }

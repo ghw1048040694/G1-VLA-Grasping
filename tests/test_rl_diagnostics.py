@@ -206,6 +206,29 @@ class DiagnosticControlTests(unittest.TestCase):
         self.assertFalse(evidence["probe_advance_permitted"].any())
         self.assertTrue((evidence["probe_offset_m"] == 0).all())
 
+    def test_physics_pinch_macro_is_only_a_reference_and_does_not_integrate_force(self):
+        from g1_vla.rl_diagnostics import GuidedClosure
+        from g1_vla.rl_probe_protocol import physics_pinch_controller_contract
+        _, candidate, cfg = self.compliant_controller()
+        cfg.update(profile_plan="physics_pinch_v5",
+            compliant_pinch_controller=physics_pinch_controller_contract())
+        source = candidate["geometry_evidence"]["source_detail"]["stage_keyframes"][0]["target_rad"]
+        first = GuidedClosure(self.t, cfg, source, self.state, candidate)
+        second = GuidedClosure(self.t, cfg, source, self.state, candidate)
+        before_targets = self.state["target_action_rad"].clone()
+        for _ in range(10):
+            self.state["group_normal_force_n"][:] = 0.
+            _, e1 = first.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+            self.state["group_normal_force_n"][:] = 1.
+            _, e2 = second.actions(self.t.zeros(2, 14), self.state, "guided_hand_pose_hold", .066, 1.5)
+        self.assertTrue(self.t.equal(e1["guided_target_hand_rad"], e2["guided_target_hand_rad"]))
+        self.assertTrue(e2["macro_reference_only_no_force_target_update"])
+        self.assertTrue(self.t.equal(self.state["target_action_rad"], before_targets))
+        self.assertEqual(e2["declared_controller_protocol"], cfg["compliant_pinch_controller"])
+        self.assertTrue((e2["probe_offset_m"] == 0).all())
+        self.assertTrue((e2["geometry_lower_hand_rad"] <= e2["guided_target_hand_rad"]).all())
+        self.assertTrue((e2["geometry_upper_hand_rad"] >= e2["guided_target_hand_rad"]).all())
+
     def test_hand_intervention_preserves_actor_arm_and_closes_declared_directions(self):
         from g1_vla.rl_diagnostics import GuidedClosure
         t = self.t

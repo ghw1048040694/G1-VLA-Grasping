@@ -24,7 +24,7 @@ from .rl_probe_protocol import validate_probe_settings, verify_probe_reference
 
 
 DIAGNOSTIC_VERSION = "g1_frozen_actor_opposing_closure_control_v4"
-STAGED_PLANS = ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3", "compliant_pinch_v4")
+STAGED_PLANS = ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3", "compliant_pinch_v4", "physics_pinch_v5")
 POSE_SERVO = {"position_gain_per_s": 4.0, "orientation_gain_per_s": 2.0,
               "dls_regularizer": 0.02, "position_speed_max_m_s": 0.01,
               "angular_speed_max_rad_s": 0.1,
@@ -102,7 +102,8 @@ class GuidedClosure:
         self.rotation = state["palm_quaternion_xyzw"].clone()
         self.ready_count = torch.zeros_like(self.ids)
         self.probe = torch.zeros_like(q[:, 0])
-        self.compliant = settings.get("profile_plan") == "compliant_pinch_v4"
+        self.physics_pinch = settings.get("profile_plan") == "physics_pinch_v5"
+        self.compliant = settings.get("profile_plan") in ("compliant_pinch_v4", "physics_pinch_v5")
         self.staged = settings.get("profile_plan") in STAGED_PLANS
         if self.staged:
             if candidate is None:
@@ -128,8 +129,9 @@ class GuidedClosure:
             self.stage_elapsed = torch.zeros_like(q[:, 0])
             self.stage_start = self.seed_hand.clone()
         if self.compliant:
-            from .rl_hand_control import CompliantPinchController
-            self.pinch = CompliantPinchController(torch, initial_hand, state, candidate,
+            from .rl_hand_control import CompliantPinchController, PhysicsPinchTrajectory
+            controller = PhysicsPinchTrajectory if self.physics_pinch else CompliantPinchController
+            self.pinch = controller(torch, initial_hand, state, candidate,
                 parameters=settings["compliant_pinch_controller"]["parameters"])
 
     def _staged_target(self, state, changed, dt, force_limit, tracking):
@@ -179,7 +181,8 @@ class GuidedClosure:
             tracking = ((position_error <= POSE_SERVO["geometry_path_tracking_position_m"]) &
                         (orientation_error <= POSE_SERVO["geometry_path_tracking_orientation_rad"]))
             if self.compliant:
-                desired_hand, fraction, stage_evidence = self.pinch.target(
+                method = self.pinch.reference if self.physics_pinch else self.pinch.target
+                desired_hand, fraction, stage_evidence = method(
                     state, changed, dt, force_limit, tracking)
             else:
                 desired_hand, fraction, stage_evidence = self._staged_target(state, changed, dt, force_limit, tracking)
@@ -277,7 +280,7 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     observations = environment.get_observations().to(cfg["rl_teacher"]["device"])
     audit = _environment_audit(environment)
     audit["source_tree_sha256"] = source_tree_identity()
-    if settings["profile_plan"] == "compliant_pinch_v4":
+    if settings["profile_plan"] in ("compliant_pinch_v4", "physics_pinch_v5"):
         # This is an explicit software-control declaration, not a measured
         # contact or a change to the environment's physical policy contract.
         audit["diagnostic_controller_protocol"] = copy.deepcopy(settings["compliant_pinch_controller"])
@@ -301,6 +304,8 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
             raise ValueError("Geometry candidate changed after native reference verification")
         candidate = json.loads(payload)
     guided = GuidedClosure(torch, settings, initial_hand, native.control_diagnostic_state(), candidate)
+    if settings["profile_plan"] == "physics_pinch_v5":
+        native.configure_physics_pinch(settings["compliant_pinch_controller"])
     quota = EvaluationQuota(settings["num_envs"], settings["num_envs"] * settings["episodes_per_env"])
     steps = 0
     environment._g1_last_step_audit = _json_safe(native.step_audit())
@@ -320,6 +325,14 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
             requested, extra = guided.actions(requested, state,
                 profile["action_source"], .066, audit["policy_contract"]["resolved_settings"]["group_force_max_n"])
             evidence.update(extra)
+            if settings["profile_plan"] == "physics_pinch_v5":
+                native.set_physics_pinch_reference(
+                    nominal_hand_rad=extra["guided_target_hand_rad"],
+                    geometry_lower_hand_rad=extra["geometry_lower_hand_rad"],
+                    geometry_upper_hand_rad=extra["geometry_upper_hand_rad"],
+                    closing_axis_hand7=extra["force_admittance_closing_axis_hand7"],
+                    palm_reference_world_m=extra["palm_pose_reference_world_m"],
+                    palm_reference_quaternion_xyzw=extra["palm_rotation_reference_xyzw"])
         streams["intent"].write({"profile": profile["name"], "control_step": steps + 1, **_json_safe(evidence),
                                  "intervention_request": _json_safe(requested)})
         observations, rewards, dones, extras = environment.step(requested.to(environment.device))

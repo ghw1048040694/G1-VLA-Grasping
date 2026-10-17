@@ -701,3 +701,55 @@ class CompliantPinchPlanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhysicsStepPinchPlanTests(unittest.TestCase):
+    def physics_fixture(self, config, current):
+        c = probe.physics_pinch_controller_contract()
+        config["rl_diagnostics"].update(profile_plan="physics_pinch_v5",
+            backend="g1_control_physics_diagnostics_v5", compliant_pinch_controller=c,
+            guided_target_lead_max_rad=None)
+        current["diagnostic_controller_protocol"] = copy.deepcopy(c)
+        current["control_probe_profile"] = copy.deepcopy(
+            probe.validate_probe_settings(config["rl_diagnostics"])["profiles"][0])
+        return c
+
+    def test_new_inner_cadence_and_old_outer_contract_are_separate(self):
+        c = probe.physics_pinch_controller_contract()
+        self.assertEqual(c["parameters"]["physics_dt_s"], .002)
+        self.assertEqual(c["parameters"]["contact_target_lead_max_rad"], .003)
+        self.assertEqual(c["parameters"]["stage0_contact_ready_controls"], 2)
+        self.assertEqual(c["parameters"]["force_target_n"], .35)
+        self.assertEqual(c["parameters"]["force_deadband_n"], .05)
+        self.assertNotEqual(c["version"], probe.compliant_pinch_controller_contract()["version"])
+        self.assertEqual(probe._canonical(probe.compliant_pinch_controller_contract()),
+            "ce31ed56f0435dbc60270a40dde00f55170135806dd03547e0f2583ecb8c99ae")
+        c["parameters"]["physics_dt_s"] = .066
+        self.assertEqual(probe.physics_pinch_controller_contract()["parameters"]["physics_dt_s"], .002)
+
+    def test_inner_plan_bridge_preserves_original_policy_and_budget(self):
+        with compliant_fixture() as (config, infos, current, _, _):
+            self.physics_fixture(config, current)
+            before = copy.deepcopy((config, infos, current))
+            r = probe.verify_probe_reference(config, infos, current)
+            self.assertTrue(r["ready_for_physical_probe"])
+            self.assertFalse(r["source_identical_trained_eval"])
+            self.assertEqual(r["optimizer_steps"], 0)
+            self.assertEqual((config, infos, current), before)
+            self.assertEqual(probe.validate_probe_settings(config["rl_diagnostics"])["guided_preload_controls"], 3)
+            self.assertEqual(infos["policy_contract"]["physics_dt_s"], .002)
+            self.assertEqual(infos["policy_contract"]["control_period_s"], .066)
+
+    def test_misdeclared_inner_cadence_and_controller_are_rejected(self):
+        for change in ("dt", "lead", "version", "profile", "extra_parameter", "old_contract", "budget"):
+            with self.subTest(change=change), compliant_fixture() as (config, infos, current, _, _):
+                self.physics_fixture(config, current)
+                v = config["rl_diagnostics"]
+                if change == "dt": v["compliant_pinch_controller"]["parameters"]["physics_dt_s"] = .066
+                elif change == "lead": v["compliant_pinch_controller"]["parameters"]["contact_target_lead_max_rad"] = .012
+                elif change == "version": v["compliant_pinch_controller"]["version"] = "unversioned"
+                elif change == "profile": current["control_probe_profile"]["name"] = "compliant_pinch_pose_hold"
+                elif change == "extra_parameter": v["compliant_pinch_controller"]["parameters"]["group_force_max_n"] = 100.
+                elif change == "old_contract": v["compliant_pinch_controller"] = probe.compliant_pinch_controller_contract()
+                else: v["max_control_steps"] = 365
+                with self.assertRaises(ValueError): probe.verify_probe_reference(config, infos, current)

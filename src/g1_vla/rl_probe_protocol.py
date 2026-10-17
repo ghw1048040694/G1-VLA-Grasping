@@ -35,11 +35,15 @@ _PLANS = {"four_way_v1": ("g1_control_physics_diagnostics_v1", _PROFILES),
           "geometry_pose_fixed_cluster_v3": ("g1_control_physics_diagnostics_v3", [_PROFILES[3]]),
           "compliant_pinch_v4": ("g1_control_physics_diagnostics_v4", [
               {"name": "compliant_pinch_pose_hold", "action_source": "guided_hand_pose_hold",
+               "control_guard_version": "box_halfspace_projected_v2"}]),
+          "physics_pinch_v5": ("g1_control_physics_diagnostics_v5", [
+              {"name": "physics_pinch_pose_hold", "action_source": "guided_hand_pose_hold",
                "control_guard_version": "box_halfspace_projected_v2"}])}
 _OLD_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v3"
 _FIXED_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v4_fixed_palm_adjacency"
 _V3_CANDIDATE_SHA256 = "09ee1ae234ab143076c514273d1105b1ee3a939cb7c349a5e3a40901a765e81f"
-_FIXED_MODEL_PLANS = frozenset(("geometry_pose_fixed_cluster_v3", "compliant_pinch_v4"))
+_FIXED_MODEL_PLANS = frozenset(("geometry_pose_fixed_cluster_v3", "compliant_pinch_v4", "physics_pinch_v5"))
+_COMPLIANT_PLANS = frozenset(("compliant_pinch_v4", "physics_pinch_v5"))
 
 _COMPLIANT_PINCH_CONTROLLER = {
     "version": "g1_joint_target_force_admittance_pinch_v1",
@@ -73,6 +77,25 @@ _COMPLIANT_PINCH_CONTROLLER = {
     },
 }
 _COMPLIANT_PINCH_CONTROLLER_SHA256 = "ce31ed56f0435dbc60270a40dde00f55170135806dd03547e0f2583ecb8c99ae"
+
+_PHYSICS_PINCH_CONTROLLER = copy.deepcopy(_COMPLIANT_PINCH_CONTROLLER)
+_PHYSICS_PINCH_CONTROLLER.update(
+    version="g1_physics_step_force_admittance_pinch_v2",
+    kind="physics_step_force_admittance_joint_targets")
+_PHYSICS_PINCH_CONTROLLER["parameters"].update(
+    free_target_lead_max_rad=.02, contact_target_lead_max_rad=.003,
+    physics_dt_s=.002, force_deadband_n=.05, adaptive_thumb0_closing_budget_rad=.02)
+_PHYSICS_PINCH_CONTROLLER["reference_semantics"].update(
+    feedback_cadence="every_completed_native_2ms_sample_before_next_target_write_once_per_sample",
+    outer_control="66ms_trajectory_reference_only_no_outer_force_integration",
+    applied_reference="last_target_actually_written_to_native_drive_not_unwritten_macro_request",
+    force_deadband_n="hold_in_contact_force_error_deadband_no_acceptance_change",
+    feedback_initialization="hold_until_first_valid_current_episode_measurement_then_unexpected_missing_feedback_is_unsafe_original_deadline_unchanged",
+    overforce_lead_priority="above_original_1p5N_only_bounded_opening_may_temporarily_extend_open_side_lead_explicitly_unmet_no_closing_override_all_native_hard_bounds_remain",
+    contact_lead_transition="if_previous_actual_target_outside_new_contact_lead_allow_only_bounded_nonincreasing_target_excursion_toward_lead_recovery_explicitly_logged_not_yet_a_satisfied_lead_bound",
+    request_bounds="native_joint_measured_anchor_2ms_speed_macro_total_box_geometry_and_lead_intersection_not_real_force_bound",
+    final_contact_equilibrium="measured_force_axis_source_to_final_adaptive_interval_with_025rad_actual_tracking_tolerance_thumb1_thumb2_target_arrival_025rad_all_seven_actual_applied_tracking_025rad_and_original_physical_force_gap_manifold_opposition_side_normal_gates_not_support")
+_PHYSICS_PINCH_CONTROLLER_SHA256 = "c5054d45f21e603c3818b6c823b36b1e3737777bb1c5b83b43cdb583e7ef3f5f"
 
 _HAND_JOINT_ORDER = ["right_hand_" + x + "_joint" for x in
     ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1", "middle_0", "middle_1")]
@@ -129,8 +152,16 @@ def compliant_pinch_controller_contract():
     return copy.deepcopy(_COMPLIANT_PINCH_CONTROLLER)
 
 
-def _verify_compliant_controller(value):
-    expected = compliant_pinch_controller_contract()
+def physics_pinch_controller_contract():
+    """The explicitly versioned 2ms feedback intervention; never a force guarantee."""
+    if _canonical(_PHYSICS_PINCH_CONTROLLER) != _PHYSICS_PINCH_CONTROLLER_SHA256:
+        raise ValueError("Physics-step pinch controller changed without its pinned identity")
+    return copy.deepcopy(_PHYSICS_PINCH_CONTROLLER)
+
+
+def _verify_compliant_controller(value, plan="compliant_pinch_v4"):
+    expected = (physics_pinch_controller_contract() if plan == "physics_pinch_v5"
+                else compliant_pinch_controller_contract())
     if (not isinstance(value, dict) or set(value) != set(expected) or
             value.get("version") != expected["version"] or value.get("kind") != expected["kind"] or
             value.get("reference_semantics") != expected["reference_semantics"] or
@@ -186,11 +217,11 @@ def validate_probe_settings(value):
     if result["profiles"] != profiles:
         raise ValueError("Diagnostics require exactly the declared profile_plan action/guard profiles in order")
     lead = result["guided_target_lead_max_rad"]
-    if ((plan in ("four_way_v1", "compliant_pinch_v4") and lead is not None) or
+    if ((plan in ("four_way_v1", "compliant_pinch_v4", "physics_pinch_v5") and lead is not None) or
             (plan in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3") and (type(lead) not in (int, float) or lead != .006))):
         raise ValueError("Diagnostic plan pins guided_target_lead_max_rad: None forv1/v4, .006 forv2/v3")
-    if plan == "compliant_pinch_v4":
-        result["compliant_pinch_controller"] = _verify_compliant_controller(result["compliant_pinch_controller"])
+    if plan in _COMPLIANT_PLANS:
+        result["compliant_pinch_controller"] = _verify_compliant_controller(result["compliant_pinch_controller"], plan)
     elif result["compliant_pinch_controller"] is not None:
         raise ValueError("Legacy diagnostic plans cannot silently select the compliant controller")
     if plan == "four_way_v1":
@@ -203,7 +234,7 @@ def validate_probe_settings(value):
                 not _is_sha(result["candidate_sha256"]) or
                 not isinstance(result["candidate_id"], str) or not result["candidate_id"].strip()):
             raise ValueError("Geometry diagnostic plan requires explicit candidate path/SHA256/ID")
-        if plan in _FIXED_MODEL_PLANS and result["candidate_sha256"] != _V3_CANDIDATE_SHA256:
+        if plan in ("geometry_pose_fixed_cluster_v3", "compliant_pinch_v4") and result["candidate_sha256"] != _V3_CANDIDATE_SHA256:
             raise ValueError("Fixed-cluster model comparison must preserve the pinned geometry candidate")
     for key, limit in (("max_wall_time_s", 3600), ("guided_closure_ramp_s", 6)):
         number = result[key]
@@ -397,7 +428,7 @@ def _finite_vector(value, length, description):
 
 def _compliant_candidate_interventions(settings, target, limits, stages, duration):
     """Declare control deviations without relabeling the pinned geometry file."""
-    if settings["profile_plan"] != "compliant_pinch_v4":
+    if settings["profile_plan"] not in _COMPLIANT_PLANS:
         return None
     parameters = settings["compliant_pinch_controller"]["parameters"]
     budget = parameters["adaptive_thumb0_closing_budget_rad"]
@@ -606,7 +637,7 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
             raise ValueError("Current diagnostic source hash must truthfully match current package bytes")
         actual_controller = current_audit.get("diagnostic_controller_protocol")
         if controller is not None:
-            if _verify_compliant_controller(actual_controller) != controller:
+            if _verify_compliant_controller(actual_controller, settings["profile_plan"]) != controller:
                 raise ValueError("Current compliant controller declaration does not match the selected control plan")
             if current_audit.get("control_probe_profile") != settings["profiles"][0]:
                 raise ValueError("Current native profile does not match the declared compliant pinch profile")
