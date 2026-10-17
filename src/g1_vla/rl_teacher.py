@@ -243,7 +243,7 @@ def run_rl_teacher_stage(stage, config, run_dir):
     if stage not in ("rl-audit", "rl-smoke", "rl-train", "rl-eval", "rl-diagnose"):
         raise ValueError("unsupported privileged RL stage")
     assets = verify_rl_assets(config)
-    if (config["rl_teacher"]["physics_protocol"] == "physx_unitree_official_usd_fixed_root_effort_grasp_v5" and
+    if (config["rl_teacher"]["physics_protocol"] == "physx_unitree_official_usd_fixed_root_effort_grasp_v6_physical_contact" and
             stage != "rl-diagnose"):
         raise ValueError("The new effort/material model is admitted only by rl-diagnose; no old actor training/evaluation route")
     run_dir = Path(run_dir)

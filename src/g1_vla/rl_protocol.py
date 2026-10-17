@@ -9,7 +9,7 @@ from pathlib import Path
 RL_PROTOCOL = "g1_official_dex3_fixed_root_pregrasp_privileged_v2"
 RL_PHYSICS = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v3"
 RL_PHYSICS_FIXED_PALM_ADJACENCY = "physx_unitree_official_usd_fixed_root_kinematic_table_tgs_v4_fixed_palm_adjacency"
-RL_PHYSICS_EFFORT_GRASP = "physx_unitree_official_usd_fixed_root_effort_grasp_v5"
+RL_PHYSICS_EFFORT_GRASP = "physx_unitree_official_usd_fixed_root_effort_grasp_v6_physical_contact"
 RIGHT_ACTION_JOINTS = [
     "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
     "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
@@ -125,10 +125,14 @@ def validate_rl_settings(settings):
     for key in ("gamma", "lam", "clip_param"):
         if not 0 < settings[key] < 1:
             raise ValueError(key + " must lie strictly between zero and one")
-    for key in ("training_position_jitter_m", "training_yaw_jitter_rad", "contact_offset_m",
-                "rest_offset_m", "entropy_coef"):
+    for key in ("training_position_jitter_m", "training_yaw_jitter_rad", "contact_offset_m", "entropy_coef"):
         if settings[key] < 0:
             raise ValueError(key + " cannot be negative")
+    if settings["physics_protocol"] == RL_PHYSICS_EFFORT_GRASP:
+        if settings["contact_offset_m"] != 0. or settings["rest_offset_m"] != -1e-6:
+            raise ValueError("The physical-contact model requires explicit contact0/rest-1micrometre offsets")
+    elif settings["rest_offset_m"] < 0:
+        raise ValueError("rest_offset_m cannot be negative in the historical physical models")
     for key in ("seed", "evaluation_seed", "smoke_seed"):
         if settings[key] < 0:
             raise ValueError(key + " cannot be negative")

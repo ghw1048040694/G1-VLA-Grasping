@@ -113,6 +113,15 @@ class EffortGraspProtocolTests(unittest.TestCase):
         self.reject("material", "compliant_contact_stiffness_n_m", 1000)
         self.reject("material", "compliant_contact_damping_ns_m", 0.8)
 
+    def test_contact_generation_cannot_hide_filtering_or_change_model_margins(self):
+        for key, bad in (("normal_manifold_filtering", True), ("contact_offset_m", .001),
+                         ("rest_offset_m", 0.), ("friction_offset_threshold_m", .04),
+                         ("original_physical_acceptance_unchanged", False)):
+            candidate = deepcopy(self.value)
+            candidate["contact_generation"][key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_effort_grasp_contract(candidate)
+
     def test_compliant_parameters_require_range_and_finite(self):
         self.value["material"]["variant"] = "finger_compliant_v5"
         for bad in (0, -1, True, math.nan, math.inf, 1000001):
@@ -121,11 +130,11 @@ class EffortGraspProtocolTests(unittest.TestCase):
         for bad in (-1, False, math.nan, math.inf, 1001):
             self.reject("material", "compliant_contact_damping_ns_m", bad)
 
-    def test_no_acceleration_spring_negative_restitution_or_negative_rest_offset(self):
+    def test_no_acceleration_spring_negative_restitution_or_undeclared_offsets(self):
         self.reject("material", "compliant_contact_acceleration_spring", True)
         self.reject("material", "restitution", -1000.0)
         self.reject("material", "rest_offset_m", -0.0001)
-        self.reject("material", "contact_offset_m", 0.0)
+        self.reject("material", "contact_offset_m", .001)
 
     def test_compliance_cannot_extend_to_cube_table_palm_or_change_friction(self):
         bodies = list(self.value["material"]["compliance_candidate_body_names"]) + ["Cube"]

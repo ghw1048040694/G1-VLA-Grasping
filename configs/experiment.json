@@ -816,7 +816,7 @@
     "enabled": true,
     "backend": "isaaclab_rsl_ppo_v1",
     "task_protocol": "g1_official_dex3_fixed_root_pregrasp_privileged_v2",
-    "physics_protocol": "physx_unitree_official_usd_fixed_root_effort_grasp_v5",
+    "physics_protocol": "physx_unitree_official_usd_fixed_root_effort_grasp_v6_physical_contact",
     "runtime_windows_root": "D:/G1-RL-Teacher",
     "isaac_python_bat": "D:/isaacsim-6.0.1/python.bat",
     "isaaclab_path": "D:/IsaacLab",
@@ -925,8 +925,8 @@
     "cube_mass_kg": 0.08,
     "position_iterations": 16,
     "velocity_iterations": 4,
-    "contact_offset_m": 0.001,
-    "rest_offset_m": 0.0,
+    "contact_offset_m": 0.0,
+    "rest_offset_m": -1e-06,
     "friction_combine_mode": "max",
     "hand_friction": 2.2,
     "cube_friction": 1.4,
@@ -1000,7 +1000,7 @@
     "guided_target_lead_max_rad": null,
     "compliant_pinch_controller": null,
     "effort_grasp_controller": {
-      "version": "g1_explicit_effort_grasp_protocol_v2_posture_gravity",
+      "version": "g1_explicit_effort_grasp_protocol_v3_physical_contact",
       "kind": "explicit_hand_effort_and_material_calibration",
       "joint_order": [
         "right_hand_thumb_0_joint",
@@ -1058,6 +1058,14 @@
           "telemetry": "commanded_total_effort_is_not_claimed_as_isolated_measured_drive_torque"
         }
       },
+      "contact_generation": {
+        "version": "g1_zero_margin_physical_contact_v1",
+        "contact_offset_m": 0.0,
+        "rest_offset_m": -1e-06,
+        "friction_offset_threshold_m": 0.0,
+        "normal_manifold_filtering": false,
+        "original_physical_acceptance_unchanged": true
+      },
       "actuation": {
         "model": "IdealPDActuator",
         "model_stiffness_nm_rad": 0.0,
@@ -1112,8 +1120,8 @@
         "compliant_contact_stiffness_n_m": 1000.0,
         "compliant_contact_damping_ns_m": 0.8,
         "compliant_contact_acceleration_spring": false,
-        "rest_offset_m": 0.0,
-        "contact_offset_m": 0.001,
+        "rest_offset_m": -1e-06,
+        "contact_offset_m": 0.0,
         "restitution": 0.0,
         "restitution_combine_mode": "average",
         "damping_combine_mode": "average",

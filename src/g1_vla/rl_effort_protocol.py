@@ -11,7 +11,7 @@ from copy import deepcopy
 import math
 
 
-EFFORT_GRASP_VERSION = "g1_explicit_effort_grasp_protocol_v2_posture_gravity"
+EFFORT_GRASP_VERSION = "g1_explicit_effort_grasp_protocol_v3_physical_contact"
 RIGHT_ARM_JOINT_NAMES = tuple("right_" + name + "_joint" for name in (
     "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw"))
 RIGHT_HAND_JOINT_NAMES = tuple(
@@ -104,6 +104,14 @@ _DEFAULTS = {
     "kind": _KINDS,
     "joint_order": list(RIGHT_HAND_JOINT_NAMES),
     "controller": deepcopy(_BALANCED_DEFAULTS),
+    "contact_generation": {
+        "version": "g1_zero_margin_physical_contact_v1",
+        "contact_offset_m": 0.0,
+        "rest_offset_m": -1e-6,
+        "friction_offset_threshold_m": 0.0,
+        "normal_manifold_filtering": False,
+        "original_physical_acceptance_unchanged": True,
+    },
     "actuation": {
         "model": "IdealPDActuator",
         "model_stiffness_nm_rad": 0.0,
@@ -128,8 +136,8 @@ _DEFAULTS = {
         "compliant_contact_stiffness_n_m": 0.0,
         "compliant_contact_damping_ns_m": 0.0,
         "compliant_contact_acceleration_spring": False,
-        "rest_offset_m": 0.0,
-        "contact_offset_m": 0.001,
+        "rest_offset_m": -1e-6,
+        "contact_offset_m": 0.0,
         "restitution": 0.0,
         "restitution_combine_mode": "average",
         "damping_combine_mode": "average",
@@ -275,7 +283,7 @@ def validate_effort_grasp_contract(value):
     acceptance, friction and drive-disable semantics cannot drift here.
     """
     _keys(value, _DEFAULTS, "effort_grasp")
-    for key in ("version", "kind", "joint_order", "acceptance"):
+    for key in ("version", "kind", "joint_order", "acceptance", "contact_generation"):
         _exact(value[key], _DEFAULTS[key], "effort_grasp." + key)
 
     actuation = value["actuation"]

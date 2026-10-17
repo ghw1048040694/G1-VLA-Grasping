@@ -8,6 +8,7 @@ import ast
 import copy
 import importlib.util
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -43,6 +44,7 @@ class NativeEffortAdapterTests(unittest.TestCase):
         import torch
         self.t = torch
         self.scope = {"torch": torch, "tensor": lambda v: v, "RLEnvironmentError": RuntimeError,
+                      "math": math,
                       "settings": {"contact_offset_m": .001, "max_abs_normal_z": .6}}
 
     def guide_fixture(self):
@@ -326,6 +328,147 @@ class NativeEffortAdapterTests(unittest.TestCase):
         self.assertTrue((env._last_written_full_effort[1] == 0).all())
         self.assertTrue((env._last_written_full_effort[0] == 999.).all())
         self.assertTrue((env._last_written_hand_effort[1] == 0).all())
+
+    def generation_fixture(self, *, already_matched=False):
+        from g1_vla.rl_effort_protocol import effort_grasp_contract
+        t, calls = self.t, []
+        contract = effort_grasp_contract()
+        contract["contact_generation"] = {
+            "version": "g1_zero_margin_physical_contact_v1", "contact_offset_m": 0.,
+            "rest_offset_m": -1e-6, "friction_offset_threshold_m": 0.,
+            "normal_manifold_filtering": False, "original_physical_acceptance_unchanged": True}
+        class View:
+            def __init__(self, name, count):
+                self.name, self.count, self.max_shapes = name, 2, count
+                self.contact = t.full((2, count), 0. if already_matched else .001)
+                self.rest = t.full((2, count), -1e-6 if already_matched else 0.)
+                self.ignore_contact_write = False
+            def get_contact_offsets(self): return self.contact
+            def get_rest_offsets(self): return self.rest
+            def set_rest_offsets(self, data, indices):
+                self.assert_cpu(data, indices)
+                calls.append((self.name, "rest"))
+                self.rest = data.clone()
+            def set_contact_offsets(self, data, indices):
+                self.assert_cpu(data, indices)
+                # Reproduce the actual SDK's strict setter-order condition.
+                if not bool((data > self.rest).all()):
+                    raise RuntimeError("contact must be strictly greater than rest")
+                calls.append((self.name, "contact"))
+                if not self.ignore_contact_write: self.contact = data.clone()
+            @staticmethod
+            def assert_cpu(data, indices):
+                if data.device.type != "cpu" or indices.device.type != "cpu":
+                    raise RuntimeError("native model parameter setters must use CPU")
+                if indices.tolist() != [0, 1]:
+                    raise RuntimeError("model writes must name every environment once")
+        class Attr:
+            def __init__(self): self.value = 0.
+            def Get(self): return self.value
+        attr = Attr()
+        api = SimpleNamespace(GetFrictionOffsetThresholdAttr=lambda: attr)
+        scene = SimpleNamespace(IsValid=lambda: True, HasAPI=lambda cls: True)
+        stage = SimpleNamespace(GetPrimAtPath=lambda path: scene)
+        views = {name: View(name, count) for name, count in (("Robot", 3), ("Cube", 1), ("Table", 1))}
+        env = SimpleNamespace(num_envs=2, sim=SimpleNamespace(get_physics_step_count=lambda: 0,
+                cfg=SimpleNamespace(physics_prim_path="/physicsScene")),
+            robot=SimpleNamespace(root_view=views["Robot"]), cube=SimpleNamespace(root_view=views["Cube"]),
+            table=SimpleNamespace(root_view=views["Table"]),
+            _effort_contact_offset_schema={name: [{"collider": "source_shape_"+str(i)} for i in range(view.max_shapes)]
+                                           for name, view in views.items()})
+        warp = SimpleNamespace(from_torch=lambda v: v,
+            array=lambda values, **kw: t.tensor(values, dtype=t.int64, device=kw["device"]), uint32=object())
+        scope = dict(self.scope, effort_contract=contract, wp=warp,
+                     PhysxSchema=SimpleNamespace(PhysxSceneAPI=lambda prim: api),
+                     get_current_stage=lambda: stage, _probe_payload=lambda torch, value: value)
+        return env, calls, views, attr, actual_method("_verify_effort_contact_generation", scope)
+
+    def test_zero_margin_native_every_shape_rest_before_contact_and_actual_readback(self):
+        env, calls, views, _, method = self.generation_fixture()
+        method(env)
+        self.assertEqual(calls, [(name, kind) for name in ("Robot", "Cube", "Table") for kind in ("rest", "contact")])
+        audit = env._effort_contact_generation_readback
+        self.assertTrue(audit["verified"])
+        self.assertFalse(audit["normal_manifold_filtering"])
+        self.assertTrue(audit["original_physical_acceptance_unchanged"])
+        for name, view in views.items():
+            self.assertTrue((view.contact == 0).all())
+            self.assertTrue(self.t.equal(view.rest, self.t.full_like(view.rest, -1e-6)))
+            row = audit["native_shape_offsets"][name]
+            self.assertEqual(row["native_shape_count_per_env"], view.max_shapes)
+            self.assertTrue(row["prephysics_native_setters_applied"])
+        self.assertFalse(audit["scene_friction_offset_threshold"]["compiled_scene_getter_available"])
+
+    def test_zero_margin_authors_all_robot_shapes_including_non_hand_instance_children(self):
+        env0, _, _, _, method = self.generation_fixture()
+        contract = method.__globals__["effort_contract"]
+        prims, ranges, uninstanced, writes = {}, {}, [], []
+        invalid = SimpleNamespace(IsValid=lambda: False)
+        def prim(path, *, collision=False, instance=False, parent=invalid):
+            p = SimpleNamespace(path=path, instance=instance, attributes={}, IsValid=lambda: True,
+                GetPath=lambda: path, HasAPI=lambda cls: collision, GetParent=lambda: parent)
+            p.IsInstance = lambda: p.instance
+            def uninstance(value):
+                p.instance = value
+                uninstanced.append(path)
+            p.SetInstanceable = uninstance
+            prims[path] = p
+            return p
+        for name in ("Robot", "Cube", "Table"):
+            root = prim("/World/envs/env_0/"+name)
+            if name == "Robot":
+                left = prim(root.path+"/left_foot_collision_instance", instance=True, parent=root)
+                ranges[root.path] = [root, left,
+                    prim(left.path+"/mesh", collision=True, parent=left),
+                    prim(root.path+"/right_hand/mesh", collision=True, parent=root)]
+            else:
+                ranges[root.path] = [root, prim(root.path+"/geometry/mesh", collision=True, parent=root)]
+        class API:
+            def __init__(self, p): self.p = p
+            def CreateRestOffsetAttr(self, v): self.p.attributes["rest"] = v; writes.append((self.p.path, "rest"))
+            def CreateContactOffsetAttr(self, v): self.p.attributes["contact"] = v; writes.append((self.p.path, "contact"))
+            def GetRestOffsetAttr(self): return SimpleNamespace(Get=lambda: self.p.attributes["rest"])
+            def GetContactOffsetAttr(self): return SimpleNamespace(Get=lambda: self.p.attributes["contact"])
+        stage = SimpleNamespace(GetPrimAtPath=lambda path: prims[path])
+        env = SimpleNamespace(_instance_overrides=[])
+        scope = dict(self.scope, effort_contract=contract,
+            Usd=SimpleNamespace(PrimRange=lambda root, flag: ranges[root.path], TraverseInstanceProxies=lambda: True),
+            UsdPhysics=SimpleNamespace(CollisionAPI=object()),
+            PhysxSchema=SimpleNamespace(PhysxCollisionAPI=SimpleNamespace(Apply=API)))
+        actual_method("_author_effort_contact_offsets", scope)(env, stage)
+        self.assertEqual({k: len(v) for k, v in env._effort_contact_offset_schema.items()}, {"Robot": 2, "Cube": 1, "Table": 1})
+        self.assertEqual(uninstanced, ["/World/envs/env_0/Robot/left_foot_collision_instance"])
+        self.assertEqual([kind for _, kind in writes], ["rest", "contact"]*4)
+        self.assertTrue(all(p.attributes == {"rest": -1e-6, "contact": 0.} for p in prims.values() if p.attributes))
+
+    def test_zero_margin_already_imported_values_need_no_native_setters(self):
+        env, calls, _, _, method = self.generation_fixture(already_matched=True)
+        method(env)
+        self.assertEqual(calls, [])
+        self.assertTrue(env._effort_contact_generation_readback["verified"])
+
+    def test_zero_margin_native_shape_count_nonfinite_or_ignored_write_fail_closed(self):
+        for failure in ("shape", "nonfinite", "ignored"):
+            env, _, views, _, method = self.generation_fixture()
+            if failure == "shape": views["Robot"].max_shapes = 4
+            elif failure == "nonfinite": views["Robot"].rest[0, 0] = float("nan")
+            else: views["Robot"].ignore_contact_write = True
+            with self.subTest(failure=failure), self.assertRaisesRegex(RuntimeError, "offset"):
+                method(env)
+            self.assertFalse(hasattr(env, "_effort_contact_generation_readback"))
+
+    def test_zero_margin_scene_usd_mismatch_is_not_excused_by_native_shape_match(self):
+        env, _, _, attr, method = self.generation_fixture(already_matched=True)
+        attr.value = .04
+        with self.assertRaisesRegex(RuntimeError, "USD friction"):
+            method(env)
+
+    def test_zero_margin_cannot_change_model_after_first_task_physics_step(self):
+        env, calls, _, _, method = self.generation_fixture()
+        env.sim.get_physics_step_count = lambda: 1
+        with self.assertRaisesRegex(RuntimeError, "before task physics"):
+            method(env)
+        self.assertEqual(calls, [])
 
     def test_actual_actuator_construction_splits_hand7_from_the_original_pd36(self):
         from g1_vla.rl_effort_protocol import RIGHT_HAND_JOINT_NAMES, effort_grasp_contract

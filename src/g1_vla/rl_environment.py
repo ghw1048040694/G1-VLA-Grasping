@@ -1057,6 +1057,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         if not probe_profile or diagnostic.get("profile_plan") != "balanced_effort_v6":
             raise RLEnvironmentError("new effort physics is only admitted by its standalone diagnostic plan")
         effort_contract = validate_effort_grasp_contract(diagnostic["effort_grasp_controller"])
+        generation = effort_contract.get("contact_generation")
+        if generation is not None:
+            settings["contact_offset_m"] = generation["contact_offset_m"]
+            settings["rest_offset_m"] = generation["rest_offset_m"]
         payload = Path(diagnostic["candidate_path"]).read_bytes()
         if hashlib.sha256(payload).hexdigest() != diagnostic["candidate_sha256"]:
             raise RLEnvironmentError("effort geometry/reset resource changed")
@@ -1166,6 +1170,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         seed = int(train_seed)
         sim = SimulationCfg(dt=0.002, device=device, render_interval=33,
                             physics=PhysxCfg(solver_type=1, enable_stabilization=False,
+                                             friction_offset_threshold=(effort_contract["contact_generation"]["friction_offset_threshold_m"]
+                                                 if effort_model and "contact_generation" in effort_contract else .04),
                                              solve_articulation_contact_last=True,
                                              gpu_max_rigid_contact_count=2**19,
                                              gpu_max_rigid_patch_count=2**15,
@@ -1221,6 +1227,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._effort_last_sample = None
             self._effort_material_readback = None
             self._effort_drive_readback = None
+            self._effort_contact_offset_schema = None
+            self._effort_contact_generation_readback = None
             self._posture_ff_update_count = 0
             self._posture_ff_last_sample = None
             self._effort_raw_samples_written = 0
@@ -1552,6 +1560,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 # with only one instance and corrupt its reset bookkeeping.
                 light = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
                 light.func("/World/RLEvaluationLight", light)
+            if effort_model and "contact_generation" in effort_contract:
+                self._author_effort_contact_offsets(stage)
             self.scene.clone_environments(copy_from_source=False)
             if fixed_palm_model:
                 if effort_model:
@@ -1563,6 +1573,104 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         stage, UsdPhysics, self.num_envs, asset_sha)
             if self.device == "cpu":
                 self.scene.filter_collisions(global_prim_paths=[])
+
+        def _author_effort_contact_offsets(self, stage):
+            """Author every source shape, including instance-proxy robot shapes.
+
+            Native readback after physics initialization remains authoritative;
+            this declaration never filters a measured normal/manifold point.
+            """
+            declaration = effort_contract["contact_generation"]
+            result = {}
+            for name in ("Robot", "Cube", "Table"):
+                root = stage.GetPrimAtPath("/World/envs/env_0/"+name)
+                paths = [str(p.GetPath()) for p in Usd.PrimRange(root, Usd.TraverseInstanceProxies())
+                         if p.HasAPI(UsdPhysics.CollisionAPI)]
+                if not paths or len(paths) != len(set(paths)):
+                    raise RLEnvironmentError("contact generation requires every unique collision shape: "+name)
+                records = []
+                for path in paths:
+                    prim = stage.GetPrimAtPath(path)
+                    instance = prim
+                    while instance.IsValid() and not instance.IsInstance():
+                        instance = instance.GetParent()
+                    if instance.IsValid():
+                        instance_path = str(instance.GetPath())
+                        instance.SetInstanceable(False)
+                        self._instance_overrides.append(instance_path.replace("/env_0/", "/env_*/"))
+                        prim = stage.GetPrimAtPath(path)
+                    api = PhysxSchema.PhysxCollisionAPI.Apply(prim)
+                    # This order is also safe for a live native shape with a
+                    # previous zero rest offset; 0 must remain > rest offset.
+                    api.CreateRestOffsetAttr(declaration["rest_offset_m"])
+                    api.CreateContactOffsetAttr(declaration["contact_offset_m"])
+                    contact, rest = api.GetContactOffsetAttr().Get(), api.GetRestOffsetAttr().Get()
+                    if (contact is None or rest is None or
+                            not math.isclose(float(contact), declaration["contact_offset_m"], rel_tol=0, abs_tol=1e-12) or
+                            not math.isclose(float(rest), declaration["rest_offset_m"], rel_tol=0, abs_tol=1e-12)):
+                        raise RLEnvironmentError("contact-generation USD shape offsets did not apply: "+path)
+                    records.append({"collider": path.replace("/env_0/", "/env_*/"),
+                                    "contact_offset_m": contact, "rest_offset_m": rest})
+                result[name] = records
+            self._effort_contact_offset_schema = result
+
+        def _verify_effort_contact_generation(self):
+            """Apply/read native all-shape offsets before the first physics step."""
+            declaration = effort_contract["contact_generation"]
+            native_step = int(self.sim.get_physics_step_count())
+            if native_step != 0:
+                raise RLEnvironmentError("contact-generation model must be fixed before task physics")
+            if self._effort_contact_offset_schema is None:
+                raise RLEnvironmentError("contact-generation model is missing its complete source-shape declaration")
+            native = {}
+            for name, view in (("Robot", self.robot.root_view), ("Cube", self.cube.root_view), ("Table", self.table.root_view)):
+                contact_before = tensor(view.get_contact_offsets()).clone()
+                rest_before = tensor(view.get_rest_offsets()).clone()
+                shape_count = len(self._effort_contact_offset_schema[name])
+                shape = (self.num_envs, shape_count)
+                if (int(view.count) != self.num_envs or int(view.max_shapes) != shape_count or
+                        tuple(contact_before.shape) != shape or tuple(rest_before.shape) != shape or
+                        not bool(torch.isfinite(contact_before).all()) or not bool(torch.isfinite(rest_before).all())):
+                    raise RLEnvironmentError("native all-shape offset binding/count/finite mismatch: "+name)
+                desired_contact = torch.full(shape, declaration["contact_offset_m"], dtype=torch.float32, device="cpu")
+                desired_rest = torch.full(shape, declaration["rest_offset_m"], dtype=torch.float32, device="cpu")
+                already_matched = (bool(torch.isclose(contact_before.cpu(), desired_contact, atol=1e-12, rtol=0).all()) and
+                                   bool(torch.isclose(rest_before.cpu(), desired_rest, atol=1e-12, rtol=0).all()))
+                if not already_matched:
+                    indices = wp.array(list(range(self.num_envs)), dtype=wp.uint32, device="cpu")
+                    # Parameter setters require CPU arrays in this installed
+                    # backend. Lower rest first so contact=0 remains legal.
+                    view.set_rest_offsets(wp.from_torch(desired_rest), indices=indices)
+                    view.set_contact_offsets(wp.from_torch(desired_contact), indices=indices)
+                contact_after = tensor(view.get_contact_offsets()).clone()
+                rest_after = tensor(view.get_rest_offsets()).clone()
+                passed = (tuple(contact_after.shape) == shape and tuple(rest_after.shape) == shape and
+                    bool(torch.isfinite(contact_after).all()) and bool(torch.isfinite(rest_after).all()) and
+                    bool(torch.isclose(contact_after.cpu(), desired_contact, atol=1e-12, rtol=0).all()) and
+                    bool(torch.isclose(rest_after.cpu(), desired_rest, atol=1e-12, rtol=0).all()))
+                if not passed:
+                    raise RLEnvironmentError("native contact/rest offsets differ from declared zero-margin model: "+name)
+                native[name] = {"verified": True, "view_count": int(view.count), "native_shape_count_per_env": shape_count,
+                    "source_collision_shapes": self._effort_contact_offset_schema[name],
+                    "contact_offsets_before_m": contact_before, "rest_offsets_before_m": rest_before,
+                    "prephysics_native_setters_applied": not already_matched,
+                    "setter_order": "rest_then_contact_cpu_parameter_arrays" if not already_matched else "not_needed",
+                    "contact_offsets_after_m": contact_after, "rest_offsets_after_m": rest_after}
+            stage = get_current_stage()
+            scene_path = self.sim.cfg.physics_prim_path
+            scene = stage.GetPrimAtPath(scene_path)
+            if not scene.IsValid() or not scene.HasAPI(PhysxSchema.PhysxSceneAPI):
+                raise RLEnvironmentError("contact-generation friction threshold requires the actual physics-scene schema")
+            actual = PhysxSchema.PhysxSceneAPI(scene).GetFrictionOffsetThresholdAttr().Get()
+            if actual is None or not math.isfinite(float(actual)) or float(actual) != declaration["friction_offset_threshold_m"]:
+                raise RLEnvironmentError("physics-scene USD friction generation threshold differs from declaration")
+            self._effort_contact_generation_readback = _probe_payload(torch, {
+                "verified": True, "contract": declaration, "native_physics_step_count_before_model_binding": native_step,
+                "native_shape_offsets": native,
+                "scene_friction_offset_threshold": {"physics_scene_path": scene_path, "usd_value_m": actual,
+                    "readback_kind": "USD_PhysxSceneAPI_not_compiled_PxScene_getter", "compiled_scene_getter_available": False},
+                "normal_manifold_filtering": False, "original_physical_acceptance_unchanged": True,
+                "zero_margin_is_new_contact_generation_model_not_a_contact_or_force_guarantee": True})
 
         def _verify_effort_native_model(self):
             """Fail closed on actual drive/material bindings, not config labels."""
@@ -1688,6 +1796,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 "always_rigid_body_names_verified": list(mat["always_rigid_body_names"]),
                 "material_readback_scope": "actual USD collision material bindings and schema including instance proxies; not a measured contact spring response",
                 "compliance_is_model_change_not_force_cap_or_real_robot_certification": True}
+            if "contact_generation" in effort_contract:
+                self._verify_effort_contact_generation()
 
         def _pre_physics_step(self, actions):
             if tuple(actions.shape) != (self.num_envs, 14) or not bool(torch.isfinite(actions).all()):
@@ -3200,6 +3310,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     reset_protocol=effort_candidate["reset_protocol"],
                     historical_reset_protocol=config["rl_teacher"]["reset_protocol"],
                     original_seed_state_retained_sha256=hashlib.sha256(json.dumps(original_initial, sort_keys=True).encode()).hexdigest())
+                if "contact_generation" in effort_contract:
+                    audit["policy_contract"]["contact_generation"] = copy.deepcopy(effort_contract["contact_generation"])
+                    audit["diagnostic_contact_generation_readback"] = self._effort_contact_generation_readback
+                    audit["physics_differences"].append("new zero-margin Robot/Cube/Table contact generation with negative one-micrometer per-shape rest offset and zero scene friction threshold; raw normal manifold and original acceptance formulas unchanged")
                 audit["diagnostic_effort_drive_readback"] = self._effort_drive_readback
                 audit["diagnostic_posture_gravity_feedforward"] = {
                     "contract": copy.deepcopy(effort_contract["actuation"]["posture_gravity_feedforward"]),

@@ -588,6 +588,9 @@ def _verify_effort_probe_reference(config, settings, current_audit):
     from .rl_effort_protocol import validate_effort_grasp_contract
     from .rl_protocol import RL_PHYSICS_EFFORT_GRASP
     contract = validate_effort_grasp_contract(settings["effort_grasp_controller"])
+    if any(config["rl_teacher"].get(key) != contract["contact_generation"][key]
+           for key in ("contact_offset_m", "rest_offset_m")):
+        raise ValueError("Central teacher offsets must match the explicitly selected contact-generation model")
     manifest_path, manifest = _read_pinned(config, settings, "reference_manifest_path", "reference_manifest_sha256")
     audit_path, old = _read_pinned(config, settings, "reference_environment_audit_path", "reference_environment_audit_sha256")
     if (_reference_source_identity(manifest) != settings["reference_source_tree_sha256"] or
@@ -630,6 +633,8 @@ def _verify_effort_probe_reference(config, settings, current_audit):
                 actual.get("effort_grasp_controller") != contract or
                 current_audit.get("diagnostic_effort_drive_readback", {}).get("verified") is not True or
                 current_audit.get("diagnostic_material_readback", {}).get("verified") is not True or
+                current_audit.get("diagnostic_contact_generation_readback", {}).get("verified") is not True or
+                actual.get("contact_generation") != contract["contact_generation"] or
                 current_audit.get("policy_contract_sha256") != _canonical(actual)):
             raise ValueError("Native effort/material/source readback differs from the explicit new model")
         filters = current_audit.get("fixed_cluster_collision_filter_override", {}).get("current_stage_readback", {})
@@ -648,8 +653,11 @@ def _verify_effort_probe_reference(config, settings, current_audit):
                 any(v.get("enabled_self_collisions") is not True for v in self_collisions.values())):
             raise ValueError("Native explicit reset or bilateral collision model differs from its declaration")
         original = old["policy_contract"]
-        if actual.get("resolved_settings") != original.get("resolved_settings"):
-            raise ValueError("Effort probe must retain all original resolved physics and qualification settings")
+        expected_settings = dict(original["resolved_settings"])
+        expected_settings.update(contact_offset_m=contract["contact_generation"]["contact_offset_m"],
+                                 rest_offset_m=contract["contact_generation"]["rest_offset_m"])
+        if actual.get("resolved_settings") != expected_settings:
+            raise ValueError("Only the explicitly versioned contact/rest offsets may differ; original qualification settings must stay fixed")
         for key in ("asset_sha256", "asset_manifest_sha256", "seed_state_sha256", "physics_dt_s",
                     "control_period_s", "validation_offsets_m", "joint_limit_tolerance_rad", "support_gate_version"):
             if actual.get(key) != original.get(key):
