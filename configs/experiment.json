@@ -1000,7 +1000,7 @@
     "guided_target_lead_max_rad": null,
     "compliant_pinch_controller": null,
     "effort_grasp_controller": {
-      "version": "g1_explicit_effort_grasp_protocol_v1",
+      "version": "g1_explicit_effort_grasp_protocol_v2_posture_gravity",
       "kind": "explicit_hand_effort_and_material_calibration",
       "joint_order": [
         "right_hand_thumb_0_joint",
@@ -1075,7 +1075,37 @@
         ],
         "gravity_compensation_within_total_cap": true,
         "unclipped_and_clipped_total_torque_logged": true,
-        "position_target_is_not_force_limit": true
+        "position_target_is_not_force_limit": true,
+        "posture_gravity_feedforward": {
+          "version": "g1_native_arm7_waist3_gravity_feedforward_v1",
+          "joint_order": [
+            "right_shoulder_pitch_joint",
+            "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint",
+            "right_elbow_joint",
+            "right_wrist_roll_joint",
+            "right_wrist_pitch_joint",
+            "right_wrist_yaw_joint",
+            "waist_yaw_joint",
+            "waist_roll_joint",
+            "waist_pitch_joint"
+          ],
+          "feedforward_caps_nm": [
+            25.0,
+            25.0,
+            25.0,
+            25.0,
+            25.0,
+            5.0,
+            5.0,
+            88.0,
+            50.0,
+            88.0
+          ],
+          "native_pd_values_unchanged": true,
+          "combined_pd_and_ff_total_not_certified_bounded": true,
+          "unused_other26_effort_targets_zero": true
+        }
       },
       "material": {
         "variant": "hard_v4_control",

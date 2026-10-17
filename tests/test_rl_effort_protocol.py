@@ -99,6 +99,16 @@ class EffortGraspProtocolTests(unittest.TestCase):
         self.reject("actuation", "gravity_compensation_within_total_cap", False)
         self.reject("actuation", "gravity_compensation_within_total_cap", 1)
 
+    def test_arm_feedforward_cannot_silently_change_joints_caps_or_claim_total_bound(self):
+        for key, bad in (("feedforward_caps_nm", [100.] * 7),
+                         ("joint_order", list(reversed(self.value["actuation"]["posture_gravity_feedforward"]["joint_order"]))),
+                         ("combined_pd_and_ff_total_not_certified_bounded", False),
+                         ("unused_other26_effort_targets_zero", False)):
+            candidate = deepcopy(self.value)
+            candidate["actuation"]["posture_gravity_feedforward"][key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_effort_grasp_contract(candidate)
+
     def test_hard_material_cannot_hide_compliance(self):
         self.reject("material", "compliant_contact_stiffness_n_m", 1000)
         self.reject("material", "compliant_contact_damping_ns_m", 0.8)

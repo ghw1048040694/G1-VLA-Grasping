@@ -1221,6 +1221,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._effort_last_sample = None
             self._effort_material_readback = None
             self._effort_drive_readback = None
+            self._posture_ff_update_count = 0
+            self._posture_ff_last_sample = None
             self._effort_raw_samples_written = 0
             self._effort_raw_samples_omitted = 0
             self._effort_previous_physical = None
@@ -1324,6 +1326,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._last_contact_native_step = -1
             self._last_written_hand_target = self._targets[:, self._action_ids[7:]].clone()
             self._last_written_hand_effort = torch.zeros(self.num_envs, 7, device=self.device)
+            self._last_written_full_effort = torch.zeros(self.num_envs, 43, device=self.device)
             self._effort_hand_body_ids = [self.robot.body_names.index(name) for name in HAND_BODIES]
             self._reward_terms = {}
             self._train_generator = torch.Generator(device=self.device).manual_seed(int(train_seed))
@@ -1803,12 +1806,107 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._update_effort_grasp()
                 position_ids = [i for i in range(43) if i not in self._action_ids[7:]]
                 self.robot.set_joint_position_target_index(target=self._targets[:, position_ids], joint_ids=position_ids)
-                self.robot.set_joint_effort_target_index(target=self._last_written_hand_effort, joint_ids=self._action_ids[7:])
+                self._write_effort_targets()
             else:
                 self.robot.set_joint_position_target_index(target=self._targets)
             if self._physics_pinch is not None:
                 self._last_written_hand_target = self._targets[:, self._action_ids[7:]].clone()
             self._pending_physics_sample = True
+
+        def _write_effort_targets(self):
+            """Write one fresh full-DOF effort vector; the implicit arm PD stays native.
+
+            Posture caps constrain this added feedforward only. Native implicit PD
+            torque is additive and is not certified by these feedforward caps.
+            The other 26 user-effort entries are overwritten with zero every
+            physics step, so a partial setter cannot retain an earlier effort.
+            """
+            declaration = effort_contract["actuation"]["posture_gravity_feedforward"]
+            expected_names = list(RIGHT_ARM)+["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+            names = declaration["joint_order"]
+            hand_ids = list(self._action_ids[7:])
+            if (names != expected_names or len(set(self.robot.joint_names)) != 43 or
+                    any(name not in self.robot.joint_names for name in names)):
+                raise RLEnvironmentError("posture feedforward must bind exact arm7 plus waist3 joint names")
+            posture_ids = [self.robot.joint_names.index(name) for name in names]
+            if (len(set(posture_ids+hand_ids)) != 17 or
+                    [self.robot.joint_names[i] for i in self._action_ids[:7]] != list(RIGHT_ARM) or
+                    [self.robot.joint_names[i] for i in hand_ids] != list(RIGHT_HAND)):
+                raise RLEnvironmentError("posture10 and hand7 effort mappings must be exact and disjoint")
+            gravity = tensor(self.robot.data.gravity_compensation_forces).clone()
+            hand = self._last_written_hand_effort.clone()
+            full = torch.zeros(self.num_envs, 43, device=self.device, dtype=gravity.dtype)
+            if (tuple(gravity.shape) != (self.num_envs, 43) or
+                    tuple(hand.shape) != (self.num_envs, 7) or
+                    not bool(torch.isfinite(gravity).all()) or not bool(torch.isfinite(hand).all())):
+                # Clear all user effort before aborting; do not leave a prior
+                # finite actuation target live after a nonfinite measurement.
+                self.robot.set_joint_effort_target_index(target=full)
+                self._last_written_full_effort = full.clone()
+                self._last_written_hand_effort.zero_()
+                raise RLEnvironmentError("fresh posture gravity and hand effort must be finite full43/hand7 tensors")
+            caps = torch.tensor(declaration["feedforward_caps_nm"], device=gravity.device, dtype=gravity.dtype)
+            original = torch.tensor([actuator_specs[name]["effort_limit_nm"] for name in names],
+                                    device=gravity.device, dtype=gravity.dtype)
+            hand_caps = torch.tensor(effort_contract["actuation"]["total_torque_caps_nm"],
+                                     device=hand.device, dtype=hand.dtype)
+            if (tuple(caps.shape) != (10,) or not bool(torch.isfinite(caps).all()) or
+                    not bool(((caps > 0) & (caps <= original)).all()) or
+                    not bool((hand.abs() <= hand_caps).all())):
+                self.robot.set_joint_effort_target_index(target=full)
+                self._last_written_full_effort = full.clone()
+                self._last_written_hand_effort.zero_()
+                raise RLEnvironmentError("posture FF caps must stay within original joint caps and hand effort within total hand caps")
+            posture_ff = gravity[:, posture_ids].clamp(-caps, caps)
+            full[:, posture_ids], full[:, hand_ids] = posture_ff, hand
+            full[self._unsafe] = 0
+            # This getter reports user actuation, not isolated implicit drive
+            # torque. Read it before replacing targets for the next step.
+            previous, previous_reason = None, None
+            getter = getattr(self.robot.root_view, "get_dof_actuation_forces", None)
+            if getter is None:
+                previous_reason = "native_get_dof_actuation_forces_unavailable"
+            else:
+                try:
+                    observed = tensor(getter()).clone()
+                    if tuple(observed.shape) != (self.num_envs, 43) or not bool(torch.isfinite(observed).all()):
+                        previous_reason = "native_user_actuation_measurement_invalid_shape_or_nonfinite"
+                    else:
+                        previous = observed
+                except (AttributeError, RuntimeError, TypeError, NotImplementedError) as exc:
+                    previous_reason = type(exc).__name__+": "+str(exc)
+            native_step = int(self.sim.get_physics_step_count())
+            self.robot.set_joint_effort_target_index(target=full)
+            self._last_written_full_effort = full.clone()
+            self._last_written_hand_effort = full[:, hand_ids].clone()
+            self._posture_ff_update_count += 1
+            self._posture_ff_last_sample = native_step
+            self._write_control_probe({"event": "physics_full_effort_target", "command_id": self._control_command_id,
+                "native_physics_step_count": native_step, "episode_id": self._episode_ids,
+                "next_target_applies_after_completed_native_step": native_step,
+                "native_gravity_compensation_all43_nm": gravity,
+                "posture_joint_indices": posture_ids, "hand_joint_indices": hand_ids,
+                "posture_gravity_feedforward_contract": declaration,
+                "raw_posture_gravity_compensation_nm": gravity[:, posture_ids],
+                "applied_posture_gravity_feedforward_nm": full[:, posture_ids],
+                "next_hand_total_effort_target_nm": full[:, hand_ids],
+                "next_full43_user_effort_target_nm": full,
+                "native_previous_completed_step_user_actuation_nm": previous,
+                "native_previous_user_actuation_unavailable_reason": previous_reason,
+                "previous_measurement_in_current_episode": self._last_contact_episode_ids == self._episode_ids,
+                "unsafe_latched": self._unsafe,
+                "unused_other26_user_effort_targets_zero": True,
+                "native_implicit_pd_values_unchanged": True,
+                "combined_posture_pd_and_ff_total_not_certified_bounded": True,
+                "native_user_actuation_is_not_isolated_implicit_drive_torque": True})
+
+        def _clear_effort_targets(self, env_ids):
+            """Clear all 43 user efforts at reset, including non-hand entries."""
+            zero = torch.zeros(len(env_ids), 43, device=self.device,
+                               dtype=self._last_written_full_effort.dtype)
+            self.robot.set_joint_effort_target_index(target=zero, env_ids=env_ids)
+            self._last_written_full_effort[env_ids] = 0
+            self._last_written_hand_effort[env_ids] = 0
 
         def configure_effort_grasp(self, contract):
             from .rl_effort_protocol import validate_effort_grasp_contract
@@ -2752,9 +2850,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._targets[env_ids] = q
             self._last_written_hand_target[env_ids] = q[:, self._action_ids[7:]]
             if effort_model:
-                self._last_written_hand_effort[env_ids] = 0
-                self.robot.set_joint_effort_target_index(target=torch.zeros(n, 7, device=self.device),
-                    joint_ids=self._action_ids[7:], env_ids=env_ids)
+                self._clear_effort_targets(env_ids)
             self._last_contact_episode_ids[env_ids] = -1
             self._actions[env_ids] = 0
             self._previous_actions[env_ids] = 0
@@ -3105,9 +3201,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     historical_reset_protocol=config["rl_teacher"]["reset_protocol"],
                     original_seed_state_retained_sha256=hashlib.sha256(json.dumps(original_initial, sort_keys=True).encode()).hexdigest())
                 audit["diagnostic_effort_drive_readback"] = self._effort_drive_readback
+                audit["diagnostic_posture_gravity_feedforward"] = {
+                    "contract": copy.deepcopy(effort_contract["actuation"]["posture_gravity_feedforward"]),
+                    "source": "fresh native gravity_compensation_forces at every 2ms action application",
+                    "routing": "single full43 user effort write: arm7 plus waist3 bounded gravity FF, hand7 bounded total effort, other26 zero",
+                    "native_implicit_pd_values_unchanged": True,
+                    "combined_posture_pd_and_ff_total_not_certified_bounded": True,
+                    "native_user_actuation_measurement_is_not_isolated_implicit_drive_torque": True}
                 audit["diagnostic_material_readback"] = self._effort_material_readback
                 audit["physics_differences"].extend([
                     "right hand7 implicit PD removed; explicit current-contact-Jacobian effort with gravity included inside commanded torque cap",
+                    "right arm7 and waist3 receive separately capped fresh native gravity feedforward; original implicit PD unchanged, combined PD plus FF torque not certified bounded by FF cap",
                     "declared finger-pad compliant-contact material variant; original rigid model and strict qualification retained as separate control",
                     "explicit new geometry/reset resource and measured arm pose reference; no old trained actor loaded"])
             return audit
@@ -3131,6 +3235,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "update_calls": self._effort_update_count, "last_feedback_sample": self._effort_last_sample,
                         "declared_feedback_period_s": self.physics_dt if self._effort_grasp is not None else None,
                         "hand_position_drive_disabled": effort_model,
+                        "posture_gravity_feedforward_update_calls": self._posture_ff_update_count,
+                        "posture_gravity_feedforward_last_completed_sample": self._posture_ff_last_sample,
+                        "posture_gravity_feedforward_period_s": self.physics_dt if self._effort_grasp is not None else None,
+                        "posture_pd_plus_ff_total_torque_certified_bounded": False,
+                        "user_effort_route": "single_full43_arm7waist3FF_hand7total_other26zero" if effort_model else None,
                         "raw_samples_written": self._effort_raw_samples_written,
                         "raw_samples_omitted": self._effort_raw_samples_omitted,
                         "raw_trigger_windows_written": self._effort_raw_triggers,

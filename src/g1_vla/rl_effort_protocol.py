@@ -11,7 +11,9 @@ from copy import deepcopy
 import math
 
 
-EFFORT_GRASP_VERSION = "g1_explicit_effort_grasp_protocol_v1"
+EFFORT_GRASP_VERSION = "g1_explicit_effort_grasp_protocol_v2_posture_gravity"
+RIGHT_ARM_JOINT_NAMES = tuple("right_" + name + "_joint" for name in (
+    "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw"))
 RIGHT_HAND_JOINT_NAMES = tuple(
     "right_hand_" + name + "_joint"
     for name in ("thumb_0", "thumb_1", "thumb_2", "index_0", "index_1", "middle_0", "middle_1")
@@ -112,6 +114,14 @@ _DEFAULTS = {
         "gravity_compensation_within_total_cap": True,
         "unclipped_and_clipped_total_torque_logged": True,
         "position_target_is_not_force_limit": True,
+        "posture_gravity_feedforward": {
+            "version": "g1_native_arm7_waist3_gravity_feedforward_v1",
+            "joint_order": list(RIGHT_ARM_JOINT_NAMES) + ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
+            "feedforward_caps_nm": [25., 25., 25., 25., 25., 5., 5., 88., 50., 88.],
+            "native_pd_values_unchanged": True,
+            "combined_pd_and_ff_total_not_certified_bounded": True,
+            "unused_other26_effort_targets_zero": True,
+        },
     },
     "material": {
         "variant": "hard_v4_control",

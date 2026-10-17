@@ -205,21 +205,123 @@ class NativeEffortAdapterTests(unittest.TestCase):
             events.append("position36")
             position_calls.append(kw)
         def effort(**kw):
-            events.append("effort7")
+            events.append("effort43")
             effort_calls.append(kw)
+        def full_write():
+            effort(target=t.zeros(2, 43))
         env = SimpleNamespace(_pending_physics_sample=True, _physics_pinch=None, _effort_grasp=object(),
             _sample_physics=lambda: events.append("sample-k"),
             _update_effort_grasp=lambda: events.append("effort-from-k"),
             _action_ids=list(range(14)), _targets=t.arange(86, dtype=t.float32).reshape(2, 43),
             _last_written_hand_effort=t.full((2, 7), .01),
+            _write_effort_targets=full_write,
             robot=SimpleNamespace(set_joint_position_target_index=position, set_joint_effort_target_index=effort))
         actual_method("_apply_action", self.scope)(env)
-        self.assertEqual(events, ["sample-k", "effort-from-k", "position36", "effort7"])
+        self.assertEqual(events, ["sample-k", "effort-from-k", "position36", "effort43"])
         self.assertEqual(len(position_calls), 1)
         self.assertEqual(len(position_calls[0]["joint_ids"]), 36)
         self.assertFalse(set(position_calls[0]["joint_ids"]) & set(range(7, 14)))
-        self.assertEqual(effort_calls[0]["joint_ids"], list(range(7, 14)))
-        self.assertTrue(t.equal(effort_calls[0]["target"], env._last_written_hand_effort))
+        self.assertNotIn("joint_ids", effort_calls[0])
+        self.assertEqual(tuple(effort_calls[0]["target"].shape), (2, 43))
+
+    def full_effort_fixture(self, *, native_getter=True):
+        from g1_vla.rl_effort_protocol import RIGHT_ARM_JOINT_NAMES, RIGHT_HAND_JOINT_NAMES, effort_grasp_contract
+        t, calls, rows = self.t, [], []
+        contract = effort_grasp_contract()
+        declaration = contract["actuation"]["posture_gravity_feedforward"]
+        # A deliberately non-contiguous native order proves that names, not
+        # assumed columns in the 43-DOF tensors, determine effort routing.
+        names = ["other_joint_{}".format(i) for i in range(26)] + list(RIGHT_HAND_JOINT_NAMES) + declaration["joint_order"]
+        names = names[::2]+names[1::2]
+        arm_ids = [names.index(n) for n in RIGHT_ARM_JOINT_NAMES]
+        hand_ids = [names.index(n) for n in RIGHT_HAND_JOINT_NAMES]
+        posture_ids = [names.index(n) for n in declaration["joint_order"]]
+        caps = t.tensor(declaration["feedforward_caps_nm"])
+        gravity = t.arange(86, dtype=t.float32).reshape(2, 43)-30
+        specs = {n: {"effort_limit_nm": float(caps[i])} for i, n in enumerate(declaration["joint_order"])}
+        view = SimpleNamespace()
+        previous = t.full((2, 43), .123)
+        if native_getter:
+            view.get_dof_actuation_forces = lambda: previous
+        env = SimpleNamespace(num_envs=2, device="cpu", _action_ids=arm_ids+hand_ids,
+            _last_written_hand_effort=t.full((2, 7), .01),
+            _last_written_full_effort=t.full((2, 43), 999.),
+            _unsafe=t.tensor([False, True]), _episode_ids=t.tensor([4, 5]),
+            _last_contact_episode_ids=t.tensor([4, -1]),
+            _posture_ff_update_count=0, _posture_ff_last_sample=None, _control_command_id=3,
+            _write_control_probe=rows.append,
+            sim=SimpleNamespace(get_physics_step_count=lambda: 72),
+            robot=SimpleNamespace(joint_names=names, root_view=view,
+                data=SimpleNamespace(gravity_compensation_forces=gravity),
+                set_joint_effort_target_index=lambda **kw: calls.append(kw)))
+        scope = dict(self.scope, RIGHT_ARM=tuple(RIGHT_ARM_JOINT_NAMES), RIGHT_HAND=tuple(RIGHT_HAND_JOINT_NAMES),
+                     effort_contract=contract, actuator_specs=specs)
+        return env, calls, rows, gravity, posture_ids, hand_ids, contract, actual_method("_write_effort_targets", scope)
+
+    def test_full43_fresh_posture_ff_clips_without_stale_unused_efforts_and_masks_unsafe(self):
+        env, calls, rows, gravity, posture_ids, hand_ids, contract, method = self.full_effort_fixture()
+        t = self.t
+        method(env)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("joint_ids", calls[0])
+        applied = calls[0]["target"]
+        caps = t.tensor(contract["actuation"]["posture_gravity_feedforward"]["feedforward_caps_nm"])
+        self.assertTrue(t.equal(applied[0, posture_ids], gravity[0, posture_ids].clamp(-caps, caps)))
+        self.assertTrue(t.equal(applied[0, hand_ids], t.full((7,), .01)))
+        unused = [i for i in range(43) if i not in posture_ids+hand_ids]
+        self.assertEqual(len(unused), 26)
+        self.assertTrue((applied[:, unused] == 0).all())
+        self.assertTrue((applied[1] == 0).all(), "unsafe zeros both posture FF and hand effort")
+        self.assertTrue(t.equal(env._last_written_hand_effort, applied[:, hand_ids]))
+        self.assertEqual(rows[0]["native_physics_step_count"], 72)
+        self.assertTrue(t.equal(rows[0]["native_previous_completed_step_user_actuation_nm"], t.full((2, 43), .123)))
+        self.assertTrue(rows[0]["combined_posture_pd_and_ff_total_not_certified_bounded"])
+        self.assertEqual(env._posture_ff_update_count, 1)
+        gravity[:] = -.002
+        method(env)
+        self.assertTrue(t.equal(calls[-1]["target"][0, posture_ids], t.full((10,), -.002)), "fresh g is reread every call")
+        self.assertEqual(env._posture_ff_update_count, 2)
+
+    def test_full43_optional_native_user_actuation_readback_is_explicitly_unavailable(self):
+        env, _, rows, _, _, _, _, method = self.full_effort_fixture(native_getter=False)
+        method(env)
+        self.assertIsNone(rows[0]["native_previous_completed_step_user_actuation_nm"])
+        self.assertEqual(rows[0]["native_previous_user_actuation_unavailable_reason"], "native_get_dof_actuation_forces_unavailable")
+
+    def test_full43_nonfinite_gravity_or_hand_effort_clears_all_user_effort_before_abort(self):
+        for source in ("gravity", "hand"):
+            env, calls, _, gravity, _, _, _, method = self.full_effort_fixture()
+            if source == "gravity":
+                gravity[0, 3] = float("nan")
+            else:
+                env._last_written_hand_effort[1, 1] = float("inf")
+            with self.subTest(source=source), self.assertRaisesRegex(RuntimeError, "finite full43/hand7"):
+                method(env)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue((calls[0]["target"] == 0).all())
+
+    def test_full43_declared_posture_caps_cannot_exceed_original_and_hand_cannot_bypass_total_cap(self):
+        for source in ("posture", "hand"):
+            env, calls, _, _, _, _, contract, method = self.full_effort_fixture()
+            if source == "posture":
+                contract["actuation"]["posture_gravity_feedforward"]["feedforward_caps_nm"][0] = 26.
+            else:
+                env._last_written_hand_effort[0, 0] = .061
+            with self.subTest(source=source), self.assertRaisesRegex(RuntimeError, "caps"):
+                method(env)
+            self.assertTrue((calls[0]["target"] == 0).all())
+
+    def test_full43_reset_clears_only_selected_environments_without_partial_joint_residue(self):
+        env, calls, _, _, _, _, _, _ = self.full_effort_fixture()
+        env._last_written_hand_effort[:] = .02
+        actual_method("_clear_effort_targets", self.scope)(env, self.t.tensor([1]))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("joint_ids", calls[0])
+        self.assertEqual(tuple(calls[0]["target"].shape), (1, 43))
+        self.assertTrue((calls[0]["target"] == 0).all())
+        self.assertTrue((env._last_written_full_effort[1] == 0).all())
+        self.assertTrue((env._last_written_full_effort[0] == 999.).all())
+        self.assertTrue((env._last_written_hand_effort[1] == 0).all())
 
     def test_actual_actuator_construction_splits_hand7_from_the_original_pd36(self):
         from g1_vla.rl_effort_protocol import RIGHT_HAND_JOINT_NAMES, effort_grasp_contract
