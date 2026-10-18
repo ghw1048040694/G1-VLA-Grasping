@@ -46,6 +46,20 @@ _CONTACT_TRANSITION_CONTROL_V2.update({
     "all_current_points_separating_threshold_m_s": -1e-5,
     "separating_floor_requires_physically_loaded_current_group": True,
 })
+_CONTACT_TRANSITION_CONTROL_V3 = deepcopy(_CONTACT_TRANSITION_CONTROL)
+_CONTACT_TRANSITION_CONTROL_V3.update({
+    "version": "g1_coordinated_contact_transition_v3_relative_viscous_preload",
+    "relative_damping_mass_model": "current_hand7_principal_block_other36_fixed_diagonal_groups_v1",
+    "relative_damping_velocity_source": "current_full43_minus_cube_com_point_velocity",
+    "relative_damping_ratio": 1.0,
+    "relative_damping_force_feedback_gain": .5,
+    "relative_damping_coefficient_minimum_ns_m": .5,
+    "relative_damping_coefficient_maximum_ns_m": 64.0,
+    "relative_damping_explicit_gain_limit": 1.2,
+    "relative_damping_material_point_stiffness_n_m": 1000.0,
+    "relative_damping_material_point_damping_ns_m": .8,
+    "relative_damping_partial_blend": "one_minus_full_force_ramp_fraction",
+})
 _CONTACT_DOMAIN_POSTURE_GUARD = {
     "version": "g1_contact_domain_nullspace_posture_guard_v1",
     "hand_joint_index": 2,
@@ -60,6 +74,16 @@ _CONTACT_DOMAIN_POSTURE_GUARD = {
     "requires_original_contact_safe": True,
     "all_original_acceptance_gates_unchanged": True,
 }
+_CONTACT_DOMAIN_POSTURE_GUARD_V2 = deepcopy(_CONTACT_DOMAIN_POSTURE_GUARD)
+_CONTACT_DOMAIN_POSTURE_GUARD_V2.pop("hand_joint_index")
+_CONTACT_DOMAIN_POSTURE_GUARD_V2.update({
+    "version": "g1_contact_domain_nullspace_posture_guard_v2_common_thumb_interval",
+    "hand_joint_indices": [0, 1, 2],
+    "spring_coordinate": "unit_current_thumb_normal_world_z_nullspace_displacement_rad",
+    "control_target": "maximum_common_interior_margin_up_to_activation_margin",
+    "interval_solver": "analytic_pairwise_margin_float64_v1",
+    "minimum_component_gate_scope": "unchanged_legacy_partial_thumb2_recovery_only",
+})
 _BALANCED_DEFAULTS = {
     "version": "g1_balanced_normal_and_object_support_effort_grasp_v2",
     "kind": "explicit_joint_effort_from_current_contact_normal_jacobian",
@@ -369,8 +393,20 @@ def validate_contact_domain_posture_guard(value):
     """
     if value is None:
         return None
-    _exact(value, _CONTACT_DOMAIN_POSTURE_GUARD, "contact_domain_posture_guard")
+    expected = (_CONTACT_DOMAIN_POSTURE_GUARD_V2 if isinstance(value, dict) and
+                value.get("version") == _CONTACT_DOMAIN_POSTURE_GUARD_V2["version"]
+                else _CONTACT_DOMAIN_POSTURE_GUARD)
+    _exact(value, expected, "contact_domain_posture_guard")
     return deepcopy(value)
+
+
+def contact_domain_posture_guard_contract(version=None):
+    """Select a guard explicitly; the historical thumb2 guard is the default."""
+    if version is None or version == _CONTACT_DOMAIN_POSTURE_GUARD["version"]:
+        return deepcopy(_CONTACT_DOMAIN_POSTURE_GUARD)
+    if version == _CONTACT_DOMAIN_POSTURE_GUARD_V2["version"]:
+        return deepcopy(_CONTACT_DOMAIN_POSTURE_GUARD_V2)
+    raise ValueError("Unknown explicitly selected contact-domain guard version")
 
 
 def validate_full_lift_protocol(value):
@@ -392,15 +428,18 @@ def contact_transition_control_contract(version=None):
         return deepcopy(_CONTACT_TRANSITION_CONTROL)
     if version == _CONTACT_TRANSITION_CONTROL_V2["version"]:
         return deepcopy(_CONTACT_TRANSITION_CONTROL_V2)
+    if version == _CONTACT_TRANSITION_CONTROL_V3["version"]:
+        return deepcopy(_CONTACT_TRANSITION_CONTROL_V3)
     raise ValueError("Unknown explicitly selected contact-transition version")
 
 
 def validate_contact_transition_control(value):
     if value is None:
         return None
-    expected = (_CONTACT_TRANSITION_CONTROL_V2 if isinstance(value, dict) and
-                value.get("version") == _CONTACT_TRANSITION_CONTROL_V2["version"]
-                else _CONTACT_TRANSITION_CONTROL)
+    versions = {v["version"]: v for v in
+                (_CONTACT_TRANSITION_CONTROL, _CONTACT_TRANSITION_CONTROL_V2, _CONTACT_TRANSITION_CONTROL_V3)}
+    version = value.get("version") if isinstance(value, dict) else None
+    expected = versions.get(version, _CONTACT_TRANSITION_CONTROL) if type(version) is str else _CONTACT_TRANSITION_CONTROL
     _exact(value, expected, "contact_transition_control")
     return deepcopy(value)
 

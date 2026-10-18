@@ -2021,5 +2021,313 @@ class TaskFailureReferenceFreezeTests(unittest.TestCase):
                 self.controller.update(sample_id=self.sample, freeze_reference_by_environment=invalid, **self.kw)
 
 
+@unittest.skipUnless(TORCH, "real torch is required for current-mass relative preload damping")
+class RelativePreloadDampingTests(unittest.TestCase):
+    step = BalancedEffortGraspTests.step
+    reset_controller = ContactTransitionControlTests.reset_controller
+    VERSION = "g1_coordinated_contact_transition_v3_relative_viscous_preload"
+
+    def setUp(self):
+        ContactTransitionControlTests.setUp(self)
+        from g1_vla.rl_effort_protocol import contact_transition_control_contract
+        self.declaration = contact_transition_control_contract(self.VERSION)
+        self.kw["relative_inward_velocity_m_s"] = self.t.full((2, 3), -.01)
+        self.kw["maximum_current_point_relative_inward_velocity_m_s"] = self.t.full((2, 3), -.009)
+        self.kw["relative_velocity_current"] = self.t.ones(2, 3, dtype=self.t.bool)
+        self.kw["raw_group_force_n"][:] = self.t.tensor([.2, .1, .1])
+        cube_j = self.t.zeros(2, 3, 6)
+        cube_j[:, :, 0] = self.t.tensor([-1., 1., 1.])
+        self.state = {"hand_mass_matrix": self.t.eye(7)[None].repeat(2, 1, 1)*.0005,
+            "cube_inverse_spatial_inertia_world": self.t.diag(self.t.tensor([12.5]*3+[30000.]*3))[None].repeat(2, 1, 1),
+            "cube_normal_point_jacobian": cube_j,
+            "physical_point_count": self.t.full((2, 3), 2, dtype=self.t.long),
+            "current": self.t.ones(2, 3, dtype=self.t.bool)}
+        self.kw["relative_damping_state"] = self.state
+        self.reset_controller()
+
+    def damping(self):
+        effort, evidence, unsafe = self.step()
+        return effort, evidence["contact_transition"]["relative_preload_damping"], evidence, unsafe
+
+    def test_known_mass_formula_and_opening_velocity_generate_inward_braking(self):
+        effort, d, e, unsafe = self.damping()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(d["gate"].all())
+        h = self.a @ self.t.linalg.solve(self.state["hand_mass_matrix"], self.a.transpose(-1, -2))
+        bc = self.state["cube_normal_point_jacobian"] @ self.state["cube_inverse_spatial_inertia_world"] @ self.state["cube_normal_point_jacobian"].transpose(-1, -2)
+        self.assertTrue(self.t.allclose(d["hand_group_mobility_inverse_kg"], h, atol=1e-6, rtol=1e-6))
+        self.assertTrue(self.t.allclose(d["cube_group_mobility_inverse_kg"], bc))
+        hd, bd = h.diagonal(dim1=-2, dim2=-1), bc.diagonal(dim1=-2, dim2=-1)
+        mass, rho = 1/(hd+bd), hd/(hd+bd)
+        expected = (2*self.t.sqrt(mass*2000*(1+.5*rho))-1.6*(1+.5*rho))/rho
+        self.assertTrue(self.t.allclose(d["raw_robot_relative_damping_coefficient_ns_m"], expected, atol=1e-4, rtol=1e-6))
+        self.assertTrue(self.t.equal(d["bounded_robot_relative_damping_coefficient_ns_m"], self.t.full((2, 3), 64.)))
+        self.assertTrue(self.t.allclose(e["group_force_command_n"], self.t.tensor([[.84, .74, .74]]*2), atol=1e-6))
+        self.assertTrue((effort*self.kw["closing_axis_hand7"][None] >= 0).all())
+        self.assertNotIn("separating_preload_floor", e["contact_transition"])
+
+    def test_current_closing_motion_brakes_instead_of_using_separating_floor(self):
+        self.kw["relative_inward_velocity_m_s"][:] = .01
+        self.kw["maximum_current_point_relative_inward_velocity_m_s"][:] = .012
+        effort, d, e, _ = self.damping()
+        self.assertTrue(d["gate"].all())
+        self.assertTrue((d["applied_normal_damping_force_n"] > 0).all())
+        self.assertTrue(self.t.allclose(e["group_force_command_n"], self.t.full((2, 3), -.4), atol=1e-7))
+        self.assertTrue((effort*self.kw["closing_axis_hand7"][None] <= 0).all())
+
+    def test_active_coupled_mobility_sets_declared_explicit_gain_cap(self):
+        self.kw["inward_normal_jacobian"] *= 4
+        _, d, _, _ = self.damping()
+        self.assertTrue(d["gate"].all())
+        self.assertTrue((d["coefficient_upper_with_declared64_ns_m"] < 64).all())
+        self.assertTrue((d["applied_local_explicit_gain_dt_dmax_lambda"] <= 1.2+2e-7).all())
+        self.assertTrue((d["bounded_robot_relative_damping_coefficient_ns_m"] >= .5).all())
+
+    def test_incompatible_point5_floor_and_explicit_cap_falls_back_without_claim(self):
+        self.kw["inward_normal_jacobian"] *= 200
+        _, d, e, _ = self.damping()
+        self.assertFalse(d["gate"].any())
+        self.assertFalse(d["original_point5_lower_bound_compatible_with_gain_cap"].any())
+        self.assertTrue(self.t.equal(d["applied_normal_damping_force_n"], d["original_hand7_damping_force_n"]))
+        self.assertTrue(self.t.equal(e["group_force_command_n"], self.kw["raw_group_force_n"]))
+
+    def test_each_current_gate_and_unknown_velocity_uses_original_law(self):
+        for name in ("current", "relative_velocity_current", "group_physical_loaded", "group_contact_valid"):
+            with self.subTest(gate=name):
+                target = self.state[name] if name == "current" else self.kw[name]
+                target[0, 1] = False
+                _, d, _, _ = self.damping()
+                self.assertFalse(d["gate"][0, 1])
+                target[0, 1] = True
+        for name in ("tracking", "unsafe_latched", "contact_measurement_valid"):
+            original = self.kw[name].clone()
+            self.kw[name][0] = name == "unsafe_latched"
+            _, d, _, _ = self.damping()
+            self.assertFalse(d["gate"][0].any(), name)
+            self.kw[name] = original
+        self.kw["relative_inward_velocity_m_s"][0, 1] = float("nan")
+        _, d, _, _ = self.damping()
+        self.assertFalse(d["gate"][0, 1])
+        self.assertTrue(self.t.isfinite(d["applied_normal_damping_force_n"]).all())
+
+    def test_nan_non_spd_or_asymmetric_mass_falls_back_per_environment(self):
+        for name in ("hand_mass_matrix", "cube_inverse_spatial_inertia_world"):
+            original = self.state[name].clone()
+            for kind in ("nan", "negative", "asymmetric"):
+                self.state[name] = original.clone()
+                if kind == "nan": self.state[name][0, 0, 0] = float("nan")
+                elif kind == "negative": self.state[name][0, 0, 0] = -1
+                else: self.state[name][0, 0, 1] = .01
+                _, d, _, unsafe = self.damping()
+                self.assertFalse(unsafe.any())
+                self.assertFalse(d["gate"][0].any(), (name, kind))
+                self.assertTrue(d["gate"][1].all())
+                self.assertTrue(self.t.equal(d["applied_normal_damping_force_n"][0], d["original_hand7_damping_force_n"][0]))
+            self.state[name] = original
+        self.state["physical_point_count"][0, 1] = 0
+        self.state["cube_normal_point_jacobian"][0, 2, 0] = float("nan")
+        _, d, _, _ = self.damping()
+        self.assertEqual(d["gate"][0].tolist(), [True, False, False])
+
+    def test_ramp_blends_force_continuously_and_full_ramp_is_exactly_old(self):
+        self.kw["measured_hand_velocity_rad_s"][:] = .1
+        self.controller.preload_settle_count[:] = 25
+        self.controller.preload_ramp_sample_count[:] = 24
+        _, d, e, _ = self.damping()
+        self.assertTrue(self.t.allclose(d["relative_damping_blend_fraction"], self.t.full((2,), .5)))
+        expected = .5*d["bounded_robot_relative_damping_coefficient_ns_m"]*self.kw["relative_inward_velocity_m_s"]+.5*d["original_hand7_damping_force_n"]
+        self.assertTrue(self.t.equal(d["applied_normal_damping_force_n"], expected))
+        self.controller.preload_ramp_sample_count[:] = 49
+        _, d, e, _ = self.damping()
+        self.assertFalse(d["gate"].any())
+        self.assertTrue(self.t.equal(d["applied_normal_damping_force_n"], d["original_hand7_damping_force_n"]))
+        expected = (e["group_force_target_n"]+.5*(e["group_force_target_n"]-self.kw["raw_group_force_n"])-.5*e["inward_velocity_m_s"]).clamp(-.4, 1.2)
+        self.assertTrue(self.t.equal(e["group_force_command_n"], expected))
+
+    def test_overforce_priority_and_common_torque_caps_are_unchanged(self):
+        self.kw["raw_group_force_n"][0, 1] = 1.5001
+        self.kw["gravity_hand_nm"][:] = .035
+        self.kw["object_support_torque_nm"] = self.t.full((2, 7), .02)
+        effort, d, e, unsafe = self.damping()
+        self.assertFalse(unsafe.any())
+        self.assertFalse(d["gate"][0].any())
+        self.assertAlmostEqual(float(e["group_force_command_n"][0, 1]), -.4, places=7)
+        self.assertTrue((effort[0, 3:5] < 0).all())
+        self.assertTrue((effort.abs() <= e["total_torque_caps_nm"]).all())
+        self.assertTrue((e["non_gravity_common_scale"] <= 1).all())
+
+    def test_duplicate_reset_and_unknown_state_do_not_reuse_mass_or_integrate(self):
+        effort, _, _, _ = self.damping()
+        self.state["current"][:] = False
+        old_reference = self.controller.reference.clone()
+        duplicate, e, _ = self.controller.update(sample_id=self.sample-1, **self.kw)
+        self.assertTrue(self.t.equal(duplicate, effort))
+        self.assertTrue(self.t.equal(self.controller.reference, old_reference))
+        self.assertFalse(e["contact_transition"]["relative_preload_damping"]["gate"].any())
+        self.kw["episode_id"] = self.ids+1
+        _, d, _, _ = self.damping()
+        self.assertFalse(d["gate"].any())
+        self.kw["relative_damping_state"] = None
+        _, d, _, _ = self.damping()
+        self.assertFalse(d["state_supplied"])
+        self.assertFalse(d["gate"].any())
+
+    def test_schema_dtype_and_exact_declaration_are_checked(self):
+        for name in self.state:
+            changed = dict(self.state); changed.pop(name)
+            self.kw["relative_damping_state"] = changed
+            with self.subTest(missing=name), self.assertRaises(ValueError): self.damping()
+        for name in self.state:
+            changed = dict(self.state); changed[name] = self.t.zeros(2, 3)
+            self.kw["relative_damping_state"] = changed
+            with self.subTest(shape=name), self.assertRaises(ValueError): self.damping()
+        self.kw["relative_damping_state"] = self.state
+        from g1_vla.rl_effort_protocol import contact_transition_control_contract, validate_contact_transition_control
+        self.assertNotIn("separating_preload_command_floor_n", self.declaration)
+        self.assertNotIn("relative_damping_mass_model", contact_transition_control_contract())
+        for key, value in (("relative_damping_ratio", .7), ("relative_damping_coefficient_maximum_ns_m", 65.),
+                           ("relative_damping_explicit_gain_limit", 1.3)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_contact_transition_control(dict(self.declaration, **{key: value}))
+
+
+@unittest.skipUnless(TORCH, "real torch is required for common thumb-domain geometry")
+class CommonThumbIntervalGuardTests(unittest.TestCase):
+    step = BalancedEffortGraspTests.step
+    VERSION = "g1_contact_domain_nullspace_posture_guard_v2_common_thumb_interval"
+
+    def setUp(self):
+        BalancedEffortGraspTests.setUp(self)
+        from g1_vla.rl_effort_protocol import contact_domain_posture_guard_contract
+        self.declaration = contact_domain_posture_guard_contract(self.VERSION)
+        self.null = self.t.tensor([-48., 9., 25.]); self.null /= self.t.linalg.vector_norm(self.null)
+        self.point = self.t.zeros(2, 3, 3, 7)
+        self.set_null(self.null)
+        self.lower = self.t.full((2, 7), -.2)
+        self.upper = self.t.full((2, 7), .2)
+        self.lower[:, :3] = self.t.tensor([-.018, .000006, -.0097])
+        self.kw.update(contact_point_jacobian_world_m=self.point,
+            actual_domain_lower_hand_rad=self.lower, actual_domain_upper_hand_rad=self.upper,
+            physical_contact_safe=self.t.ones(2, dtype=self.t.bool))
+        self.make_controller()
+
+    def set_null(self, null):
+        first = self.t.linalg.cross(null, self.t.tensor([0., 0., 1.]))
+        if float(first.abs().max()) == 0: first = self.t.tensor([1., 0., 0.])
+        first /= self.t.linalg.vector_norm(first)
+        second = self.t.linalg.cross(null, first); second /= self.t.linalg.vector_norm(second)
+        self.kw["inward_normal_jacobian"][:, 0, :3] = first*.04
+        self.point[:, 0, 2, :3] = second*.03
+
+    def make_controller(self, transition=None):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        self.controller = BalancedEffortGraspController(self.t, self.seed, self.ids,
+            domain_posture_guard=self.declaration, contact_transition=transition)
+        self.sample = 0; self.step()
+
+    def guard(self):
+        effort, evidence, unsafe = self.step()
+        return effort, evidence["contact_domain_posture_guard"], evidence, unsafe
+
+    def test_recorded_thumb1_geometry_restores_common_domain_without_chasing_infeasible6mrad(self):
+        _, g, e, unsafe = self.guard()
+        self.assertFalse(unsafe.any()); self.assertTrue(g["gate"].all())
+        common = g["common_domain"]
+        expected_margin = (9*.018-48*.000006)/57
+        self.assertTrue(self.t.allclose(common["maximum_common_interior_margin_rad"],
+            self.t.full((2,), expected_margin, dtype=self.t.float64), atol=1e-9, rtol=0))
+        target = common["joint_target_thumb3_rad"]
+        self.assertTrue((target >= self.lower[:, :3]).all())
+        self.assertTrue((target <= self.upper[:, :3]).all())
+        self.assertLess(expected_margin, .006)
+        self.assertLess(-48/9*(.006+.000006), -.018, "A thumb1-only6mrad target would push thumb0 out")
+        expected_torque = self.t.tensor([-.004, .00075, .00208333333333])
+        self.assertTrue(self.t.allclose(g["guard_torque_before_total_alpha_nm"][:, :3], expected_torque[None], atol=1e-8, rtol=0))
+        self.assertTrue(g["actual_torque_nonzero_by_environment_before_total_alpha"].all())
+        self.assertLess(float(g["normal_projection_residual_m_nm"].abs().max()), 1e-9)
+        self.assertLess(float(g["world_z_projection_residual_m_nm"].abs().max()), 1e-9)
+        self.assertTrue((g["guard_torque_before_total_alpha_nm"][:, 3:] == 0).all())
+        self.assertTrue((g["nullspace_joint_components_thumb3"][:, 1] < .05).all())
+        self.assertEqual(g["legacy_partial_thumb2_minimum_component_unchanged"], .05)
+
+    def test_no_common_original_domain_direction_never_fakes_recovery(self):
+        self.lower[:, 0] = 0
+        self.lower[:, 1] = .001
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["common_domain"]["base_original_domain_intersection_feasible"].any())
+        self.assertFalse(g["gate"].any())
+        self.assertTrue((g["guard_torque_before_total_alpha_nm"] == 0).all())
+
+    def test_null_sign_zero_components_and_already_interior_are_handled_without_division(self):
+        from g1_vla.rl_hand_control import _common_thumb_domain_interval
+        q = self.t.tensor([[-.099, 0., 0.]], dtype=self.t.float64)
+        low = self.t.tensor([[-.1, -.003, -.1]], dtype=self.t.float64)
+        high = -low
+        null = self.t.tensor([[1., 0., 0.]], dtype=self.t.float64)
+        s, a = _common_thumb_domain_interval(self.t, q, low, high, null, .006)
+        r, b = _common_thumb_domain_interval(self.t, q, low, high, -null, .006)
+        self.assertTrue(a["common_interval_feasible"].all())
+        self.assertAlmostEqual(float(s[0]), .002, places=11)
+        self.assertTrue(self.t.equal(s[:, None]*null, r[:, None]*-null))
+        self.assertTrue(self.t.equal(a["joint_target_thumb3_rad"], b["joint_target_thumb3_rad"]))
+        q[0, 1] = -.004
+        _, a = _common_thumb_domain_interval(self.t, q, low, high, null, .006)
+        self.assertFalse(a["base_original_domain_intersection_feasible"].any())
+        self.lower[:] = -.2
+        _, g, _, _ = self.guard()
+        self.assertTrue(g["gate"].all())
+        self.assertTrue((g["guard_torque_before_total_alpha_nm"] == 0).all())
+
+    def test_original_current_gates_and_rank_are_still_required(self):
+        for name in ("tracking", "physical_contact_safe", "group_physical_loaded", "group_contact_valid", "unsafe_latched"):
+            original = self.kw[name].clone()
+            self.kw[name][0] = name == "unsafe_latched"
+            _, g, _, _ = self.guard()
+            self.assertFalse(g["gate"][0], name)
+            self.kw[name] = original
+        old = self.point.clone(); self.point[0, 0, 2, :3] = self.kw["inward_normal_jacobian"][0, 0, :3]
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["rank_supported"][0]); self.assertFalse(g["gate"][0])
+        self.point[:] = old; self.point[0, 0, 2, 0] = float("nan")
+        _, g, _, _ = self.guard(); self.assertFalse(g["gate"][0])
+
+    def test_overforce_and_common_total_cap_do_not_receive_a_guard_bypass(self):
+        self.kw["gravity_hand_nm"][:] = .035
+        self.kw["object_support_torque_nm"] = self.t.full((2, 7), .02)
+        effort, g, e, _ = self.guard()
+        self.assertTrue((effort.abs() <= e["total_torque_caps_nm"]).all())
+        self.assertTrue((e["non_gravity_common_scale"] < 1).all())
+        applied = g["guard_component_for_current_new_command_nm"]
+        residual = self.t.einsum("nri,ni->nr", g["current_normal_world_z_jacobian_m"], applied[:, :3])
+        self.assertLess(float(residual.abs().max()), 1e-9)
+        self.kw["raw_group_force_n"][:, 1] = 2.
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["gate"].any())
+        self.assertTrue((g["guard_component_for_current_new_command_nm"] == 0).all())
+
+    def test_partial_thumb2_recovery_retains_original_point05_authority_gate(self):
+        from g1_vla.rl_effort_protocol import contact_transition_control_contract
+        null = self.t.tensor([.7, .7, .1]); null /= self.t.linalg.vector_norm(null)
+        self.set_null(null)
+        self.kw["group_physical_loaded"][:, 1] = False
+        self.kw["measured_hand_rad"][:, 2] = self.lower[:, 2]+.001
+        self.make_controller(contact_transition_control_contract())
+        _, g, e, _ = self.guard()
+        self.assertFalse(g["gate"].any())
+        partial = e["contact_transition"]["thumb_domain_recovery"]
+        self.assertTrue((partial["projection_thumb2_component"] < .05).all())
+        self.assertFalse(partial["partial_contact_projection_gate"].any())
+
+    def test_guard_declaration_is_explicit_deepcopied_and_keeps_v1_default(self):
+        from g1_vla.rl_effort_protocol import contact_domain_posture_guard_contract, validate_contact_domain_posture_guard
+        self.assertEqual(contact_domain_posture_guard_contract(), ContactDomainPostureGuardTests.DECLARATION)
+        for key, value in (("activation_margin_rad", .01), ("maximum_guard_joint_torque_nm", .008),
+                           ("minimum_nullspace_joint_component", .02)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_contact_domain_posture_guard(dict(self.declaration, **{key: value}))
+        changed = contact_domain_posture_guard_contract(self.VERSION); changed["hand_joint_indices"][0] = 6
+        self.assertEqual(contact_domain_posture_guard_contract(self.VERSION)["hand_joint_indices"], [0, 1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()

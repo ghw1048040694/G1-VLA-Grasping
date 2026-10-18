@@ -40,6 +40,8 @@ from g1_vla.rl_environment import (
     consecutive_window_samples,
     control_probe_profile,
     current_relative_contact_motion,
+    native_relative_damping_state,
+    reconstruct_native_hand_inertia,
     revalidated_native_arm_substep,
     RIGHT_ARM,
     RIGHT_HAND,
@@ -809,7 +811,9 @@ class RelativeContactMotionTests(unittest.TestCase):
         node=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name=="_effort_contact_geometry")
         scope={"torch":t,"tensor":lambda value:value,"RLEnvironmentError":RLEnvironmentError,
             "settings":{"contact_offset_m":0.,"max_abs_normal_z":.6},
-            "current_relative_contact_motion":current_relative_contact_motion}
+            "current_relative_contact_motion":current_relative_contact_motion,
+            "native_relative_damping_state":native_relative_damping_state,
+            "reconstruct_native_hand_inertia":reconstruct_native_hand_inertia}
         exec(compile(ast.Module(body=[node],type_ignores=[]),"<actual-relative-motion-adapter>","exec"),scope)
         jac=t.zeros(1,8,6,43);jac[:,:7]=v["link_jacobian_world"]
         positions=t.zeros(1,9,3);positions[:,1:8]=v["link_position_world"]
@@ -868,7 +872,11 @@ class RelativeContactMotionTests(unittest.TestCase):
         exec(compile(ast.Module(body=[node],type_ignores=[]),"<actual-relative-motion-forward>","exec"),scope)
         def update(**values):
             calls.append(values)
-            return t.zeros(1,7),{"group_force_command_n":t.zeros(1,3)},t.zeros(1,dtype=t.bool)
+            evidence={"group_force_command_n":t.zeros(1,3)}
+            if "relative_damping_state" in values:
+                evidence["contact_transition"]={"relative_preload_damping":{
+                    "actual_enabled_by_group":values["relative_damping_state"]["current"].clone()}}
+            return t.zeros(1,7),evidence,t.zeros(1,dtype=t.bool)
         ids=t.tensor([2]);quat=t.zeros(1,9,4);quat[...,3]=1
         motion={"available":True,"episode_id":ids.clone(),"native_step":9,
             "relative_velocity_current":t.tensor([[True,False,True]]),
@@ -915,6 +923,28 @@ class RelativeContactMotionTests(unittest.TestCase):
         motion["available"]=False
         method(env)
         self.assertNotIn("relative_velocity_current",calls[-1])
+        motion.update(available=True,episode_id=ids.clone(),native_step=9)
+        env._effort_geometry.update(episode_id=ids.clone(),native_step=9)
+        damping={"available":True,"episode_id":ids.clone(),"native_step":9,
+            "hand_mass_matrix":t.eye(7)[None],"cube_inverse_spatial_inertia_world":t.eye(6)[None],
+            "cube_normal_point_jacobian":t.zeros(1,3,6),"physical_point_count":t.ones(1,3,dtype=t.int64),
+            "current":t.ones(1,3,dtype=t.bool)}
+        env._effort_geometry["relative_damping_state"]=damping
+        method(env)
+        self.assertNotIn("relative_damping_state",calls[-1],"v2 cannot request a new inertia input")
+        env._effort_contact_transition["version"]="g1_coordinated_contact_transition_v3_relative_viscous_preload"
+        method(env)
+        self.assertEqual(calls[-1]["relative_damping_state"]["current"].tolist(),[[True,False,True]])
+        self.assertEqual(env._effort_actual_relative_damping_group_samples.tolist(),[[1,0,1]])
+        for key in ("episode_id","native_step"):
+            damping[key]=ids+1 if key=="episode_id" else 8
+            method(env)
+            self.assertFalse(calls[-1]["relative_damping_state"]["current"].any())
+            damping[key]=ids.clone() if key=="episode_id" else 9
+        self.assertEqual(env._effort_actual_relative_damping_group_samples.tolist(),[[1,0,1]],"Duplicate/native-stale inputs never inflate the cumulative enabled count")
+        motion["available"]=False
+        method(env)
+        self.assertFalse(calls[-1]["relative_damping_state"]["current"].any())
         env._keep_current_hand_force_on_full_failure=True
         env._full_lift=SimpleNamespace(failed=t.tensor([False]))
         method(env)
@@ -1000,6 +1030,147 @@ class RelativeContactMotionTests(unittest.TestCase):
         self.assertAlmostEqual(motion["relative_inward_velocity_m_s"][0,0].item(),expected,places=7)
         recomputed=t.einsum("ngi,ni->ng",raw["group_weighted_normal_jacobian_full43_m"],v["joint_velocity_full43"])
         self.assertTrue(t.allclose(recomputed,motion["weighted_finger_inward_velocity_m_s"],atol=1e-8,rtol=0))
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "Native inertia adapters require real Torch")
+class NativeRelativeDampingStateTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        self.t=torch;t=torch
+        j=t.zeros(1,9,6,43)
+        for i in range(7):j[0,i+1,5,i+7]=1
+        quat=t.zeros(1,9,4);quat[...,3]=1
+        com=t.zeros(1,9,7);com[...,0]=.1;com[...,6]=1
+        mass=t.eye(43)[None]*.01
+        for i in range(7,14):mass[0,i,i]=.006
+        armature=t.zeros(1,43);armature[:,7:14]=.001
+        self.inertia=dict(link_jacobian_world_full43=j,link_quaternion_xyzw=quat,
+            body_mass_kg=t.full((1,9),.2),body_inertia_prim_column_major=(t.eye(3)*.004).reshape(1,1,9).repeat(1,9,1),
+            body_com_local_pose=com,native_mass_matrix_full43=mass,native_armature_full43=armature,
+            hand_body_ids=list(range(1,8)),hand_joint_ids=list(range(7,14)))
+        self.state=dict(hand_mass_matrix=t.eye(7)[None]*.007,hand_armature=t.zeros(1,7),
+            cube_mass_kg=t.tensor([[.08]]),cube_inertia_prim_column_major=t.diag(t.tensor([.002,.003,.004])).reshape(1,9),
+            cube_link_quaternion_xyzw=t.tensor([[0.,0.,math.sqrt(.5),math.sqrt(.5)]]),
+            cube_normal_point_jacobian=t.zeros(1,3,6),physical_point_count=t.ones(1,3,dtype=t.int64),
+            relative_velocity_current=t.ones(1,3,dtype=t.bool))
+
+    def test_native_rigid_com_offset_reconstruction_classifies_excluded_and_included_armature_once(self):
+        t=self.t;v=self.inertia
+        dynamic,current,e=reconstruct_native_hand_inertia(t,**v)
+        self.assertTrue(current.all());self.assertTrue(t.allclose(dynamic,t.eye(7)[None]*.007,atol=1e-8,rtol=0))
+        self.assertEqual(e["native_mass_classification_code"].tolist(),[1])
+        v["native_mass_matrix_full43"][:,7:14,7:14]=dynamic
+        dynamic2,current,e=reconstruct_native_hand_inertia(t,**v)
+        self.assertTrue(current.all());self.assertTrue(t.equal(dynamic2,dynamic))
+        self.assertEqual(e["native_mass_classification_code"].tolist(),[2])
+        v["native_mass_matrix_full43"][:,7:14,7:14]=t.eye(7)[None]*.05
+        _,current,e=reconstruct_native_hand_inertia(t,**v)
+        self.assertFalse(current.any());self.assertEqual(e["native_mass_classification_code"].tolist(),[0])
+
+    def test_unmodelled_body_hand_jacobian_or_nonfinite_readback_is_unknown(self):
+        t=self.t;v=self.inertia
+        v["link_jacobian_world_full43"][0,8,0,7]=.01
+        _,current,e=reconstruct_native_hand_inertia(t,**v)
+        self.assertFalse(current.any());self.assertAlmostEqual(e["other_body_hand_jacobian_max_abs"].item(),.01,places=7)
+        v["link_jacobian_world_full43"][0,8,0,7]=0
+        v["body_mass_kg"][0,3]=float("nan")
+        _,current,_=reconstruct_native_hand_inertia(t,**v)
+        self.assertFalse(current.any())
+
+    def test_cube_native_prim_inertia_rotates_to_world_without_assuming_isotropic_box(self):
+        t=self.t;state,e=native_relative_damping_state(t,**self.state)
+        self.assertTrue(state["current"].all());inverse=state["cube_inverse_spatial_inertia_world"]
+        self.assertTrue(t.allclose(inverse[0,:3,:3],t.eye(3)*12.5))
+        self.assertTrue(t.allclose(inverse[0,3:,3:],t.diag(t.tensor([1/.003,1/.002,1/.004])),atol=.0001,rtol=1e-6))
+        self.assertFalse(e["cube_inertia_isotropic_readback"].any())
+        self.state["cube_inertia_prim_column_major"]=t.eye(3).reshape(1,9)*.002
+        _,e=native_relative_damping_state(t,**self.state)
+        self.assertTrue(e["cube_inertia_isotropic_readback"].all())
+
+    def test_unknown_or_nonspd_numeric_readback_disables_proof_without_nan_state(self):
+        t=self.t
+        for key in ("hand_mass_matrix","cube_mass_kg","cube_inertia_prim_column_major","cube_link_quaternion_xyzw"):
+            with self.subTest(key=key):
+                v=copy.deepcopy(self.state);v[key].reshape(-1)[0]=float("nan")
+                state,_=native_relative_damping_state(t,**v)
+                self.assertFalse(state["current"].any())
+                for value in state.values():self.assertTrue(t.isfinite(value).all())
+        v=copy.deepcopy(self.state);v["hand_mass_matrix"].zero_()
+        state,_=native_relative_damping_state(t,**v);self.assertFalse(state["current"].any())
+        v=copy.deepcopy(self.state);v["hand_armature"][:]=.001
+        state,_=native_relative_damping_state(t,**v);self.assertFalse(state["current"].any())
+        v["hand_mass_semantics_current"]=t.ones(1,dtype=t.bool)
+        state,_=native_relative_damping_state(t,**v);self.assertTrue(state["current"].all())
+
+    def test_cube_spatial_normal_is_weighted_per_point_before_aggregation(self):
+        helper=RelativeContactMotionTests();helper.setUp();v=helper.values;t=self.t
+        v["cube_com_position_world"].zero_();v["point_world"][0,2,0]=t.tensor([0.,.01,0.])
+        v["point_world"][0,2,1]=t.tensor([.02,0.,0.]);v["inward_normal_world"][0,2,1]=t.tensor([0.,1.,0.])
+        v["control_point_valid"][0,2,1]=True;v["physical_point_loaded"][0,2,1]=True
+        v["point_weight"][0,2,0]=.25;v["point_weight"][0,2,1]=.75
+        motion,_=current_relative_contact_motion(t,**v,include_cube_point_jacobian=True)
+        expected=t.tensor([.25,.75,0.,0.,0.,.0125])
+        self.assertTrue(t.allclose(motion["cube_normal_point_jacobian"][0,0],expected))
+        original,_=current_relative_contact_motion(t,**v)
+        self.assertNotIn("cube_normal_point_jacobian",original,"Original v2 output schema is unchanged")
+
+    def test_native_v3_reads_properties_once_and_rigid_contact_group_falls_back_without_filtering_points(self):
+        helper=RelativeContactMotionTests();helper.setUp();env,hand,method=helper.geometry_adapter();t=self.t
+        env._effort_contact_transition["version"]="g1_coordinated_contact_transition_v3_relative_viscous_preload"
+        v=self.inertia;data=env.robot.data
+        data.body_link_jacobian_w=v["link_jacobian_world_full43"][:,1:]
+        data.body_quat_w=v["link_quaternion_xyzw"];data.mass_matrix=v["native_mass_matrix_full43"]
+        env.robot.body_names=["body"+str(i) for i in range(9)]
+        env.robot.joint_names=["joint"+str(i) for i in range(43)]
+        calls=[];rows=[]
+        def getter(key):
+            def get():calls.append(key);return v[key]
+            return get
+        env.robot.root_view=SimpleNamespace(get_masses=getter("body_mass_kg"),get_inertias=getter("body_inertia_prim_column_major"),
+            get_coms=getter("body_com_local_pose"),get_dof_armatures=getter("native_armature_full43"))
+        env.cube.root_view=SimpleNamespace(get_masses=lambda:t.tensor([[.08]]),get_inertias=lambda:t.eye(3).reshape(1,9)*.002)
+        env.cube.data.root_link_quat_w=t.tensor([[0.,0.,0.,1.]])
+        env._write_control_probe=rows.append
+        method(env,hand)
+        damping=env._effort_geometry["relative_damping_state"]
+        self.assertTrue(damping["available"]);self.assertTrue(damping["current"].all())
+        self.assertEqual(len(calls),4);self.assertEqual(len(rows),1)
+        self.assertEqual(env._effort_valid_mass_environment_samples.tolist(),[1])
+        self.assertEqual(env._effort_relative_motion_raw["native_mass_matrix_full43"].shape,(1,43,43))
+        hand["point"][0,0,0]=hand["point"][0,2,0]
+        hand["point_normal"][0,0,0]=hand["point_normal"][0,2,0]
+        hand["point_valid"][0,0,0]=True;hand["point_force"][0,0,0]=.1
+        method(env,hand)
+        self.assertEqual(len(calls),4);self.assertEqual(len(rows),1)
+        self.assertEqual(env._effort_valid_mass_environment_samples.tolist(),[1],"Same native/episode is counted once")
+        damping=env._effort_geometry["relative_damping_state"]
+        self.assertEqual(damping["current"].tolist(),[[False,True,True]])
+        self.assertEqual(damping["native_inertia_readback"]["nonsoft_current_control_or_physical_point_count"].tolist(),[[1,0,0]])
+        self.assertEqual(env._effort_geometry["relative_contact_motion"]["original_control_point_count"].tolist(),[[2,1,1]])
+        original=env._effort_geometry["normal_jacobian"].clone()
+        del data.mass_matrix
+        method(env,hand)
+        self.assertFalse(env._effort_geometry["relative_damping_state"]["available"])
+        self.assertTrue(env._effort_geometry["relative_contact_motion"]["available"])
+        self.assertTrue(t.equal(env._effort_geometry["normal_jacobian"],original),"Missing native inertia must retain the old normal-control geometry")
+        self.assertFalse(env._effort_native_inertia_status["available"])
+
+    def test_small_audit_exposes_only_versioned_scalar_status_without_native_getters(self):
+        helper=NativeArmTargetScheduleTests();helper.setUp();method=helper.method("_relative_damping_small_status")
+        fake=SimpleNamespace(_effort_contact_transition=None)
+        self.assertIsNone(method(fake))
+        for version in ("g1_coordinated_contact_transition_v1","g1_coordinated_contact_transition_v2_separating_preload"):
+            fake._effort_contact_transition={"version":version};self.assertIsNone(method(fake))
+        fake._effort_contact_transition={"version":"g1_coordinated_contact_transition_v3_relative_viscous_preload"}
+        self.assertEqual(method(fake)["state"],"not_measured_yet")
+        fake._effort_native_inertia_status={"available":True,"classification_code":[1],
+            "hand_mass_semantics_current":[True],"raw_sdk_minus_rigid_max_abs_kg_m2":[1e-9]}
+        fake._effort_valid_mass_environment_samples=[99]
+        fake._effort_actual_relative_damping_group_samples=[[2,3,4]]
+        result=method(fake)
+        self.assertEqual(result["valid_mass_environment_samples"],[99])
+        self.assertEqual(result["actual_relative_damping_group_environment_samples"],[[2,3,4]])
+        self.assertNotIn("hand_mass_matrix",result)
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "Torch-free host; run sparse contact tests in the native runtime")

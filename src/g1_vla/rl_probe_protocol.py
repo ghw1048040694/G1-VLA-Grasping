@@ -248,6 +248,16 @@ def validate_probe_settings(value):
             raise ValueError("Contact transition requires balanced_effort_v6 and the original-domain posture guard")
         from .rl_effort_protocol import validate_contact_transition_control
         result["contact_transition_control"] = validate_contact_transition_control(transition)
+        if "relative_damping_material_point_stiffness_n_m" in transition:
+            from .rl_effort_protocol import FINGER_BODY_NAMES, DISTAL_PAD_BODY_NAMES
+            material = effort["material"]
+            if (material["variant"] != "finger_compliant_v5" or
+                    material["compliant_contact_acceleration_spring"] is not False or
+                    material["compliant_contact_stiffness_n_m"] != transition["relative_damping_material_point_stiffness_n_m"] or
+                    material["compliant_contact_damping_ns_m"] != transition["relative_damping_material_point_damping_ns_m"] or
+                    set(material["compliance_candidate_body_names"]) != set(DISTAL_PAD_BODY_NAMES) or
+                    not (set(FINGER_BODY_NAMES)-set(DISTAL_PAD_BODY_NAMES)).issubset(material["always_rigid_body_names"])):
+                raise ValueError("Relative preload damping requires the original three compliant pads1000N/m and.8Ns/m with other finger bodies rigid")
     full_lift = result["full_lift"]
     if full_lift is not None:
         if plan != "balanced_effort_v6" or transition is None or guard is None:

@@ -422,7 +422,7 @@ def current_relative_contact_motion(torch, *, link_jacobian_world, link_position
                                     joint_velocity_full43, point_world, inward_normal_world,
                                     control_point_valid, physical_point_loaded, point_weight,
                                     cube_com_position_world, cube_com_linear_velocity_world,
-                                    cube_angular_velocity_world):
+                                    cube_angular_velocity_world, include_cube_point_jacobian=False):
     """Current point approach speed, including every robot DoF and Cube twist.
 
     Positive normal velocity closes the gap; negative velocity separates.
@@ -475,6 +475,7 @@ def current_relative_contact_motion(torch, *, link_jacobian_world, link_position
     relative = (normal*(finger_velocity-cube_velocity)).sum(-1)
     group_summaries = []
     weighted_full43 = []
+    weighted_cube6 = []
     for first,last in ((0,3),(3,5),(5,7)):
         usable = proved[:,first:last]
         original = control_point_valid[:,first:last]
@@ -509,7 +510,14 @@ def current_relative_contact_motion(torch, *, link_jacobian_world, link_position
         normal_j=(normal[:,first:last,:,:,None]*point_j).sum(-2)
         weighted_full43.append((normalized[...,None]*t.where(usable[...,None],normal_j,
             t.zeros_like(normal_j))).sum(dim=(1,2)))
+        if include_cube_point_jacobian:
+            cube_j=t.cat((normal[:,first:last],t.linalg.cross(
+                cube_offset[:,first:last],normal[:,first:last],dim=-1)),dim=-1)
+            weighted_cube6.append((normalized[...,None]*t.where(usable[...,None],cube_j,
+                t.zeros_like(cube_j))).sum(dim=(1,2)))
     summary={key:t.stack([row[key] for row in group_summaries],dim=1) for key in group_summaries[0]}
+    if include_cube_point_jacobian:
+        summary["cube_normal_point_jacobian"]=t.stack(weighted_cube6,dim=1)
     raw={"link_origin_jacobian_world_full43_m":link_jacobian_world.detach().clone(),
         "link_origin_position_world_m":link_position_world.detach().clone(),
         "joint_velocity_full43_rad_s":joint_velocity_full43.detach().clone(),
@@ -519,6 +527,140 @@ def current_relative_contact_motion(torch, *, link_jacobian_world, link_position
         "cube_com_linear_velocity_world_m_s":cube_com_linear_velocity_world.detach().clone(),
         "cube_angular_velocity_world_rad_s":cube_angular_velocity_world.detach().clone()}
     return summary,raw
+
+
+def _native_rotation_xyzw(torch,q):
+    x,y,z,w=q.unbind(-1)
+    return torch.stack((1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w),
+        2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w),
+        2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)),dim=-1).reshape(q.shape[:-1]+(3,3))
+
+
+def reconstruct_native_hand_inertia(torch, *, link_jacobian_world_full43, link_quaternion_xyzw,
+                                    body_mass_kg, body_inertia_prim_column_major, body_com_local_pose,
+                                    native_mass_matrix_full43, native_armature_full43,
+                                    hand_body_ids, hand_joint_ids):
+    """Classify the SDK hand block against independently read native rigid inertia.
+
+    Other body hand-J columns must currently vanish. The selected native body
+    parameters and COM offsets reconstruct rigid-body Mhh; actual armature is
+    added exactly once only after raw SDK Mhh matches either rigid or dynamic.
+    This does not claim arm/hand constrained contact or drive effective inertia.
+    """
+    t=torch;n,b=link_quaternion_xyzw.shape[:2];dtype=link_jacobian_world_full43.dtype
+    device=link_jacobian_world_full43.device
+    shapes=((link_jacobian_world_full43,(n,b,6,43)),(link_quaternion_xyzw,(n,b,4)),
+        (body_mass_kg,(n,b)),(body_inertia_prim_column_major,(n,b,9)),(body_com_local_pose,(n,b,7)),
+        (native_mass_matrix_full43,(n,43,43)),(native_armature_full43,(n,43)))
+    if any(not t.is_tensor(v) or tuple(v.shape)!=shape or v.dtype!=dtype or v.device!=device
+            or not v.is_floating_point() for v,shape in shapes):
+        raise ValueError("Native hand inertia reconstruction requires matching current fixed-root body tensors")
+    if len(hand_body_ids)!=7 or len(set(hand_body_ids))!=7 or len(hand_joint_ids)!=7 or len(set(hand_joint_ids))!=7:
+        raise ValueError("Native hand inertia requires the seven explicitly bound bodies and joints")
+    j=link_jacobian_world_full43[:,:,:,hand_joint_ids]
+    other=[i for i in range(b) if i not in hand_body_ids]
+    other_max=j[:,other].abs().amax(dim=(1,2,3)) if other else t.zeros(n,dtype=dtype,device=device)
+    q=link_quaternion_xyzw[:,hand_body_ids];m=body_mass_kg[:,hand_body_ids]
+    ip=body_inertia_prim_column_major[:,hand_body_ids].reshape(n,7,3,3).transpose(-1,-2)
+    com=body_com_local_pose[:,hand_body_ids,:3];jh=j[:,hand_body_ids]
+    armature=native_armature_full43[:,hand_joint_ids]
+    raw=native_mass_matrix_full43[:,hand_joint_ids][:,:,hand_joint_ids]
+    finite=t.stack([t.isfinite(v).reshape(n,-1).all(-1) for v in (j,q,m,ip,com,armature,raw)]).all(0)
+    quat_valid=(t.linalg.vector_norm(q,dim=-1)-1).abs().amax(-1)<=1e-4
+    safe=lambda v:t.where(t.isfinite(v),v,t.zeros_like(v))
+    r=_native_rotation_xyzw(t,safe(q));offset=(r@safe(com)[...,None]).squeeze(-1)
+    jw=safe(jh[:,:,3:]);jcom=safe(jh[:,:,:3])+t.linalg.cross(
+        jw.transpose(-1,-2),offset[:,:,None].expand(-1,-1,7,-1),dim=-1).transpose(-1,-2)
+    iw=r@safe(ip)@r.transpose(-1,-2)
+    rigid=(safe(m)[:,:,None,None]*(jcom.transpose(-1,-2)@jcom)+jw.transpose(-1,-2)@iw@jw).sum(1)
+    dynamic=rigid+t.diag_embed(safe(armature))
+    rigid_error=(safe(raw)-rigid).abs().amax((-1,-2))
+    dynamic_error=(safe(raw)-dynamic).abs().amax((-1,-2))
+    rigid_match=rigid_error<=1e-8+1e-3*rigid.abs().amax((-1,-2))
+    dynamic_match=dynamic_error<=1e-8+1e-3*dynamic.abs().amax((-1,-2))
+    symmetry=(ip-ip.transpose(-1,-2)).abs().amax((1,2,3))<=1e-10+1e-4*ip.abs().amax((1,2,3))
+    eye=t.eye(3,dtype=dtype,device=device)[None,None].expand(n,7,-1,-1)
+    _,info=t.linalg.cholesky_ex(t.where((finite&symmetry)[:,None,None,None],iw,eye))
+    valid=(finite&quat_valid&symmetry&(info==0).all(-1)&(m>0).all(-1)&
+        (armature>=0).all(-1)&(other_max<=1e-6)&(rigid_match|dynamic_match))
+    classification=t.zeros(n,dtype=t.int64,device=device)
+    classification=t.where(valid&rigid_match,t.ones_like(classification),classification)
+    classification=t.where(valid&dynamic_match&~rigid_match,t.full_like(classification,2),classification)
+    classification=t.where(valid&dynamic_match&rigid_match,t.full_like(classification,3),classification)
+    return dynamic,valid,{"raw_sdk_hand_mass_matrix":raw,"reconstructed_rigid_hand_mass_matrix":rigid,
+        "reconstructed_dynamic_hand_mass_matrix":dynamic,"native_hand_armature":armature,
+        "raw_sdk_minus_rigid_max_abs_kg_m2":rigid_error,"raw_sdk_minus_dynamic_max_abs_kg_m2":dynamic_error,
+        "native_mass_classification_code":classification,
+        "classification_codes":{"0":"unproved","1":"sdk_matches_rigid_armature_added_once",
+            "2":"sdk_matches_dynamic_armature_not_added_twice","3":"both_matches_within_declared_tolerance"},
+        "other_body_hand_jacobian_max_abs":other_max,"other_body_hand_jacobian_zero_tolerance":1e-6,
+        "comparison_absolute_tolerance_kg_m2":1e-8,"comparison_relative_tolerance":1e-3,
+        "hand_mass_semantics_current":valid,
+        "mass_model_scope":"native_rigid_bodies_plus_readback_joint_armature_hand7_other_DOF_held_fixed_no_drive_or_contact_inertia"}
+
+
+def native_relative_damping_state(torch, *, hand_mass_matrix, hand_armature,
+                                  cube_mass_kg, cube_inertia_prim_column_major,
+                                  cube_link_quaternion_xyzw, cube_normal_point_jacobian,
+                                  physical_point_count, relative_velocity_current, hand_mass_semantics_current=None):
+    """Prepare optional native inertia evidence; unknown numeric rows stay unknown.
+
+    Native rigid-body inertia is at COM but expressed in the body prim frame,
+    with column-major nine entries. Rotate by the actor/link world quaternion,
+    never by the differently oriented principal-inertia COM quaternion.
+    Native M's nonzero-armature semantics are not assumed here.
+    """
+    t=torch;n=hand_mass_matrix.shape[0];dtype=hand_mass_matrix.dtype;device=hand_mass_matrix.device
+    shapes=((hand_mass_matrix,(n,7,7)),(hand_armature,(n,7)),(cube_mass_kg,(n,1)),
+        (cube_inertia_prim_column_major,(n,9)),(cube_link_quaternion_xyzw,(n,4)),
+        (cube_normal_point_jacobian,(n,3,6)))
+    if any(not t.is_tensor(v) or tuple(v.shape)!=shape or v.dtype!=dtype or v.device!=device
+           or not v.is_floating_point() for v,shape in shapes):
+        raise ValueError("Native damping inertia requires matching floating tensors")
+    if (physical_point_count.shape!=(n,3) or physical_point_count.dtype not in (t.int32,t.int64) or
+            physical_point_count.device!=device or relative_velocity_current.shape!=(n,3) or
+            relative_velocity_current.dtype!=t.bool or relative_velocity_current.device!=device):
+        raise ValueError("Native damping counts/current proof require matching group tensors")
+    finite=t.stack([t.isfinite(v).reshape(n,-1).all(-1) for v,_ in shapes]).all(0)
+    safe=lambda v:t.where(t.isfinite(v),v,t.zeros_like(v))
+    mass=safe(hand_mass_matrix);inertia=safe(cube_inertia_prim_column_major).reshape(n,3,3).transpose(-1,-2)
+    eye3=t.eye(3,dtype=dtype,device=device)[None].expand(n,-1,-1)
+    eye7=t.eye(7,dtype=dtype,device=device)[None].expand(n,-1,-1)
+    symmetry=(mass-mass.transpose(-1,-2)).abs().amax((-1,-2))<=1e-7+1e-4*mass.abs().amax((-1,-2))
+    symmetry &= (inertia-inertia.transpose(-1,-2)).abs().amax((-1,-2))<=1e-10+1e-4*inertia.abs().amax((-1,-2))
+    q=safe(cube_link_quaternion_xyzw);norm=t.linalg.vector_norm(q,dim=-1)
+    quaternion_valid=(norm-1).abs()<=1e-4
+    q=t.where(quaternion_valid[:,None],q,t.tensor([0.,0.,0.,1.],dtype=dtype,device=device)[None])
+    rotation=_native_rotation_xyzw(t,q)
+    inertia_world=rotation@inertia@rotation.transpose(-1,-2)
+    _,mass_info=t.linalg.cholesky_ex(t.where((finite&symmetry)[:,None,None],mass,eye7))
+    chol,inertia_info=t.linalg.cholesky_ex(t.where((finite&symmetry)[:,None,None],inertia_world,eye3))
+    # A zero armature is unambiguous; otherwise require the independent native
+    # rigid-body reconstruction/SDK comparison supplied by the caller.
+    armature_known=(hand_armature==0).all(-1) if hand_mass_semantics_current is None else hand_mass_semantics_current
+    if (armature_known.shape!=(n,) or armature_known.dtype!=t.bool or armature_known.device!=device):
+        raise ValueError("Native hand mass semantics require matching per-environment proof")
+    valid=(finite&symmetry&quaternion_valid&(mass_info==0)&(inertia_info==0)&
+        (cube_mass_kg[:,0]>0)&armature_known)
+    inverse=t.zeros(n,6,6,dtype=dtype,device=device)
+    inverse[:,:3,:3]=eye3/cube_mass_kg[:,0].clamp_min(t.finfo(dtype).tiny)[:,None,None]
+    inverse[:,3:,3:]=t.cholesky_inverse(t.where((inertia_info==0)[:,None,None],chol,eye3))
+    inverse=t.where(valid[:,None,None],inverse,t.zeros_like(inverse))
+    current=relative_velocity_current & valid[:,None] & (physical_point_count>=0)
+    state={"hand_mass_matrix":t.where(valid[:,None,None],mass,t.zeros_like(mass)),
+        "cube_inverse_spatial_inertia_world":inverse,
+        "cube_normal_point_jacobian":safe(cube_normal_point_jacobian),
+        "physical_point_count":physical_point_count,"current":current}
+    isotropic=(inertia-(inertia.diagonal(dim1=-2,dim2=-1).mean(-1)[:,None,None]*eye3)).abs().amax((-1,-2))
+    evidence={"hand_mass_matrix_from_readback_and_reconstruction":hand_mass_matrix,"native_hand_armature":hand_armature,
+        "armature_semantics_current":armature_known,"cube_mass_readback_kg":cube_mass_kg,
+        "cube_inertia_prim_column_major_readback":cube_inertia_prim_column_major,
+        "cube_link_quaternion_xyzw":cube_link_quaternion_xyzw,"cube_inertia_world_kg_m2":inertia_world,
+        "inertia_numeric_valid":valid,"mass_spd_info":mass_info,"cube_inertia_spd_info":inertia_info,
+        "cube_inertia_isotropic_readback":isotropic<=1e-10+1e-4*inertia.abs().amax((-1,-2)),
+        "cube_inertia_frame":"native_COM_inertia_expressed_in_body_prim_frame_rotated_by_link_quaternion",
+        "raw_native_mass_armature_not_silently_added_or_assumed_included":True}
+    return state,evidence
 
 
 def revalidated_native_arm_substep(torch, *, segment_origin, macro_endpoint, previous_written,
@@ -2572,7 +2714,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 "episode_id": self._episode_ids.clone(),
                 "native_step": int(self.sim.get_physics_step_count())}
             transition = getattr(self,"_effort_contact_transition",None)
-            if transition is not None and transition.get("version")=="g1_coordinated_contact_transition_v2_separating_preload":
+            relative_viscous = (transition is not None and
+                transition.get("version")=="g1_coordinated_contact_transition_v3_relative_viscous_preload")
+            if transition is not None and transition.get("version") in (
+                    "g1_coordinated_contact_transition_v2_separating_preload",
+                    "g1_coordinated_contact_transition_v3_relative_viscous_preload"):
                 try:
                     motion,raw = current_relative_contact_motion(torch,
                         link_jacobian_world=jac[:,[i-1 for i in self._effort_hand_body_ids]],
@@ -2584,7 +2730,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         point_weight=hand["point_force"][:,:7].abs()+.001,
                         cube_com_position_world=tensor(self.cube.data.root_com_pos_w),
                         cube_com_linear_velocity_world=tensor(self.cube.data.root_com_lin_vel_w),
-                        cube_angular_velocity_world=tensor(self.cube.data.root_com_ang_vel_w))
+                        cube_angular_velocity_world=tensor(self.cube.data.root_com_ang_vel_w),
+                        **({"include_cube_point_jacobian":True} if relative_viscous else {}))
                     identity={"episode_id":self._episode_ids.clone(),
                         "native_step":int(self.sim.get_physics_step_count())}
                     self._effort_geometry["relative_contact_motion"]={**motion,**identity,
@@ -2593,6 +2740,93 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "point_weight_semantics":"unchanged_abs_raw_Fn_plus_0p001_over_original_control_points",
                         "all_physical_loaded_points_must_have_current_motion_proof":True}
                     self._effort_relative_motion_raw={**raw,**identity}
+                    if relative_viscous:
+                        try:
+                            mass43=tensor(self.robot.data.mass_matrix)
+                            if tuple(mass43.shape)!=(point.shape[0],43,43):
+                                raise ValueError("Native fixed-root mass matrix must be N by43 by43")
+                            hand_ids=self._action_ids[7:]
+                            def matching_native(value):
+                                return tensor(value).to(device=mass43.device,dtype=mass43.dtype)
+                            properties=getattr(self,"_effort_native_inertial_properties",None)
+                            if properties is None:
+                                properties={"robot_body_mass_kg":matching_native(self.robot.root_view.get_masses()).clone(),
+                                    "robot_body_inertia_prim_column_major":matching_native(self.robot.root_view.get_inertias()).clone(),
+                                    "robot_body_com_local_pose":matching_native(self.robot.root_view.get_coms()).clone(),
+                                    "robot_armature_full43":matching_native(self.robot.root_view.get_dof_armatures()).clone(),
+                                    "cube_mass_kg":matching_native(self.cube.root_view.get_masses()).clone(),
+                                    "cube_inertia_prim_column_major":matching_native(self.cube.root_view.get_inertias()).clone()}
+                                expected={"robot_body_mass_kg":(mass43.shape[0],self.robot.num_bodies),
+                                    "robot_body_inertia_prim_column_major":(mass43.shape[0],self.robot.num_bodies,9),
+                                    "robot_body_com_local_pose":(mass43.shape[0],self.robot.num_bodies,7),
+                                    "robot_armature_full43":(mass43.shape[0],43),"cube_mass_kg":(mass43.shape[0],1),
+                                    "cube_inertia_prim_column_major":(mass43.shape[0],9)}
+                                if any(properties[key].shape!=shape for key,shape in expected.items()):
+                                    raise ValueError("Native inertia/property buffers do not match the verified body/joint order")
+                                self._effort_native_inertial_properties=properties
+                                self._write_control_probe({"event":"native_relative_damping_inertial_readback",
+                                    **identity,"read_only_static_native_properties":properties,
+                                    "robot_body_names":self.robot.body_names,"robot_joint_names":self.robot.joint_names,
+                                    "robot_hand_body_ids":self._effort_hand_body_ids,"robot_hand_joint_ids":hand_ids,
+                                    "inertia_frame":"COM_inertia_expressed_in_body_prim_frame_column_major9",
+                                    "properties_reused_only_with_unchanged_native_model":True,
+                                    "physical_parameter_writes":0})
+                            armature=properties["robot_armature_full43"]
+                            full_j=torch.cat((torch.zeros_like(jac[:,:1]),jac),dim=1)
+                            dynamic,mass_current,reconstruction=reconstruct_native_hand_inertia(torch,
+                                link_jacobian_world_full43=full_j,
+                                link_quaternion_xyzw=tensor(self.robot.data.body_quat_w),
+                                body_mass_kg=properties["robot_body_mass_kg"],
+                                body_inertia_prim_column_major=properties["robot_body_inertia_prim_column_major"],
+                                body_com_local_pose=properties["robot_body_com_local_pose"],
+                                native_mass_matrix_full43=mass43,native_armature_full43=armature,
+                                hand_body_ids=self._effort_hand_body_ids,hand_joint_ids=hand_ids)
+                            damping,damping_evidence=native_relative_damping_state(torch,
+                                hand_mass_matrix=dynamic,
+                                hand_armature=armature[:,hand_ids],
+                                hand_mass_semantics_current=mass_current,
+                                cube_mass_kg=properties["cube_mass_kg"],
+                                cube_inertia_prim_column_major=properties["cube_inertia_prim_column_major"],
+                                cube_link_quaternion_xyzw=matching_native(self.cube.data.root_link_quat_w),
+                                cube_normal_point_jacobian=motion["cube_normal_point_jacobian"],
+                                physical_point_count=motion["physical_loaded_point_count"],
+                                relative_velocity_current=motion["relative_velocity_current"])
+                            physical_points=(hand["point_valid"][:,:7] &
+                                (hand["point_force"][:,:7].abs()>0) & (hand["separation"][:,:7]<=0))
+                            rigid_point_counts=[]
+                            for first,last,pad in ((0,3,2),(3,5,4),(5,7,6)):
+                                rigid=[index for index in range(first,last) if index!=pad]
+                                rigid_point_counts.append((valid[:,rigid] | physical_points[:,rigid]).sum((1,2)))
+                            nonsoft=torch.stack(rigid_point_counts,dim=1)
+                            damping["current"] &= nonsoft==0
+                            damping_evidence.update(reconstruction)
+                            damping_evidence.update(nonsoft_current_control_or_physical_point_count=nonsoft,
+                                all_group_points_use_declared_soft_pad=nonsoft==0,
+                                declared_soft_hand_body_indices=[2,4,6])
+                            self._effort_geometry["relative_damping_state"]={**damping,**identity,
+                                "available":True,"native_inertia_readback":damping_evidence}
+                            self._effort_native_inertia_status={**identity,"available":True,
+                                "classification_code":reconstruction["native_mass_classification_code"],
+                                "hand_mass_semantics_current":mass_current,
+                                "group_state_current":damping["current"],
+                                "raw_sdk_minus_rigid_max_abs_kg_m2":reconstruction["raw_sdk_minus_rigid_max_abs_kg_m2"],
+                                "raw_sdk_minus_dynamic_max_abs_kg_m2":reconstruction["raw_sdk_minus_dynamic_max_abs_kg_m2"]}
+                            old_count_ids=getattr(self,"_effort_mass_counted_episode_ids",None)
+                            unique=(torch.ones_like(self._episode_ids,dtype=torch.bool) if
+                                getattr(self,"_effort_mass_counted_native_step",None)!=identity["native_step"] or old_count_ids is None
+                                else old_count_ids!=self._episode_ids)
+                            self._effort_valid_mass_environment_samples=getattr(self,
+                                "_effort_valid_mass_environment_samples",torch.zeros_like(self._episode_ids))+(mass_current&unique).to(torch.int64)
+                            self._effort_mass_counted_episode_ids=self._episode_ids.clone()
+                            self._effort_mass_counted_native_step=identity["native_step"]
+                            self._effort_relative_motion_raw["native_mass_matrix_full43"]=mass43.detach().clone()
+                            self._effort_relative_motion_raw["native_armature_full43"]=armature.detach().clone()
+                        except (AttributeError,TypeError,ValueError,RuntimeError) as exc:
+                            self._effort_geometry["relative_damping_state"]={**identity,"available":False,
+                                "unavailable_reason":type(exc).__name__+": "+str(exc),
+                                "fallback":"original_unmodified_hand7_normal_feedback"}
+                            self._effort_native_inertia_status={**identity,"available":False,
+                                "unavailable_reason":type(exc).__name__+": "+str(exc)}
                 except (AttributeError,TypeError,ValueError,RuntimeError) as exc:
                     # An optional motion proof cannot invalidate successful
                     # original force/geometry reads or fabricate separation.
@@ -2689,6 +2923,18 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "maximum_current_point_relative_inward_velocity_m_s":torch.where(motion_current,
                         motion["maximum_current_point_relative_inward_velocity_m_s"],
                         torch.zeros_like(motion["maximum_current_point_relative_inward_velocity_m_s"]))}
+            damping_feedback={}
+            damping=geometry.get("relative_damping_state") if geometry is not None else None
+            if (getattr(self,"_effort_contact_transition",None) is not None and
+                    self._effort_contact_transition.get("version")=="g1_coordinated_contact_transition_v3_relative_viscous_preload" and
+                    damping is not None and damping.get("available") is True):
+                damping_fresh=(damping["episode_id"]==self._episode_ids)&(damping["native_step"]==native_step)
+                damping_current=(damping["current"] & relative_feedback.get("relative_velocity_current",
+                    torch.zeros_like(current)) & current & fresh[:,None] & damping_fresh[:,None])
+                damping_feedback["relative_damping_state"]={key:damping[key] for key in (
+                    "hand_mass_matrix","cube_inverse_spatial_inertia_world","cube_normal_point_jacobian",
+                    "physical_point_count")}
+                damping_feedback["relative_damping_state"]["current"]=damping_current
             failure_feedback={}
             if (getattr(self,"_keep_current_hand_force_on_full_failure",False) and
                     bool(self._full_lift.failed.any())):
@@ -2706,8 +2952,21 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 nominal_velocity_limit_hand_rad_s=self._velocity[7:][None].expand_as(q),
                 penetration_m=metrics.get("maximum_penetration_m", torch.zeros(self.num_envs, device=self.device)),
                 closing_axis_hand7=ref["closing_axis_hand7"], object_support_torque_nm=support_torque,
-                **guard_feedback, **relative_feedback, **failure_feedback)
+                **guard_feedback, **relative_feedback, **damping_feedback, **failure_feedback)
             self._unsafe |= unsafe
+            if (getattr(self,"_effort_contact_transition",None) is not None and
+                    self._effort_contact_transition.get("version")=="g1_coordinated_contact_transition_v3_relative_viscous_preload"):
+                damping_evidence=evidence.get("contact_transition",{}).get("relative_preload_damping",{})
+                enabled=damping_evidence.get("actual_enabled_by_group")
+                if torch.is_tensor(enabled) and enabled.shape==(self.num_envs,3) and enabled.dtype==torch.bool:
+                    old_ids=getattr(self,"_effort_damping_counted_episode_ids",None)
+                    unique=(torch.ones_like(self._episode_ids,dtype=torch.bool) if
+                        getattr(self,"_effort_damping_counted_native_step",None)!=native_step or old_ids is None
+                        else old_ids!=self._episode_ids)
+                    self._effort_actual_relative_damping_group_samples=getattr(self,
+                        "_effort_actual_relative_damping_group_samples",torch.zeros_like(enabled,dtype=torch.int64))+(enabled&unique[:,None]).to(torch.int64)
+                    self._effort_damping_counted_episode_ids=self._episode_ids.clone()
+                    self._effort_damping_counted_native_step=native_step
             self._last_written_hand_effort = effort.clone()
             self._effort_update_count += 1
             self._effort_last_sample = native_step
@@ -3951,6 +4210,15 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._record.write(json.dumps(_json_finite(_probe_payload(torch, row)),
                                               ensure_ascii=False, allow_nan=False) + "\n")
 
+        def _relative_damping_small_status(self):
+            transition=getattr(self,"_effort_contact_transition",None)
+            if transition is None or transition.get("version")!="g1_coordinated_contact_transition_v3_relative_viscous_preload":
+                return None
+            return {**getattr(self,"_effort_native_inertia_status",{"available":False,"state":"not_measured_yet"}),
+                "valid_mass_environment_samples":getattr(self,"_effort_valid_mass_environment_samples",0),
+                "actual_relative_damping_group_environment_samples":getattr(self,"_effort_actual_relative_damping_group_samples",0),
+                "scope":"small_read_only_summary_no_additional_native_queries_or_large_matrices"}
+
         def runtime_audit(self):
             audit = {"environment_version": ENVIRONMENT_VERSION, "settings": dict(settings),
                     "policy_contract": {"environment_version": ENVIRONMENT_VERSION,
@@ -4081,6 +4349,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "right arm7 and waist3 receive separately capped fresh native gravity feedforward; original implicit PD unchanged, combined PD plus FF torque not certified bounded by FF cap",
                     "declared finger-pad compliant-contact material variant; original rigid model and strict qualification retained as separate control",
                     "explicit new geometry/reset resource and measured arm pose reference; no old trained actor loaded"])
+            damping_status=self._relative_damping_small_status()
+            if damping_status is not None:
+                audit["relative_damping_native_status"]=damping_status
             return _json_finite(_probe_payload(torch, audit))
 
         def step_audit(self):
@@ -4137,6 +4408,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "control_guard_unsafe_count": self._control_guard_unsafe_count,
                         "shield_count_semantics": "legacy applied scalar<1; projected actual target correction nonzero"}
                        if self._control_probe_enabled else {})}
+            damping_status=self._relative_damping_small_status()
+            if damping_status is not None:
+                audit["relative_damping_native_status"]=damping_status
             return _json_finite(_probe_payload(torch, audit))
 
         def close(self):

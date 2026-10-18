@@ -751,6 +751,142 @@ def _balanced_effort_contract_and_parameters(parameters):
     return copy.deepcopy(contract), copy.deepcopy(contract["parameters"])
 
 
+def _common_thumb_domain_interval(t, q, lower, upper, null, maximum_margin):
+    """Nine pairwise inequalities solve a one-dimensional common-domain LP.
+
+    The tiny tensors use float64: float32 cancellation at an optimal margin
+    can reverse the reconstructed feasible interval by several microradians.
+    A conservative float64 roundoff inset changes the control target only;
+    original physical domain bounds and acceptance are never relaxed.
+    """
+    qd, ld, ud, nd = (value.to(t.float64) for value in (q, lower, upper, null))
+    finite = t.isfinite(qd).all(-1) & t.isfinite(ld).all(-1) & t.isfinite(ud).all(-1) & t.isfinite(nd).all(-1)
+    valid = finite & (ld <= ud).all(-1) & (nd.abs().amax(-1) > 0)
+    qd = t.where(valid[:, None], qd, t.zeros_like(qd))
+    ld = t.where(valid[:, None], ld, -t.ones_like(ld))
+    ud = t.where(valid[:, None], ud, t.ones_like(ud))
+    nd = t.where(valid[:, None], nd, t.zeros_like(nd))
+    distance_low, distance_high = qd-ld, ud-qd
+    magnitude = nd.abs()
+    aa = t.where(nd >= 0, distance_low, distance_high)
+    bb = t.where(nd >= 0, distance_high, distance_low)
+    denominator = magnitude[:, :, None]+magnitude[:, None, :]
+    safe_denominator = t.where(denominator > 0, denominator, t.ones_like(denominator))
+    ratios = (magnitude[:, None, :]*aa[:, :, None]+magnitude[:, :, None]*bb[:, None, :])/safe_denominator
+    ratios = t.where(denominator > 0, ratios, t.full_like(ratios, float("inf")))
+    raw_margin = ratios.amin(dim=(-1, -2))
+    base_feasible = valid & t.isfinite(raw_margin) & (raw_margin >= 0)
+    maximum = t.full_like(raw_margin, maximum_margin)
+    ideal_margin = t.minimum(raw_margin, maximum)
+    ideal_margin = t.where(base_feasible, ideal_margin, t.zeros_like(ideal_margin))
+    numerical_inset = 32*t.finfo(t.float64).eps*t.maximum(
+        distance_low.abs().amax(-1), distance_high.abs().amax(-1)).clamp_min(1.)
+    control_margin = (ideal_margin-numerical_inset).clamp_min(0)
+    nonzero = magnitude > 0
+    safe_magnitude = t.where(nonzero, magnitude, t.ones_like(magnitude))
+    interval_low = t.where(nonzero, (control_margin[:, None]-aa)/safe_magnitude,
+        t.full_like(aa, float("-inf"))).amax(-1)
+    interval_high = t.where(nonzero, (bb-control_margin[:, None])/safe_magnitude,
+        t.full_like(bb, float("inf"))).amin(-1)
+    scalar = t.maximum(interval_low, t.minimum(t.zeros_like(interval_high), interval_high))
+    target = qd+nd*scalar[:, None]
+    target_margin = t.minimum(target-ld, ud-target).amin(-1)
+    feasible = (base_feasible & t.isfinite(interval_low) & t.isfinite(interval_high) &
+        (interval_low <= interval_high) & t.isfinite(target).all(-1) &
+        (target_margin >= 0) &
+        (nonzero | ((distance_low >= control_margin[:, None]) &
+                      (distance_high >= control_margin[:, None]))).all(-1))
+    scalar = t.where(feasible, scalar, t.zeros_like(scalar))
+    target = qd+nd*scalar[:, None]
+    return scalar, {"input_finite_and_bounds_valid": valid,
+        "base_original_domain_intersection_feasible": base_feasible,
+        "common_interval_feasible": feasible,
+        "maximum_common_margin_without_activation_cap_rad": raw_margin,
+        "maximum_common_interior_margin_rad": ideal_margin,
+        "control_interior_margin_after_float64_inset_rad": control_margin,
+        "float64_control_target_roundoff_inset_rad": numerical_inset,
+        "common_scalar_interval_lower_rad": interval_low,
+        "common_scalar_interval_upper_rad": interval_high,
+        "target_unit_nullspace_displacement_rad": scalar,
+        "joint_target_thumb3_rad": target,
+        "target_minimum_original_domain_margin_rad": t.minimum(target-ld, ud-target).amin(-1),
+        "original_lower_margin_thumb3_rad": distance_low,
+        "original_upper_margin_thumb3_rad": distance_high,
+        "pairwise_margin_candidates_rad": t.where(denominator > 0, ratios, t.zeros_like(ratios)),
+        "pairwise_margin_candidate_valid": denominator > 0,
+        "solver_float64_changes_control_target_only_original_domain_gates_unchanged": True}
+
+
+def _common_thumb_domain_guard_torque(t, declaration, *, q, a, point_jacobian, lower, upper,
+                                     physical_safe, safe, tracking, normal_available,
+                                     physical_loaded, overforce):
+    n = q.shape[0]
+    missing = [name for name, value in (("contact_point_jacobian_world_m", point_jacobian),
+        ("actual_domain_lower_hand_rad", lower), ("actual_domain_upper_hand_rad", upper),
+        ("physical_contact_safe", physical_safe)) if value is None]
+    supplied = not missing
+    if supplied:
+        for name, value, shape in (("point Jacobian", point_jacobian, (n, 3, 3, 7)),
+                ("domain lower", lower, (n, 7)), ("domain upper", upper, (n, 7))):
+            if (not t.is_tensor(value) or tuple(value.shape) != shape or value.dtype != q.dtype or
+                    value.device != q.device or not value.is_floating_point()):
+                raise ValueError("Common thumb guard requires matching native "+name)
+        if (not t.is_tensor(physical_safe) or tuple(physical_safe.shape) != (n,) or
+                physical_safe.dtype != t.bool or physical_safe.device != q.device):
+            raise ValueError("Common thumb guard requires native physical-contact booleans")
+        finite = (t.isfinite(point_jacobian).all(dim=(-1, -2, -3)) &
+            t.isfinite(lower).all(-1) & t.isfinite(upper).all(-1))
+        bounds_valid = (lower <= upper).all(-1)
+        matrix = t.stack((a[:, 0, :3], point_jacobian[:, 0, 2, :3]), dim=1)
+    else:
+        finite = t.zeros(n, dtype=t.bool, device=q.device)
+        bounds_valid = finite.clone()
+        physical_safe = finite.clone()
+        lower, upper = -t.ones_like(q), t.ones_like(q)
+        matrix = t.zeros(n, 2, 3, dtype=q.dtype, device=q.device)
+    finite &= t.isfinite(matrix).all(dim=(-1, -2))
+    matrix = t.where(finite[:, None, None], matrix, t.zeros_like(matrix))
+    _, singular, vh = t.linalg.svd(matrix, full_matrices=True)
+    rank = (singular >= declaration["svd_tolerance_m"]).sum(-1)
+    null = vh[:, 2, :]
+    projector = null[:, :, None]*null[:, None, :]
+    scalar, interval = _common_thumb_domain_interval(t, q[:, :3], lower[:, :3], upper[:, :3],
+        null, declaration["activation_margin_rad"])
+    gate = (finite & bounds_valid & (rank == 2) & safe & tracking & normal_available.all(-1) &
+        physical_loaded.all(-1) & physical_safe & ~overforce.any(-1) & interval["common_interval_feasible"])
+    restoring = declaration["restoring_stiffness_nm_rad"]*scalar.to(q.dtype)
+    before_cap = t.zeros_like(q)
+    before_cap[:, :3] = null*restoring[:, None]
+    before_cap = t.where(gate[:, None], before_cap, t.zeros_like(before_cap))
+    peak = before_cap.abs().amax(-1)
+    scale = (declaration["maximum_guard_joint_torque_nm"]/peak.clamp_min(1e-12)).clamp(max=1)
+    torque = before_cap*scale[:, None]
+    residual = t.einsum("nri,ni->nr", matrix, torque[:, :3])
+    evidence = {"contract": copy.deepcopy(declaration), "inputs_supplied": supplied,
+        "missing_inputs": missing, "current_input_finite": finite, "actual_domain_bounds_valid": bounds_valid,
+        "safe_fresh_sample": safe, "palm_tracking": tracking,
+        "all_group_current_normals": normal_available.all(-1),
+        "all_groups_physically_loaded": physical_loaded.all(-1),
+        "original_physical_contact_safe": physical_safe, "any_group_overforce": overforce.any(-1),
+        "gate": gate, "current_normal_world_z_jacobian_m": matrix,
+        "singular_values_m": singular, "retained_rank": rank, "required_rank": 2,
+        "rank_supported": rank == 2, "thumb_unit_null_vector": null, "thumb_nullspace_projector": projector,
+        "nullspace_joint_components_thumb3": projector.diagonal(dim1=-2, dim2=-1),
+        "common_domain": interval, "restoring_unit_nullspace_scalar_nm": restoring,
+        "requested_guard_before_own_cap_nm": before_cap, "guard_common_scale": scale,
+        "guard_torque_before_total_alpha_nm": torque,
+        "actual_torque_nonzero_by_environment_before_total_alpha": torque.ne(0).any(-1),
+        "normal_projection_residual_m_nm": residual[:, 0], "world_z_projection_residual_m_nm": residual[:, 1],
+        "original_actual_domain_not_enlarged": True, "all_force_mode_position_springs_remain_zero": True,
+        "other_four_hand_joints_guard_torque_zero": True, "fresh_current_geometry_only_no_history": True,
+        "unit_null_coordinate_avoids_division_by_small_joint_component": True,
+        "legacy_partial_thumb2_minimum_component_unchanged": declaration["minimum_nullspace_joint_component"],
+        "geometric_projection_is_not_dynamic_force_isolation": True,
+        "common_geometric_target_not_guaranteed_actual_motion_or_domain_invariance": True,
+        "all_original_acceptance_gates_unchanged": True}
+    return torque, evidence
+
+
 def _contact_domain_guard_torque(t, declaration, *, q, a, point_jacobian, lower, upper,
                                 physical_safe, safe, tracking, normal_available,
                                 physical_loaded, overforce):
@@ -760,6 +896,11 @@ def _contact_domain_guard_torque(t, declaration, *, q, a, point_jacobian, lower,
     every manifold point fixed. Independent 2ms physical gates remain decisive.
     No contact Jacobian or guard effort is retained across samples or resets.
     """
+    if declaration.get("interval_solver") == "analytic_pairwise_margin_float64_v1":
+        return _common_thumb_domain_guard_torque(t, declaration, q=q, a=a,
+            point_jacobian=point_jacobian, lower=lower, upper=upper, physical_safe=physical_safe,
+            safe=safe, tracking=tracking, normal_available=normal_available,
+            physical_loaded=physical_loaded, overforce=overforce)
     n = q.shape[0]
     missing = [name for name, value in (("contact_point_jacobian_world_m", point_jacobian),
         ("actual_domain_lower_hand_rad", lower), ("actual_domain_upper_hand_rad", upper),
@@ -1008,6 +1149,164 @@ def _separating_preload_command_floor(t, declaration, *, command, force, force_l
     return after, evidence
 
 
+def _relative_preload_damping(t, declaration, *, a, absolute_velocity, relative_velocity,
+                             maximum_relative_velocity, velocity_current, state, safe,
+                             tracking, normal_available, physical_loaded, overforce,
+                             ramp_fraction, dt, force_gain, original_damping):
+    """Estimate bounded diagonal damping in a declared fixed-other36 model.
+
+    This is neither a coupled critical-damping theorem nor a physical force
+    cap. Current mass/point evidence is optional; unknown evidence preserves
+    the original hand7 damping law without retaining any mass or Jacobian.
+    """
+    n = a.shape[0]
+    old = original_damping*absolute_velocity
+    zero_gate = t.zeros(n, 3, dtype=t.bool, device=a.device)
+    evidence = {"state_supplied": state is not None, "gate": zero_gate,
+        "actual_enabled_by_group": zero_gate,
+        "original_hand7_damping_force_n": old,
+        "applied_normal_damping_force_n": old,
+        "mass_model": declaration["relative_damping_mass_model"],
+        "fixed_other36_diagonal_estimate_not_global_critical_passive_or_force_cap": True,
+        "no_mass_or_jacobian_history": True}
+    if state is None:
+        return old, evidence
+    shapes = {"hand_mass_matrix": (n, 7, 7),
+        "cube_inverse_spatial_inertia_world": (n, 6, 6),
+        "cube_normal_point_jacobian": (n, 3, 6),
+        "physical_point_count": (n, 3), "current": (n, 3)}
+    if not isinstance(state, dict) or set(state) != set(shapes):
+        raise ValueError("Relative damping state requires its exact five native tensor keys")
+    for key, shape in shapes.items():
+        value = state[key]
+        valid_dtype = (value.dtype in (t.int32, t.int64) if key == "physical_point_count" else
+                       value.dtype == t.bool if key == "current" else value.dtype == a.dtype) if t.is_tensor(value) else False
+        if (not t.is_tensor(value) or tuple(value.shape) != shape or value.device != a.device or
+                not valid_dtype or (key not in ("physical_point_count", "current") and not value.is_floating_point())):
+            raise ValueError("Invalid native relative damping tensor: "+key)
+    relative_supplied = all(value is not None for value in
+        (relative_velocity, maximum_relative_velocity, velocity_current))
+    for key, value, boolean in (("relative velocity", relative_velocity, False),
+            ("maximum point velocity", maximum_relative_velocity, False),
+            ("relative current", velocity_current, True)):
+        if value is not None and (not t.is_tensor(value) or tuple(value.shape) != (n, 3) or
+                value.device != a.device or value.dtype != (t.bool if boolean else a.dtype)):
+            raise ValueError("Invalid native relative damping "+key)
+    relative = relative_velocity if relative_supplied else t.zeros_like(absolute_velocity)
+    maximum = maximum_relative_velocity if relative_supplied else t.zeros_like(relative)
+    motion_current = velocity_current if relative_supplied else zero_gate
+    motion_finite = t.isfinite(relative) & t.isfinite(maximum)
+    motion_consistent = relative <= maximum+1e-6
+    relative = t.where(motion_finite, relative, t.zeros_like(relative))
+    maximum = t.where(motion_finite, maximum, t.zeros_like(maximum))
+
+    def current_spd(matrix, size):
+        identity = t.eye(size, dtype=a.dtype, device=a.device)[None].expand(n, -1, -1)
+        finite = t.isfinite(matrix).all(dim=(-1, -2))
+        clean = t.where(finite[:, None, None], matrix, identity)
+        difference = (clean-clean.transpose(-1, -2)).abs()
+        diagonal = clean.diagonal(dim1=-2, dim2=-1).abs()
+        entry_scale = t.maximum(t.maximum(clean.abs(), clean.transpose(-1, -2).abs()),
+            t.sqrt(diagonal[:, :, None]*diagonal[:, None, :]))
+        tolerance = 32*t.finfo(a.dtype).eps*entry_scale.clamp_min(1e-12)
+        symmetry_error = difference.amax(dim=(-1, -2))
+        symmetry_tolerance = tolerance.amax(dim=(-1, -2))
+        symmetric = (difference <= tolerance).all(dim=(-1, -2))
+        clean = .5*(clean+clean.transpose(-1, -2))
+        chol, info = t.linalg.cholesky_ex(clean)
+        valid = finite & symmetric & (info == 0)
+        return (t.where(valid[:, None, None], clean, identity),
+                t.where(valid[:, None, None], chol, identity), valid,
+                {"finite": finite, "symmetric": symmetric, "cholesky_info": info,
+                 "symmetry_error": symmetry_error, "symmetry_tolerance": symmetry_tolerance})
+
+    _, hand_chol, hand_valid, hand_proof = current_spd(state["hand_mass_matrix"], 7)
+    cube_inverse, _, cube_valid, cube_proof = current_spd(state["cube_inverse_spatial_inertia_world"], 6)
+    jc_raw = state["cube_normal_point_jacobian"]
+    jc_finite = t.isfinite(jc_raw).all(-1)
+    jc = t.where(jc_finite[:, :, None], jc_raw, t.zeros_like(jc_raw))
+    h = a @ t.cholesky_solve(a.transpose(-1, -2), hand_chol)
+    h = .5*(h+h.transpose(-1, -2))
+    bc = jc @ cube_inverse @ jc.transpose(-1, -2)
+    bc = .5*(bc+bc.transpose(-1, -2))
+    mobility_finite = t.isfinite(h).all(dim=(-1, -2)) & t.isfinite(bc).all(dim=(-1, -2))
+    h = t.where(mobility_finite[:, None, None], h, t.zeros_like(h))
+    bc = t.where(mobility_finite[:, None, None], bc, t.zeros_like(bc))
+    hdiag, bcdiag = h.diagonal(dim1=-2, dim2=-1), bc.diagonal(dim1=-2, dim2=-1)
+    mobility = hdiag+bcdiag
+    numerical_floor = 1e-12
+    m_eff = 1/mobility.clamp_min(numerical_floor)
+    rho = hdiag/mobility.clamp_min(numerical_floor)
+    counts = state["physical_point_count"]
+    count_max = t.tensor([96, 64, 64], device=a.device)[None]
+    count_valid = (counts > 0) & (counts <= count_max)
+    count_float = t.where(count_valid, counts, t.ones_like(counts)).to(a.dtype)
+    stiffness = declaration["relative_damping_material_point_stiffness_n_m"]*count_float
+    material_damping = declaration["relative_damping_material_point_damping_ns_m"]*count_float
+    feedback_factor = 1+rho*force_gain
+    critical = 2*declaration["relative_damping_ratio"]*t.sqrt((m_eff*stiffness*feedback_factor).clamp_min(0))
+    raw_d = (critical-material_damping*feedback_factor)/rho.clamp_min(numerical_floor)
+    numerical_valid = (t.isfinite(hdiag) & t.isfinite(bcdiag) & t.isfinite(mobility) &
+        (hdiag > numerical_floor) & (bcdiag >= 0) &
+        (mobility > numerical_floor) & (rho > numerical_floor) & (rho <= 1+1e-6) & t.isfinite(raw_d))
+    provisional = (safe[:, None] & tracking[:, None] & normal_available & physical_loaded &
+        ~overforce.any(-1)[:, None] & (ramp_fraction < 1)[:, None] & state["current"] &
+        hand_valid[:, None] & cube_valid[:, None] & mobility_finite[:, None] & jc_finite & count_valid &
+        motion_current & motion_finite & motion_consistent & numerical_valid)
+    active_h = h*provisional[:, :, None]*provisional[:, None, :]
+    eigenvalues = t.linalg.eigvalsh(active_h)
+    lambda_max = eigenvalues[:, -1].clamp_min(0)
+    gain_upper = declaration["relative_damping_explicit_gain_limit"]/(dt*lambda_max.clamp_min(numerical_floor))
+    upper = t.minimum(gain_upper, t.full_like(gain_upper,
+        declaration["relative_damping_coefficient_maximum_ns_m"]))
+    lower = declaration["relative_damping_coefficient_minimum_ns_m"]
+    feasible = upper >= lower
+    gate = provisional & feasible[:, None]
+    bounded_d = t.minimum(raw_d.clamp(min=lower,
+        max=declaration["relative_damping_coefficient_maximum_ns_m"]), upper[:, None].clamp_min(lower))
+    blend = (1-ramp_fraction).clamp(0, 1)
+    candidate = blend[:, None]*bounded_d*relative+(1-blend[:, None])*old
+    applied = t.where(gate, candidate, old)
+    used_d_max = t.where(gate, bounded_d, t.zeros_like(bounded_d)).amax(-1)
+    evidence.update({"gate": gate, "actual_enabled_by_group": gate, "state_current": state["current"],
+        "relative_inputs_supplied": relative_supplied, "relative_velocity_current": motion_current,
+        "relative_velocity_finite": motion_finite, "relative_mean_not_above_point_max": motion_consistent,
+        "relative_inward_velocity_m_s": relative, "maximum_point_relative_inward_velocity_m_s": maximum,
+        "hand_mass_spd": hand_proof, "cube_inverse_inertia_spd": cube_proof,
+        "hand_mass_valid": hand_valid, "cube_inverse_inertia_valid": cube_valid,
+        "computed_group_mobility_finite": mobility_finite,
+        "cube_normal_point_jacobian_finite": jc_finite,
+        "physical_point_count": counts, "physical_point_count_valid": count_valid,
+        "hand_group_mobility_inverse_kg": h, "cube_group_mobility_inverse_kg": bc,
+        "combined_group_mobility_inverse_kg": h+bc,
+        "relative_effective_mass_kg": m_eff, "hand_actuation_fraction_rho": rho,
+        "parallel_point_stiffness_n_m": stiffness, "parallel_point_material_damping_ns_m": material_damping,
+        "force_feedback_factor": feedback_factor, "scalar_critical_effective_damping_ns_m": critical,
+        "raw_robot_relative_damping_coefficient_ns_m": raw_d,
+        "bounded_robot_relative_damping_coefficient_ns_m": bounded_d,
+        "active_hand_mobility_eigenvalues_inverse_kg": eigenvalues,
+        "active_hand_mobility_maximum_eigenvalue_inverse_kg": lambda_max,
+        "local_explicit_gain_coefficient_upper_ns_m": gain_upper,
+        "coefficient_upper_with_declared64_ns_m": upper,
+        "original_point5_lower_bound_compatible_with_gain_cap": feasible,
+        "applied_local_explicit_gain_dt_dmax_lambda": dt*used_d_max*lambda_max,
+        "applied_relative_explicit_gain_dt_blended_dmax_lambda": dt*blend*used_d_max*lambda_max,
+        "relative_damping_blend_fraction": blend,
+        "actual_relative_damping_coefficient_ns_m_before_torque_caps":
+            t.where(gate, blend[:, None]*bounded_d, t.zeros_like(bounded_d)),
+        "actual_hand7_damping_coefficient_ns_m_before_torque_caps":
+            t.where(gate, (1-blend[:, None])*original_damping,
+                    t.full_like(bounded_d, original_damping)),
+        "blended_coefficient_ns_m": blend[:, None]*bounded_d+(1-blend[:, None])*original_damping,
+        "relative_viscous_force_before_blend_n": bounded_d*relative,
+        "applied_normal_damping_force_n": applied,
+        "blend_is_force_term_relative_to_hand7_at_full_ramp": True,
+        "point_parallel_springs_and_fixed_other36_are_local_model_assumptions": True,
+        "group_couplings_retained_for_audit_diagonal_design_not_modal_critical_proof": True,
+        "original_force_command_clamps_and_common_torque_alpha_still_apply": True})
+    return applied, evidence
+
+
 class BalancedEffortGraspController:
     """Joint efforts for the declared hand-only grasp intervention.
 
@@ -1037,6 +1336,10 @@ class BalancedEffortGraspController:
         if contact_transition is not None:
             from .rl_effort_protocol import validate_contact_transition_control
             self.contact_transition = validate_contact_transition_control(contact_transition)
+            if "relative_damping_force_feedback_gain" in self.contact_transition and (
+                    self.parameters["normal_force_feedback_gain"] != self.contact_transition["relative_damping_force_feedback_gain"] or
+                    self.parameters["normal_velocity_damping_n_s_m"] != self.contact_transition["relative_damping_coefficient_minimum_ns_m"]):
+                raise ValueError("Relative preload damping requires its original declared.5 force gain and hand7 damping")
             self.contract["version"] += "+"+self.contact_transition["version"]
             self.contract["contact_transition"] = copy.deepcopy(self.contact_transition)
         self.torch = torch
@@ -1076,7 +1379,8 @@ class BalancedEffortGraspController:
                actual_domain_upper_hand_rad=None, physical_contact_safe=None,
                relative_inward_velocity_m_s=None,
                maximum_current_point_relative_inward_velocity_m_s=None,
-               relative_velocity_current=None, freeze_reference_by_environment=None):
+               relative_velocity_current=None, freeze_reference_by_environment=None,
+               relative_damping_state=None):
         """Use completed native sample k to request efforts for k+1 exactly once."""
         t, p, n = self.torch, self.parameters, self.num_envs
         if (type(sample_id) is not int or sample_id < 0 or type(dt) not in (int, float) or
@@ -1304,14 +1608,34 @@ class BalancedEffortGraspController:
                 "force_targets_are_not_measured_force_bounds": True}
         error = targets-force
         inward_velocity = t.einsum("ngi,ni->ng", a, qd)
-        command = (targets+p["normal_force_feedback_gain"]*error-
-                   p["normal_velocity_damping_n_s_m"]*inward_velocity).clamp(
+        normal_damping = p["normal_velocity_damping_n_s_m"]*inward_velocity
+        relative_damping_evidence = None
+        if self.contact_transition is not None and "relative_damping_mass_model" in self.contact_transition:
+            normal_damping, relative_damping_evidence = _relative_preload_damping(
+                t, self.contact_transition, a=a, absolute_velocity=inward_velocity,
+                relative_velocity=relative_inward_velocity_m_s,
+                maximum_relative_velocity=maximum_current_point_relative_inward_velocity_m_s,
+                velocity_current=relative_velocity_current, state=relative_damping_state,
+                safe=safe, tracking=tracking, normal_available=normal_available,
+                physical_loaded=group_physical_loaded,
+                overforce=safe[:, None] & (force > p["group_force_limit_n"]),
+                ramp_fraction=ramp_fraction, dt=dt, force_gain=p["normal_force_feedback_gain"],
+                original_damping=p["normal_velocity_damping_n_s_m"])
+            transition_evidence["relative_preload_damping"] = relative_damping_evidence
+        command = (targets+p["normal_force_feedback_gain"]*error-normal_damping).clamp(
                        p["group_force_command_lower_n"], p["group_force_command_upper_n"])
         overforce = safe[:, None] & (force > p["group_force_limit_n"])
         command = t.where(overforce, t.full_like(command, p["group_force_command_lower_n"]), command)
         command = t.where(tracking[:, None] | overforce, command.clamp(max=p["group_force_command_upper_n"]),
                           command.clamp(max=0))
         command = t.where(normal_available, command, t.zeros_like(command))
+        if relative_damping_evidence is not None:
+            relative_damping_evidence.update({
+                "force_command_with_old_damping_before_clamp_n": targets+p["normal_force_feedback_gain"]*error-
+                    p["normal_velocity_damping_n_s_m"]*inward_velocity,
+                "force_command_with_new_damping_before_clamp_n": targets+p["normal_force_feedback_gain"]*error-normal_damping,
+                "force_command_after_original_safety_clamps_n": command,
+                "overforce_original_negative_command_priority": True})
         separating_floor_evidence = None
         if (self.contact_transition is not None and
                 "separating_preload_command_floor_n" in self.contact_transition):
@@ -1503,6 +1827,8 @@ class BalancedEffortGraspController:
             if duplicate:
                 applied_guard = t.zeros_like(applied_guard)
             guard_evidence["guard_component_for_current_new_command_nm"] = applied_guard
+            if "common_domain" in guard_evidence:
+                guard_evidence["actual_torque_nonzero_by_environment"] = applied_guard.ne(0).any(-1)
             guard_evidence["duplicate_holds_prior_complete_effort_without_new_guard_evaluation"] = duplicate
             evidence["contact_domain_posture_guard"] = guard_evidence
         if transition_evidence is not None:

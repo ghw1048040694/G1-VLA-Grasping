@@ -162,6 +162,21 @@ class FullLiftProbeSettingsTests(unittest.TestCase):
         self.assertIsNone(settings["contact_transition_control"])
         self.assertEqual(settings["max_control_steps"], 91)
 
+    def test_relative_damping_requires_original_compliant_pads_and_material_values(self):
+        from g1_vla.rl_effort_protocol import contact_transition_control_contract
+        value = self.settings()
+        value["contact_transition_control"] = contact_transition_control_contract(
+            "g1_coordinated_contact_transition_v3_relative_viscous_preload")
+        with self.assertRaises(ValueError): probe.validate_probe_settings(value)
+        material = value["effort_grasp_controller"]["material"]
+        material.update(variant="finger_compliant_v5", compliant_contact_stiffness_n_m=1000.,
+            compliant_contact_damping_ns_m=.8)
+        self.assertEqual(probe.validate_probe_settings(value)["contact_transition_control"], value["contact_transition_control"])
+        for key, changed in (("compliant_contact_stiffness_n_m", 999.), ("compliant_contact_damping_ns_m", .9)):
+            original = material[key]; material[key] = changed
+            with self.subTest(key=key), self.assertRaises(ValueError): probe.validate_probe_settings(value)
+            material[key] = original
+
     def test_full_lift_quotas_declarations_and_original_probe_are_independent(self):
         for protocol, repeats, steps in [("full_lift8_v1", 1, 213), ("full_lift32_v1", 4, 852)]:
             value = self.settings(True, protocol)
