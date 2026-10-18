@@ -39,6 +39,10 @@ from g1_vla.rl_environment import (
     audit_fixed_root_joints,
     consecutive_window_samples,
     control_probe_profile,
+    current_relative_contact_motion,
+    revalidated_native_arm_substep,
+    RIGHT_ARM,
+    RIGHT_HAND,
     cube_contact_partner_layout,
     minimum_box_clearance,
     migration_pose_errors,
@@ -556,6 +560,446 @@ class ContactQualifiedFullLiftTests(unittest.TestCase):
         self.assertFalse(self.state.full_success.any())
         self.assertEqual(self.state.maximum_hold_samples.tolist(),[0,0])
 
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "CPU Torch is required")
+class NativeArmTargetScheduleTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        self.t=torch
+        z=torch.zeros(2,7,dtype=torch.float64)
+        j=z.clone();j[:,0]=1
+        self.values=dict(segment_origin=z.clone(),macro_endpoint=torch.full_like(z,.033),
+            previous_written=z.clone(),measured_arm=z.clone(),native_index=torch.ones(2,dtype=torch.int64),
+            substeps=33,physics_dt_s=.002,velocity_limits_rad_s=torch.ones(7,dtype=torch.float64),
+            anchor_delta_rad=.08,joint_lower=torch.full_like(z,-2),joint_upper=torch.full_like(z,2),
+            point_jz=j,palm_z=torch.zeros(2,dtype=torch.float64),start_palm_z=torch.zeros(2,dtype=torch.float64),
+            height_cap_m=.11,enabled=torch.ones(2,dtype=torch.bool),sample_fresh=torch.ones(2,dtype=torch.bool))
+
+    def method(self,name,**extra):
+        tree=ast.parse((ROOT/"src/g1_vla/rl_environment.py").read_text())
+        owner=next(node for node in ast.walk(tree) if isinstance(node,ast.ClassDef) and node.name=="Environment")
+        node=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name==name)
+        scope={"torch":self.t,"tensor":lambda v:v,"RLEnvironmentError":RLEnvironmentError,
+            "__package__":"g1_vla","math":math,"json":json,
+            "revalidated_native_arm_substep":revalidated_native_arm_substep,
+            "offset_point_jacobian":offset_point_jacobian,"quat_apply":lambda q,v:v,**extra}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),"<actual-native-arm-schedule>","exec"),scope)
+        return scope[name]
+
+    def test_33_real_substep_targets_reach_endpoint_without_macro_jump(self):
+        t=self.t;v=self.values
+        for index in range(1,34):
+            v["native_index"][:]=index
+            target,evidence=revalidated_native_arm_substep(t,**v)
+            self.assertTrue(t.allclose(target,t.full_like(target,.001*index),atol=1e-12,rtol=0))
+            self.assertFalse(evidence["requires_unsafe"].any())
+            self.assertTrue((evidence["written_increment_rad_s"].abs()<=1+1e-12).all())
+            v["previous_written"]=target.clone();v["measured_arm"]=target.clone()
+            v["palm_z"]=target[:,0].clone()
+        self.assertTrue(t.equal(target,v["macro_endpoint"]))
+
+    def test_each_substep_rechecks_rate_mechanical_and_current_height_not_only_endpoint(self):
+        t=self.t;v=self.values
+        v["velocity_limits_rad_s"][:]=.05
+        for index in range(1,34):
+            v["native_index"][:]=index
+            target,e=revalidated_native_arm_substep(t,**v)
+            self.assertTrue((e["written_increment_rad_s"].abs()<=.05+1e-12).all())
+            v["previous_written"]=target.clone();v["measured_arm"]=target.clone();v["palm_z"]=target[:,0]
+        self.assertTrue(t.allclose(target,t.full_like(target,.0033),atol=1e-12,rtol=0))
+        self.assertFalse(t.equal(target,v["macro_endpoint"]),"Never snap to an unreached endpoint at substep33")
+        v=copy.deepcopy(self.values);v["native_index"][:]=1
+        v["previous_written"].zero_();v["measured_arm"].zero_();v["palm_z"].zero_()
+        v["velocity_limits_rad_s"][:]=1.;v["joint_upper"][:,1]=.0003;v["height_cap_m"]=.0005
+        target,e=revalidated_native_arm_substep(t,**v)
+        self.assertLessEqual(target[:,0].max().item(),.0005)
+        self.assertLessEqual(target[:,1].max().item(),.0003)
+        self.assertFalse(e["requires_unsafe"].any())
+        for key,source in (("current_measured_arm_rad","measured_arm"),
+                ("current_point_jz_m_per_rad","point_jz"),("current_palm_z_m","palm_z"),
+                ("start_palm_z_m","start_palm_z")):
+            self.assertTrue(t.equal(e[key],v[source]))
+        self.assertTrue(t.equal(e["height_cap_m"],t.full((2,),.0005,dtype=t.float64)))
+
+    def test_stale_native_epoch_and_nonfinite_height_abort_while_inactive_path_stays_macro_hold(self):
+        t=self.t;v=self.values
+        v["enabled"][1]=False;v["sample_fresh"][0]=False;v["measured_arm"][0]=.001
+        target,e=revalidated_native_arm_substep(t,**v)
+        self.assertEqual(e["requires_unsafe"].tolist(),[True,False])
+        self.assertTrue(t.equal(target[0],v["measured_arm"][0]))
+        self.assertTrue(t.equal(target[1],v["macro_endpoint"][1]))
+        v["sample_fresh"][:]=True;v["palm_z"][0]=float("nan")
+        _,e=revalidated_native_arm_substep(t,**v)
+        self.assertTrue(e["requires_unsafe"][0])
+        for anchor in (0.,float("nan"),True):
+            v["anchor_delta_rad"]=anchor
+            with self.assertRaises(ValueError):revalidated_native_arm_substep(t,**v)
+
+    def test_real_sdk_write_precedes_actual_target_evidence_and_preserves_other36_mapping(self):
+        t=self.t;events=[];writes=[]
+        q=t.zeros(2,43);arm=t.full((2,7),.0002)
+        def write(**values):
+            events.append("sdk_write");writes.append(values["target"].clone())
+        def log(row):
+            self.assertEqual(events[-1],"sdk_write")
+            events.append("logged")
+            self.assertTrue(t.equal(row["actually_written_arm_target_rad"],arm))
+            self.assertFalse(row["native_target_readback_claimed"])
+        fake=SimpleNamespace(_pending_physics_sample=False,_full_lift=None,_physics_pinch=None,
+            _effort_grasp=object(),_native_arm_interpolation=True,_action_ids=list(range(14)),
+            _targets=t.ones(2,43),_episode_ids=t.tensor([2,3]),_control_command_id=4,
+            _update_effort_grasp=lambda:None,_native_arm_substep_target=lambda:(arm,{"native_index":t.tensor([1,1])}),
+            _write_control_probe=log,_write_effort_targets=lambda:None,
+            sim=SimpleNamespace(get_physics_step_count=lambda:0),
+            robot=SimpleNamespace(data=SimpleNamespace(joint_pos=q,joint_vel=q.clone()),set_joint_position_target_index=write))
+        self.method("_apply_action")(fake)
+        self.assertEqual(events,["sdk_write","logged"])
+        self.assertEqual(writes[0].shape,(2,36))
+        self.assertTrue(t.equal(writes[0][:,:7],arm))
+        self.assertTrue((writes[0][:,7:]==1).all())
+        self.assertTrue(t.equal(fake._last_written_arm_target,arm))
+        self.assertTrue(t.equal(fake._last_written_arm_target_episode_ids,fake._episode_ids))
+        self.assertEqual(fake._last_written_arm_target_next_native_step.tolist(),[1,1])
+
+    def test_completed_terminal_measurement_records_arm_state_and_successful_target_write_only_for_new_schedule(self):
+        t=self.t;rows=[];q=t.arange(86,dtype=t.float64).reshape(2,43)
+        tree=ast.parse((ROOT/"src/g1_vla/rl_environment.py").read_text())
+        sample=next(node for node in ast.walk(tree) if isinstance(node,ast.FunctionDef) and node.name=="_sample_physics")
+        call=next(node for node in ast.walk(sample) if isinstance(node,ast.Call) and
+            isinstance(node.func,ast.Attribute) and node.func.attr=="_write_control_probe" and
+            node.args and isinstance(node.args[0],ast.Dict) and any(
+                isinstance(value,ast.Constant) and value.value=="physics_hand_measurement"
+                for value in node.args[0].values))
+        code=compile(ast.Expression(body=call),"<actual-completed-native-measurement>","eval")
+        fake=SimpleNamespace(_native_arm_interpolation=True,_control_command_id=4,_last_contact_native_step=101,
+            _episode_ids=t.tensor([2,3]),episode_length_buf=t.tensor([20,30]),_action_ids=list(range(14)),
+            robot=SimpleNamespace(data=SimpleNamespace(joint_pos=q,joint_vel=q+.5)),
+            _last_written_arm_target=t.full((2,7),.001),_last_written_arm_target_episode_ids=t.tensor([2,3]),
+            _last_written_arm_target_next_native_step=t.tensor([101,101]),
+            _last_written_hand_target=t.zeros(2,7),_last_written_hand_effort=t.zeros(2,7),
+            _last_metrics={},_unsafe=t.tensor([False,False]),_write_control_probe=rows.append)
+        scope={"self":fake,"tensor":lambda value:value,"active_effort":False}
+        eval(code,scope)
+        row=rows[-1]
+        self.assertTrue(t.equal(row["measured_arm_rad"],q[:,:7]))
+        self.assertTrue(t.equal(row["measured_arm_velocity_rad_s"],(q+.5)[:,:7]))
+        self.assertTrue(t.equal(row["actually_written_arm_position_target_rad"],fake._last_written_arm_target))
+        self.assertEqual(row["arm_target_write_episode_id"].tolist(),[2,3])
+        self.assertEqual(row["arm_target_write_applies_to_native_step"].tolist(),[101,101])
+        self.assertIn("not_sdk_target_readback",row["arm_target_measurement_scope"])
+        fake._native_arm_interpolation=False
+        eval(code,scope)
+        for key in ("measured_arm_rad","measured_arm_velocity_rad_s","actually_written_arm_position_target_rad",
+                "arm_target_write_episode_id","arm_target_write_applies_to_native_step","arm_target_measurement_scope"):
+            self.assertNotIn(key,rows[-1])
+
+    def test_actual_main_cancel_holds_first_failure_pose_and_only_real_reset_clears_history(self):
+        t=self.t;z=t.zeros(1,7);native=[100]
+        jac=t.zeros(1,1,6,43);jac[0,0,2,0]=1
+        data=SimpleNamespace(joint_pos=t.zeros(1,43),body_quat_w=t.tensor([[[0.,0,0,1],[0.,0,0,1]]]),
+            body_pos_w=t.zeros(1,2,3),body_link_jacobian_w=jac)
+        fake=SimpleNamespace(_action_ids=list(range(14)),_episode_ids=t.tensor([2]),
+            _arm_segment_origin=z.clone(),_arm_segment_endpoint=t.full_like(z,.033),
+            _last_written_arm_target=z.clone(),_arm_segment_native_index=t.zeros(1,dtype=t.int64),
+            _last_written_arm_target_episode_ids=t.tensor([2]),_last_written_arm_target_next_native_step=t.tensor([100]),
+            _arm_segment_episode_ids=t.tensor([2]),_arm_segment_start_native=100,
+            _arm_segment_enabled=t.tensor([True]),_arm_segment_cancelled=t.tensor([False]),
+            _arm_segment_failure_hold=z.clone(),_unsafe=t.tensor([False]),
+            _full_lift=SimpleNamespace(failed=t.tensor([False]),main_lift_started=t.tensor([True])),
+            _full_lift_failure_arm_target=t.full_like(z,.0007),_palm_id=1,_palm_local=t.zeros(1,3),
+            _start_palm_z=t.zeros(1),_velocity=t.ones(14),_limits=t.tensor([[[-2.,2.]]*43]),physics_dt=.002,
+            sim=SimpleNamespace(get_physics_step_count=lambda:native[0]),
+            robot=SimpleNamespace(data=data,num_bodies=2))
+        method=self.method("_native_arm_substep_target",full_lift={"palm_lift_request_max_m":.11,
+            "arm_target_interpolation_substeps":33},settings={"probe_clearance_max_m":.006},
+            config={"control":{"max_anchor_delta_rad":.08}})
+        first,e=method(fake);self.assertTrue(t.allclose(first,t.full_like(z,.001)))
+        fake._last_written_arm_target=first.clone();fake._full_lift.failed[:]=True
+        data.joint_pos[:,:7]=.0007;native[0]=101
+        target,e=method(fake)
+        self.assertTrue(t.allclose(target,t.full_like(z,.0007)))
+        self.assertTrue(e["arm_schedule_cancelled"].all())
+        self.assertTrue(e["failure_override_is_not_velocity_certified"].all())
+        self.assertFalse(fake._unsafe.any(),"Task failure alone is separate from hard physical unsafe")
+        fake._last_written_arm_target=target.clone();data.joint_pos[:,:7]=.0006;native[0]=102
+        target,_=method(fake)
+        self.assertTrue(t.allclose(target,t.full_like(z,.0007)),"Keep the first failure pose; no resumed ascent")
+        fake._episode_ids+=1
+        self.method("_reset_native_arm_schedule")(fake,t.tensor([0]),z)
+        self.assertEqual(fake._arm_segment_episode_ids.tolist(),[3])
+        self.assertFalse(fake._arm_segment_cancelled.any())
+        self.assertFalse(fake._arm_segment_enabled.any())
+        self.assertFalse(fake._last_written_arm_target.any())
+        fake._last_written_arm_target[0,0]=.0009
+        fake._full_lift.failed[:]=True
+        fake._full_lift_failure_arm_target[0,0]=float("nan")
+        data.joint_pos[0,0]=float("nan")
+        target,e=method(fake)
+        self.assertTrue(t.isfinite(target).all(),"Failure override must never reintroduce NaN into the SDK write")
+        self.assertAlmostEqual(target[0,0].item(),.0009,places=7)
+        self.assertTrue(fake._unsafe.all())
+        self.assertTrue(e["cancelled_pose_nonfinite_axis_fallback_to_last_successful_write"][0,0])
+        self.assertTrue(e["failure_override_is_not_velocity_certified"].all())
+
+    def test_full_task_failure_keeps_current_hand_effort_but_hard_unsafe_still_clears_full43(self):
+        from g1_vla.rl_effort_protocol import effort_grasp_contract
+        t=self.t;contract=effort_grasp_contract();decl=contract["actuation"]["posture_gravity_feedforward"]
+        names=list(RIGHT_ARM)+list(RIGHT_HAND)+["waist_yaw_joint","waist_roll_joint","waist_pitch_joint"]
+        names += ["other_"+str(i) for i in range(26)]
+        specs={name:{"effort_limit_nm":cap} for name,cap in zip(decl["joint_order"],decl["feedforward_caps_nm"])}
+        calls=[];ids=t.tensor([2,2])
+        fake=SimpleNamespace(num_envs=2,device="cpu",_action_ids=list(range(14)),
+            _last_written_hand_effort=t.full((2,7),.01),_last_written_full_effort=t.zeros(2,43),
+            _unsafe=t.tensor([False,True]),_full_lift=SimpleNamespace(failed=t.tensor([True,True])),
+            _episode_ids=ids,_last_contact_episode_ids=ids.clone(),_posture_ff_update_count=0,
+            _posture_ff_last_sample=None,_control_command_id=1,_write_control_probe=lambda row:None,
+            sim=SimpleNamespace(get_physics_step_count=lambda:10),robot=SimpleNamespace(joint_names=names,
+                root_view=SimpleNamespace(),data=SimpleNamespace(gravity_compensation_forces=t.full((2,43),.002)),
+                set_joint_effort_target_index=lambda **values:calls.append(values["target"].clone())))
+        self.method("_write_effort_targets",RIGHT_ARM=RIGHT_ARM,RIGHT_HAND=RIGHT_HAND,
+            effort_contract=contract,actuator_specs=specs)(fake)
+        self.assertTrue(t.equal(calls[0][0,7:14],t.full((7,),.01)))
+        self.assertTrue((calls[0][1]==0).all())
+        self.assertTrue(fake._full_lift.failed.all(),"Retaining force feedback never restores task success")
+
+    def test_full_failure_terminates_without_hard_unsafe_and_local_milestone_does_not_terminate(self):
+        t=self.t
+        fake=SimpleNamespace(_pending_physics_sample=False,_control_probe_enabled=False,_standalone_video=False,
+            _unsafe=t.tensor([False]),_local_success=t.tensor([True]),
+            _full_lift=SimpleNamespace(failed=t.tensor([False]),full_success=t.tensor([False])),
+            episode_length_buf=t.tensor([20]),max_episode_length=243,
+            cube=SimpleNamespace(data=SimpleNamespace(root_pos_w=t.tensor([[0.,0.,.779]]))))
+        method=self.method("_get_dones")
+        terminated,truncated=method(fake)
+        self.assertFalse(terminated.any());self.assertFalse(truncated.any())
+        fake._full_lift.failed[:]=True
+        terminated,truncated=method(fake)
+        self.assertTrue(terminated.all());self.assertFalse(truncated.any())
+        self.assertFalse(fake._unsafe.any())
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "CPU Torch is required")
+class RelativeContactMotionTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        self.t=torch
+        self.values=dict(link_jacobian_world=torch.zeros(1,7,6,43),
+            link_position_world=torch.zeros(1,7,3),joint_velocity_full43=torch.zeros(1,43),
+            point_world=torch.zeros(1,7,32,3),inward_normal_world=torch.zeros(1,7,32,3),
+            control_point_valid=torch.zeros(1,7,32,dtype=torch.bool),
+            physical_point_loaded=torch.zeros(1,7,32,dtype=torch.bool),point_weight=torch.ones(1,7,32)*.101,
+            cube_com_position_world=torch.tensor([[.05,0,0.]]),
+            cube_com_linear_velocity_world=torch.zeros(1,3),cube_angular_velocity_world=torch.zeros(1,3))
+        for body in (2,4,6):
+            self.values["point_world"][0,body,0]=torch.tensor([.02,.01,0])
+            self.values["inward_normal_world"][0,body,0,0]=1
+            self.values["control_point_valid"][0,body,0]=True
+            self.values["physical_point_loaded"][0,body,0]=True
+        # This native DoF is deliberately outside the seven hand columns.
+        self.values["joint_velocity_full43"][0,42]=1
+
+    def motion(self):
+        return current_relative_contact_motion(self.t,**self.values)
+
+    def geometry_adapter(self):
+        t=self.t;v=self.values
+        tree=ast.parse((ROOT/"src/g1_vla/rl_environment.py").read_text())
+        owner=next(node for node in ast.walk(tree) if isinstance(node,ast.ClassDef) and node.name=="Environment")
+        node=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name=="_effort_contact_geometry")
+        scope={"torch":t,"tensor":lambda value:value,"RLEnvironmentError":RLEnvironmentError,
+            "settings":{"contact_offset_m":0.,"max_abs_normal_z":.6},
+            "current_relative_contact_motion":current_relative_contact_motion}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),"<actual-relative-motion-adapter>","exec"),scope)
+        jac=t.zeros(1,8,6,43);jac[:,:7]=v["link_jacobian_world"]
+        positions=t.zeros(1,9,3);positions[:,1:8]=v["link_position_world"]
+        cube=SimpleNamespace(root_pos_w=v["cube_com_position_world"],root_com_pos_w=v["cube_com_position_world"],
+            root_com_lin_vel_w=v["cube_com_linear_velocity_world"],root_com_ang_vel_w=v["cube_angular_velocity_world"])
+        env=SimpleNamespace(_effort_contact_transition={"version":"g1_coordinated_contact_transition_v2_separating_preload"},
+            robot=SimpleNamespace(num_bodies=9,data=SimpleNamespace(body_link_jacobian_w=jac,body_pos_w=positions,
+                joint_vel=v["joint_velocity_full43"])),cube=SimpleNamespace(data=cube),
+            _effort_hand_body_ids=list(range(1,8)),_action_ids=list(range(14)),_episode_ids=t.tensor([2]),
+            sim=SimpleNamespace(get_physics_step_count=lambda:9))
+        hand={"point":t.zeros(1,8,32,3),"point_normal":t.zeros(1,8,32,3),
+            "point_valid":t.zeros(1,8,32,dtype=t.bool),"point_force":t.zeros(1,8,32),
+            "separation":t.zeros(1,8,32)}
+        for target,source in (("point","point_world"),("point_normal","inward_normal_world"),
+                              ("point_valid","control_point_valid")):
+            hand[target][:,:7]=v[source]
+        hand["point_force"][:,:7]=t.where(v["physical_point_loaded"],v["point_weight"]-.001,0.)
+        return env,hand,scope["_effort_contact_geometry"]
+
+    def test_native_adapter_new_motion_is_current_and_unavailable_sdk_keeps_original_geometry(self):
+        env,hand,method=self.geometry_adapter()
+        method(env,hand)
+        original=env._effort_geometry["normal_jacobian"].clone()
+        motion=env._effort_geometry["relative_contact_motion"]
+        self.assertTrue(motion["available"])
+        self.assertTrue(motion["relative_velocity_current"].all())
+        self.assertEqual(motion["native_step"],9)
+        self.assertEqual(motion["episode_id"].tolist(),[2])
+        self.assertEqual(env._effort_relative_motion_raw["link_origin_jacobian_world_full43_m"].shape,(1,7,6,43))
+        del env.cube.data.root_com_pos_w
+        method(env,hand)
+        self.assertFalse(env._effort_geometry["relative_contact_motion"]["available"])
+        self.assertTrue(self.t.equal(original,env._effort_geometry["normal_jacobian"]))
+        self.assertTrue(env._effort_geometry["current_normal_available"].all())
+        self.assertIsNone(env._effort_relative_motion_raw)
+
+    def test_old_transition_never_requests_new_sdk_motion_fields(self):
+        env,hand,method=self.geometry_adapter()
+        env._effort_contact_transition={"version":"g1_coordinated_contact_transition_v1"}
+        del env.cube.data.root_com_pos_w
+        method(env,hand)
+        original=env._effort_geometry["normal_jacobian"].clone()
+        self.assertNotIn("relative_contact_motion",env._effort_geometry)
+        env._effort_contact_transition=None
+        method(env,hand)
+        self.assertTrue(self.t.equal(original,env._effort_geometry["normal_jacobian"]))
+        self.assertNotIn("relative_contact_motion",env._effort_geometry)
+
+    def test_native_forwarding_requires_both_motion_and_geometry_epoch_and_sample_freshness(self):
+        t=self.t;calls=[]
+        tree=ast.parse((ROOT/"src/g1_vla/rl_environment.py").read_text())
+        owner=next(node for node in ast.walk(tree) if isinstance(node,ast.ClassDef) and node.name=="Environment")
+        node=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name=="_update_effort_grasp")
+        scope={"torch":t,"tensor":lambda value:value,"RLEnvironmentError":RLEnvironmentError,
+            "quat_apply":lambda q,v:v,"quat_mul":lambda q,r:q}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),"<actual-relative-motion-forward>","exec"),scope)
+        def update(**values):
+            calls.append(values)
+            return t.zeros(1,7),{"group_force_command_n":t.zeros(1,3)},t.zeros(1,dtype=t.bool)
+        ids=t.tensor([2]);quat=t.zeros(1,9,4);quat[...,3]=1
+        motion={"available":True,"episode_id":ids.clone(),"native_step":9,
+            "relative_velocity_current":t.tensor([[True,False,True]]),
+            "relative_inward_velocity_m_s":t.tensor([[-.01,-.02,-.03]]),
+            "maximum_current_point_relative_inward_velocity_m_s":t.tensor([[-.009,-.019,-.029]])}
+        env=SimpleNamespace(num_envs=1,device="cpu",_episode_ids=ids,_action_ids=list(range(14)),
+            _palm_id=8,_palm_local=t.zeros(1,3),_palm_local_rotation=t.tensor([[0.,0,0,1]]),
+            _effort_reference={"episode_id":ids.clone(),"nominal_hand_rad":t.zeros(1,7),
+                "geometry_lower_hand_rad":t.full((1,7),-1.),"geometry_upper_hand_rad":t.full((1,7),1.),
+                "closing_axis_hand7":t.tensor([-1.,0,0,1,1,1,1]),"palm_reference_world_m":t.zeros(1,3),
+                "palm_reference_quaternion_xyzw":t.tensor([[0.,0,0,1]])},
+            _last_contact_episode_ids=ids.clone(),_last_contact_native_step=9,
+            _effort_geometry={"relative_contact_motion":motion,"episode_id":ids.clone(),"native_step":9,
+                "current_normal_available":t.ones(1,3,dtype=t.bool),"normal_jacobian":t.zeros(1,3,7),
+                "point_jacobian_world_m":t.zeros(1,3,3,7),"inward_normal_world":t.zeros(1,3,3),
+                "point_world_m":t.zeros(1,3,3)},
+            _effort_contact_transition={"version":"g1_coordinated_contact_transition_v2_separating_preload"},
+            _effort_actual_domain_lower=t.full((1,7),-1.),_effort_actual_domain_upper=t.full((1,7),1.),
+            _last_metrics={key:t.ones(1,dtype=t.bool) for key in
+                ("finite","joint_safe","table_pair_measurement_supported","contact_safe")},
+            _unsafe=t.zeros(1,dtype=t.bool),_limits=t.tensor([[[-2.,2.]]*43]),_velocity=t.ones(14),
+            _effort_update_count=0,_control_command_id=1,_effort_grasp=SimpleNamespace(update=update),
+            _write_control_probe=lambda row:None,_object_weight_support_torque=lambda **kw:(t.zeros(1,7),{}),
+            sim=SimpleNamespace(get_physics_step_count=lambda:9),physics_dt=.002,
+            robot=SimpleNamespace(data=SimpleNamespace(joint_pos=t.zeros(1,43),joint_vel=t.zeros(1,43),
+                body_pos_w=t.zeros(1,9,3),body_quat_w=quat,gravity_compensation_forces=t.zeros(1,43))),
+            cube=SimpleNamespace(data=SimpleNamespace(root_pos_w=t.zeros(1,3))))
+        env._last_metrics.update(group_physical_loaded_contact_count=t.ones(1,3,dtype=t.long),
+            group_normal_force_n=t.full((1,3),.1),maximum_penetration_m=t.zeros(1))
+        method=scope["_update_effort_grasp"]
+        method(env)
+        self.assertEqual(calls[-1]["relative_velocity_current"].tolist(),[[True,False,True]])
+        self.assertTrue(t.equal(calls[-1]["relative_inward_velocity_m_s"],t.tensor([[-.01,0.,-.03]])))
+        for stale in ("motion_epoch","motion_sample","geometry_epoch","geometry_sample"):
+            motion["episode_id"]=ids.clone();motion["native_step"]=9
+            env._effort_geometry["episode_id"]=ids.clone();env._effort_geometry["native_step"]=9
+            if stale=="motion_epoch":motion["episode_id"]=ids+1
+            if stale=="motion_sample":motion["native_step"]=8
+            if stale=="geometry_epoch":env._effort_geometry["episode_id"]=ids+1
+            if stale=="geometry_sample":env._effort_geometry["native_step"]=8
+            method(env)
+            self.assertFalse(calls[-1]["relative_velocity_current"].any(),stale)
+            self.assertFalse(calls[-1]["relative_inward_velocity_m_s"].any(),stale)
+        motion["available"]=False
+        method(env)
+        self.assertNotIn("relative_velocity_current",calls[-1])
+        env._keep_current_hand_force_on_full_failure=True
+        env._full_lift=SimpleNamespace(failed=t.tensor([False]))
+        method(env)
+        self.assertNotIn("freeze_reference_by_environment",calls[-1])
+        env._full_lift.failed[:]=True
+        method(env)
+        self.assertTrue(calls[-1]["freeze_reference_by_environment"].all())
+        self.assertFalse(env._unsafe.any())
+
+    def test_common_rigid_motion_is_zero_relative_with_rotating_cube_com_offset(self):
+        t=self.t;v=self.values
+        v["link_position_world"][0,:,1]=t.arange(7)*.01
+        com=v["cube_com_position_world"]
+        velocity=t.tensor([[.03,-.01,.02]]);omega=t.tensor([[0.,0.,.2]])
+        v["cube_com_linear_velocity_world"]=velocity
+        v["cube_angular_velocity_world"]=omega
+        link_velocity=velocity[:,None]+t.linalg.cross(omega[:,None].expand(1,7,3),
+            v["link_position_world"]-com[:,None],dim=-1)
+        v["link_jacobian_world"][0,:,:3,42]=link_velocity[0]
+        v["link_jacobian_world"][0,:,3:,42]=omega.expand(7,3)
+        motion,raw=self.motion()
+        self.assertTrue(motion["relative_velocity_current"].all())
+        self.assertTrue(t.allclose(motion["relative_inward_velocity_m_s"],t.zeros(1,3),atol=1e-8,rtol=0))
+        self.assertTrue(t.allclose(motion["maximum_current_point_relative_inward_velocity_m_s"],t.zeros(1,3),atol=1e-8,rtol=0))
+        full43_inward=t.einsum("ngi,ni->ng",raw["group_weighted_normal_jacobian_full43_m"],v["joint_velocity_full43"])
+        self.assertTrue(t.allclose(full43_inward,motion["weighted_finger_inward_velocity_m_s"],atol=1e-8,rtol=0))
+        self.assertTrue((full43_inward.abs()>0).all())
+
+    def test_opening_finger_can_still_have_cube_approaching_it(self):
+        t=self.t;v=self.values
+        v["link_jacobian_world"][0,:,0,42]=-.01
+        v["cube_com_linear_velocity_world"][0,0]=-.03
+        motion,_=self.motion()
+        self.assertTrue(motion["relative_velocity_current"].all())
+        self.assertTrue(t.allclose(motion["weighted_finger_inward_velocity_m_s"],t.full((1,3),-.01)))
+        self.assertTrue(t.allclose(motion["relative_inward_velocity_m_s"],t.full((1,3),.02)))
+        self.assertTrue((motion["maximum_current_point_relative_inward_velocity_m_s"]>0).all())
+
+    def test_one_closing_even_zero_force_point_cannot_be_hidden_by_negative_group_mean(self):
+        t=self.t;v=self.values
+        v["link_jacobian_world"][0,:,5,42]=.1
+        v["point_world"][0,2,0]=t.tensor([.02,.02,0])
+        v["point_world"][0,2,1]=t.tensor([.02,-.02,0])
+        v["inward_normal_world"][0,2,1,0]=1
+        v["control_point_valid"][0,2,1]=True
+        v["physical_point_loaded"][0,2,1]=False
+        v["point_weight"][0,2,1]=.001
+        motion,_=self.motion()
+        self.assertTrue(motion["relative_velocity_current"][0,0])
+        self.assertLess(motion["relative_inward_velocity_m_s"][0,0].item(),0)
+        self.assertAlmostEqual(motion["maximum_current_point_relative_inward_velocity_m_s"][0,0].item(),.002,places=7)
+        self.assertEqual(motion["original_control_point_count"][0,0].item(),2)
+
+    def test_any_physical_point_excluded_by_original_control_filter_disables_proof(self):
+        v=self.values
+        v["control_point_valid"][0,2,0]=False
+        motion,_=self.motion()
+        self.assertEqual(motion["relative_velocity_current"].tolist(),[[False,True,True]])
+        self.assertEqual(motion["unproved_physical_loaded_point_count"].tolist(),[[1,0,0]])
+        self.assertEqual(motion["relative_inward_velocity_m_s"][0,0].item(),0)
+
+    def test_nan_motion_is_unknown_and_never_becomes_a_separation_certificate(self):
+        v=self.values;v["cube_angular_velocity_world"][0,2]=float("nan")
+        motion,_=self.motion()
+        self.assertFalse(motion["relative_velocity_current"].any())
+        for value in motion.values():
+            if value.is_floating_point():
+                self.assertTrue(self.t.isfinite(value).all())
+        self.assertFalse(motion["maximum_current_point_relative_inward_velocity_m_s"].any())
+
+    def test_different_point_normals_are_dotted_before_original_force_weighting(self):
+        t=self.t;v=self.values
+        v["point_world"][0,2,1]=t.tensor([.02,-.02,0])
+        v["inward_normal_world"][0,2,1,1]=1
+        v["control_point_valid"][0,2,1]=True
+        v["physical_point_loaded"][0,2,1]=True
+        v["point_weight"][0,2,1]=.201
+        v["link_jacobian_world"][0,:,0,42]=.01
+        v["link_jacobian_world"][0,:,1,42]=-.02
+        v["link_jacobian_world"][0,:,5,42]=.1
+        motion,raw=self.motion()
+        expected=(.101*(.01-.1*.01)+.201*(-.02+.1*.02))/(.101+.201)
+        self.assertAlmostEqual(motion["relative_inward_velocity_m_s"][0,0].item(),expected,places=7)
+        recomputed=t.einsum("ngi,ni->ng",raw["group_weighted_normal_jacobian_full43_m"],v["joint_velocity_full43"])
+        self.assertTrue(t.allclose(recomputed,motion["weighted_finger_inward_velocity_m_s"],atol=1e-8,rtol=0))
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "Torch-free host; run sparse contact tests in the native runtime")

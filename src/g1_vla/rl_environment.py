@@ -418,6 +418,190 @@ def _probe_payload(torch, value):
     return value
 
 
+def current_relative_contact_motion(torch, *, link_jacobian_world, link_position_world,
+                                    joint_velocity_full43, point_world, inward_normal_world,
+                                    control_point_valid, physical_point_loaded, point_weight,
+                                    cube_com_position_world, cube_com_linear_velocity_world,
+                                    cube_angular_velocity_world):
+    """Current point approach speed, including every robot DoF and Cube twist.
+
+    Positive normal velocity closes the gap; negative velocity separates.
+    Existing normal-control points and force weights are retained exactly.
+    A group with any unproved control or physical point is unavailable. The
+    caller supplies same-sample tensors and separately checks epoch freshness.
+    No point, normal, or velocity from a previous sample is retained here.
+    """
+    t = torch
+    n = joint_velocity_full43.shape[0]
+    shapes = ((link_jacobian_world, (n,7,6,43)), (link_position_world,(n,7,3)),
+        (joint_velocity_full43,(n,43)), (point_world,(n,7,32,3)),
+        (inward_normal_world,(n,7,32,3)), (point_weight,(n,7,32)),
+        (cube_com_position_world,(n,3)), (cube_com_linear_velocity_world,(n,3)),
+        (cube_angular_velocity_world,(n,3)))
+    if any(not t.is_tensor(value) or tuple(value.shape)!=shape or
+           value.dtype!=joint_velocity_full43.dtype or value.device!=joint_velocity_full43.device
+           for value,shape in shapes):
+        raise ValueError("Relative contact motion requires matching native full43 floating tensors")
+    if not joint_velocity_full43.is_floating_point():
+        raise ValueError("Relative contact motion requires floating native velocities")
+    for mask in (control_point_valid, physical_point_loaded):
+        if (not t.is_tensor(mask) or tuple(mask.shape)!=(n,7,32) or mask.dtype!=t.bool or
+                mask.device!=joint_velocity_full43.device):
+            raise ValueError("Relative contact point masks require matching N by7 by32 booleans")
+    common_finite = (t.isfinite(joint_velocity_full43).all(-1) &
+        t.isfinite(cube_com_position_world).all(-1) & t.isfinite(cube_com_linear_velocity_world).all(-1) &
+        t.isfinite(cube_angular_velocity_world).all(-1))
+    link_finite = t.isfinite(link_jacobian_world).all(dim=(-1,-2)) & t.isfinite(link_position_world).all(-1)
+    normal_norm = t.linalg.vector_norm(inward_normal_world,dim=-1)
+    point_finite = (t.isfinite(point_world).all(-1) & t.isfinite(inward_normal_world).all(-1) &
+        t.isfinite(point_weight) & (point_weight>0) & ((normal_norm-1).abs()<=1e-3))
+    proved = (control_point_valid & point_finite & link_finite[:,:,None] & common_finite[:,None,None])
+    # Replace unavailable values before matrix products. Unknown data must
+    # disable this optional proof, rather than polluting the original law.
+    finite_or_zero = lambda value:t.where(t.isfinite(value),value,t.zeros_like(value))
+    link_j = finite_or_zero(link_jacobian_world)
+    qd = finite_or_zero(joint_velocity_full43)
+    point = finite_or_zero(point_world)
+    normal = finite_or_zero(inward_normal_world)
+    offset = point-finite_or_zero(link_position_world)[:,:,None]
+    link_twist = t.einsum("nbij,nj->nbi",link_j,qd)
+    finger_velocity = (link_twist[:,:,None,:3] + t.linalg.cross(
+        link_twist[:,:,None,3:].expand_as(offset),offset,dim=-1))
+    cube_offset = point-finite_or_zero(cube_com_position_world)[:,None,None]
+    cube_velocity = (finite_or_zero(cube_com_linear_velocity_world)[:,None,None] + t.linalg.cross(
+        finite_or_zero(cube_angular_velocity_world)[:,None,None].expand_as(cube_offset),cube_offset,dim=-1))
+    finger_inward = (normal*finger_velocity).sum(-1)
+    cube_inward = (normal*cube_velocity).sum(-1)
+    relative = (normal*(finger_velocity-cube_velocity)).sum(-1)
+    group_summaries = []
+    weighted_full43 = []
+    for first,last in ((0,3),(3,5),(5,7)):
+        usable = proved[:,first:last]
+        original = control_point_valid[:,first:last]
+        physical = physical_point_loaded[:,first:last]
+        unknown_control = (original & ~usable).sum(dim=(1,2))
+        unknown_physical = (physical & ~usable).sum(dim=(1,2))
+        weight = t.where(usable,point_weight[:,first:last],t.zeros_like(point_weight[:,first:last]))
+        total = weight.sum(dim=(1,2))
+        normalized = weight/total.clamp_min(1e-12)[:,None,None]
+        available = (total>0) & (unknown_control==0) & (unknown_physical==0)
+        def weighted(value):
+            result=(normalized*t.where(usable,value[:,first:last],t.zeros_like(value[:,first:last]))).sum(dim=(1,2))
+            return t.where(available,result,t.zeros_like(result))
+        local=relative[:,first:last]
+        maximum=t.where(usable,local,t.full_like(local,float("-inf"))).amax(dim=(1,2))
+        minimum=t.where(usable,local,t.full_like(local,float("inf"))).amin(dim=(1,2))
+        group_summaries.append({"relative_velocity_current":available,
+            "relative_inward_velocity_m_s":weighted(relative),
+            "weighted_finger_inward_velocity_m_s":weighted(finger_inward),
+            "weighted_cube_inward_velocity_m_s":weighted(cube_inward),
+            "maximum_current_point_relative_inward_velocity_m_s":t.where(available,maximum,t.zeros_like(maximum)),
+            "minimum_current_point_relative_inward_velocity_m_s":t.where(available,minimum,t.zeros_like(minimum)),
+            "original_control_point_count":original.sum(dim=(1,2)),
+            "proved_control_point_count":usable.sum(dim=(1,2)),
+            "unproved_control_point_count":unknown_control,"unproved_physical_loaded_point_count":unknown_physical,
+            "physical_loaded_point_count":physical.sum(dim=(1,2)),"original_force_weight_sum":total})
+        # Raw-window evidence permits an independent full43 dot-product audit;
+        # its rows use the same original point weights, never a new selection.
+        point_j = (link_j[:,first:last,None,:3] + t.linalg.cross(
+            link_j[:,first:last,None,3:].transpose(-1,-2).expand(-1,-1,32,-1,-1),
+            offset[:,first:last,:,None].expand(-1,-1,-1,43,-1),dim=-1).transpose(-1,-2))
+        normal_j=(normal[:,first:last,:,:,None]*point_j).sum(-2)
+        weighted_full43.append((normalized[...,None]*t.where(usable[...,None],normal_j,
+            t.zeros_like(normal_j))).sum(dim=(1,2)))
+    summary={key:t.stack([row[key] for row in group_summaries],dim=1) for key in group_summaries[0]}
+    raw={"link_origin_jacobian_world_full43_m":link_jacobian_world.detach().clone(),
+        "link_origin_position_world_m":link_position_world.detach().clone(),
+        "joint_velocity_full43_rad_s":joint_velocity_full43.detach().clone(),
+        "link_origin_twist_world":link_twist.detach().clone(),
+        "group_weighted_normal_jacobian_full43_m":t.stack(weighted_full43,dim=1).detach().clone(),
+        "cube_com_position_world_m":cube_com_position_world.detach().clone(),
+        "cube_com_linear_velocity_world_m_s":cube_com_linear_velocity_world.detach().clone(),
+        "cube_angular_velocity_world_rad_s":cube_angular_velocity_world.detach().clone()}
+    return summary,raw
+
+
+def revalidated_native_arm_substep(torch, *, segment_origin, macro_endpoint, previous_written,
+                                  measured_arm, native_index, substeps, physics_dt_s,
+                                  velocity_limits_rad_s, anchor_delta_rad, joint_lower, joint_upper,
+                                  point_jz, palm_z, start_palm_z, height_cap_m, enabled, sample_fresh):
+    """Linear native target schedule with fresh box/height revalidation.
+
+    Only enabled main-lift environments use this schedule. Others retain the
+    original macro hold. A failure returns the measured pose as an explicit
+    unsafe override; it never labels that emergency hold velocity-certified.
+    """
+    from .rl_probe_control import apply_probe_guard
+    t=torch; n=macro_endpoint.shape[0]
+    matrices=(segment_origin,macro_endpoint,previous_written,measured_arm,joint_lower,joint_upper,point_jz)
+    if (type(substeps) is not int or substeps!=33 or not math.isclose(physics_dt_s,.002,abs_tol=1e-12,rel_tol=0) or
+            any(tuple(value.shape)!=(n,7) for value in matrices) or
+            any(value.dtype!=macro_endpoint.dtype or value.device!=macro_endpoint.device for value in matrices)):
+        raise ValueError("Native arm interpolation requires matching seven-joint tensors and33 actual2ms substeps")
+    if isinstance(anchor_delta_rad,bool) or not math.isfinite(anchor_delta_rad) or anchor_delta_rad<=0:
+        raise ValueError("Native arm interpolation requires the original finite positive anchor delta")
+    for height in (palm_z,start_palm_z):
+        if (not t.is_tensor(height) or tuple(height.shape)!=(n,) or height.dtype!=macro_endpoint.dtype or
+                height.device!=macro_endpoint.device):
+            raise ValueError("Native arm interpolation requires matching current palm-height tensors")
+    for mask in (enabled,sample_fresh):
+        if tuple(mask.shape)!=(n,) or mask.dtype!=t.bool or mask.device!=macro_endpoint.device:
+            raise ValueError("Native arm interpolation requires matching episode/freshness booleans")
+    if tuple(native_index.shape)!=(n,) or native_index.dtype!=t.int64 or native_index.device!=macro_endpoint.device:
+        raise ValueError("Native arm interpolation requires per-environment native indices")
+    limits=t.as_tensor(velocity_limits_rad_s,dtype=macro_endpoint.dtype,device=macro_endpoint.device)
+    if limits.shape==(7,):limits=limits[None].expand(n,-1)
+    if limits.shape!=(n,7) or not bool(t.isfinite(limits).all()) or bool((limits<=0).any()):
+        raise ValueError("Native arm interpolation requires original positive finite velocity limits")
+    index_valid=(native_index>=1)&(native_index<=substeps)
+    finite=t.stack([t.isfinite(value).all(-1) for value in matrices]).all(0)
+    cap=t.as_tensor(height_cap_m,dtype=macro_endpoint.dtype,device=macro_endpoint.device)
+    if cap.ndim==0:cap=cap.expand(n)
+    if cap.shape!=(n,):raise ValueError("Native arm interpolation requires scalar or N-element height caps")
+    fresh=(sample_fresh & index_valid & finite & t.isfinite(palm_z) & t.isfinite(start_palm_z) &
+           t.isfinite(cap) & (cap>=0))
+    fraction=(native_index.to(macro_endpoint.dtype)/substeps).clamp(0,1)
+    nominal=segment_origin+(macro_endpoint-segment_origin)*fraction[:,None]
+    output=macro_endpoint.clone()
+    low=t.maximum(t.maximum(previous_written-limits*physics_dt_s,measured_arm-anchor_delta_rad),joint_lower)
+    high=t.minimum(t.minimum(previous_written+limits*physics_dt_s,measured_arm+anchor_delta_rad),joint_upper)
+    requires_unsafe=enabled & ~fresh
+    active=enabled & fresh
+    selected=t.nonzero(active,as_tuple=False).flatten()
+    guard_evidence=None
+    if selected.numel():
+        target,guard_evidence=apply_probe_guard(t,nominal[selected],previous_written[selected],measured_arm[selected],
+            low[selected],high[selected],point_jz[selected],palm_z[selected],start_palm_z[selected],
+            cap[selected],mode="box_halfspace_projected_v2")
+        output[selected]=target
+        requires_unsafe[selected] |= guard_evidence["requires_unsafe"]
+    failure_hold=t.where(t.isfinite(measured_arm),measured_arm,previous_written)
+    output=t.where(requires_unsafe[:,None],failure_hold,output)
+    delta=output-previous_written
+    nominal_delta=nominal-previous_written
+    denominator=t.linalg.vector_norm(nominal_delta,dim=-1)
+    ratio=t.where(denominator>1e-12,t.linalg.vector_norm(delta,dim=-1)/denominator.clamp_min(1e-12),
+                  t.zeros_like(denominator))
+    return output,{"schedule":"native_linear33_revalidated_v1","interpolation_enabled":enabled,
+        "sample_fresh":sample_fresh,"native_index":native_index.clone(),"fraction":fraction,
+        "segment_origin_arm_rad":segment_origin,"macro_endpoint_arm_rad":macro_endpoint,
+        "previous_actually_written_arm_target_rad":previous_written,
+        "current_measured_arm_rad":measured_arm,
+        "current_point_jz_m_per_rad":point_jz,
+        "current_palm_z_m":palm_z,"start_palm_z_m":start_palm_z,"height_cap_m":cap,
+        "nominal_interpolated_arm_target_rad":nominal,"revalidated_arm_target_rad":output,
+        "nominal_increment_rad":nominal_delta,"written_increment_rad":delta,
+        "written_increment_rad_s":delta/physics_dt_s,
+        "written_target_minus_measured_arm_rad":output-measured_arm,
+        "interpolation_correction_rad":output-nominal,
+        "written_delta_norm_over_nominal_delta_norm":ratio,
+        "original_velocity_limits_rad_s":limits,"native_lower_bound_rad":low,"native_upper_bound_rad":high,
+        "mechanical_lower_bound_rad":joint_lower,"mechanical_upper_bound_rad":joint_upper,
+        "requires_unsafe":requires_unsafe,"failure_override_is_not_velocity_certified":requires_unsafe,
+        "projected_environment_indices":selected,"native_height_guard":guard_evidence,
+        "target_is_not_measured_joint_motion_or_object_velocity_guarantee":True}
+
+
 class NativeJointLoadDiagnostics:
     """Read-only native load telemetry, separate from support or motor torque.
 
@@ -1428,6 +1612,22 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     raise RLEnvironmentError("full lift requires immutable original six-keyframe hand bounds")
                 self._effort_actual_domain_lower = (trajectory.amin(0)-.025)[None].expand(self.num_envs,-1).clone()
                 self._effort_actual_domain_upper = (trajectory.amax(0)+.025)[None].expand(self.num_envs,-1).clone()
+            self._native_arm_interpolation = (full_lift is not None and
+                full_lift.get("arm_target_schedule")=="native_linear33_revalidated_v1")
+            self._keep_current_hand_force_on_full_failure = (full_lift is not None and
+                full_lift.get("full_lift_failure_response")=="stop_arm_keep_current_hand_force_feedback_v1")
+            if self._native_arm_interpolation:
+                self._last_written_arm_target = self._targets[:,self._action_ids[:7]].clone()
+                self._last_written_arm_target_episode_ids = torch.full_like(self._episode_ids,-1)
+                self._last_written_arm_target_next_native_step = torch.full_like(self._episode_ids,-1)
+                self._arm_segment_origin = self._last_written_arm_target.clone()
+                self._arm_segment_endpoint = self._last_written_arm_target.clone()
+                self._arm_segment_native_index = torch.zeros_like(self._episode_ids)
+                self._arm_segment_episode_ids = self._episode_ids.clone()
+                self._arm_segment_start_native = int(self.sim.get_physics_step_count())
+                self._arm_segment_enabled = torch.zeros_like(self._support_qualified)
+                self._arm_segment_cancelled = torch.zeros_like(self._support_qualified)
+                self._arm_segment_failure_hold = self._last_written_arm_target.clone()
             self._unsafe = torch.zeros_like(self._support_qualified)
             self._probe_overshoot = torch.zeros_like(self._support_qualified)
             self._grip_locked = torch.zeros_like(self._support_qualified)
@@ -2042,8 +2242,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "limited_candidate_action_rad": candidate, "post_guard_target_action_rad": desired,
                     "macro_hand_reference_before_physics_feedback_rad": macro_reference,
                     "unwritten_macro_reference_action_rad": macro_full_reference if self._physics_pinch is not None else None,
-                    "guard_evidence_scope": "macro_arm_guard_and_unwritten_hand_reference_before_inner_feedback" if self._physics_pinch is not None else "macro_applied_target",
+                    "guard_evidence_scope": ("macro_guarded_endpoint_before_native_arm_interpolation" if
+                        getattr(self,"_native_arm_interpolation",False) else
+                        "macro_arm_guard_and_unwritten_hand_reference_before_inner_feedback" if self._physics_pinch is not None else "macro_applied_target"),
                     "hand_target_execution": "2ms_feedback_after_completed_sample" if self._physics_pinch is not None else "macro_target_hold",
+                    "arm_target_execution": ("main_lift_native_linear33_revalidated" if
+                        getattr(self,"_native_arm_interpolation",False) else "macro_target_hold"),
                     "point_jz": point_jz, "palm_position_world_m": tensor(self.robot.data.body_pos_w)[:, self._palm_id]+offset_w,
                     "palm_point_jacobian_w": offset_point_jacobian(torch, palm_jac, offset_w),
                     "start_palm_z_m": self._start_palm_z, "guard_evidence": evidence,
@@ -2052,6 +2256,86 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "post_bounds_passed": bounds_ok, "requires_unsafe": guard_unsafe,
                     "legacy_diagnostic_difference": "post-guard box/height violations are explicit unsafe; roundoff-only legacy residuals remain logged"})
             self._targets[:, self._action_ids] = desired
+            if getattr(self,"_native_arm_interpolation",False):
+                self._arm_segment_origin = self._last_written_arm_target.clone()
+                self._arm_segment_endpoint = desired[:,:7].clone()
+                self._arm_segment_native_index.zero_()
+                self._arm_segment_episode_ids = self._episode_ids.clone()
+                self._arm_segment_start_native = int(self.sim.get_physics_step_count())
+                self._arm_segment_enabled = (self._full_lift.main_lift_started & ~self._unsafe &
+                                             ~self._arm_segment_cancelled)
+
+        def _native_arm_substep_target(self):
+            """Prepare one original-limits-revalidated target; do not write it."""
+            ids=self._action_ids[:7]
+            measured=tensor(self.robot.data.joint_pos)[:,ids]
+            self._arm_segment_native_index += 1
+            native=int(self.sim.get_physics_step_count())
+            fresh=((self._arm_segment_episode_ids==self._episode_ids) &
+                (self._arm_segment_start_native+self._arm_segment_native_index-1==native))
+            nonfinite_measured=~torch.isfinite(measured).all(-1)
+            self._unsafe |= nonfinite_measured
+            cancelled=self._unsafe | self._full_lift.failed
+            first_cancel=cancelled & ~self._arm_segment_cancelled
+            raw_hold=torch.where(self._full_lift.failed[:,None],self._full_lift_failure_arm_target,measured)
+            hold_fallback=~torch.isfinite(raw_hold)
+            hold=torch.where(hold_fallback,self._last_written_arm_target,raw_hold)
+            self._unsafe |= hold_fallback.any(-1)
+            self._arm_segment_failure_hold[first_cancel]=hold[first_cancel]
+            self._arm_segment_cancelled |= cancelled
+            body_rotation=tensor(self.robot.data.body_quat_w)[:,self._palm_id]
+            offset=quat_apply(body_rotation,self._palm_local)
+            palm=tensor(self.robot.data.body_pos_w)[:,self._palm_id]+offset
+            jac=tensor(self.robot.data.body_link_jacobian_w)
+            if jac.shape[1:]!=(self.robot.num_bodies-1,6,43):
+                raise RLEnvironmentError("native arm interpolation requires fixed-root43 current Jacobians")
+            point_j=offset_point_jacobian(torch,jac[:,self._palm_id-1][:,:,ids],offset)
+            cap=torch.where(self._full_lift.main_lift_started,
+                torch.full_like(palm[:,2],full_lift["palm_lift_request_max_m"]),
+                torch.full_like(palm[:,2],settings["probe_clearance_max_m"]))
+            target,evidence=revalidated_native_arm_substep(torch,
+                segment_origin=self._arm_segment_origin,macro_endpoint=self._arm_segment_endpoint,
+                previous_written=self._last_written_arm_target,measured_arm=measured,
+                native_index=self._arm_segment_native_index,
+                substeps=full_lift["arm_target_interpolation_substeps"],physics_dt_s=self.physics_dt,
+                velocity_limits_rad_s=self._velocity[:7],anchor_delta_rad=float(config["control"]["max_anchor_delta_rad"]),
+                joint_lower=self._limits[:,ids,0],joint_upper=self._limits[:,ids,1],point_jz=point_j[:,2],
+                palm_z=palm[:,2],start_palm_z=self._start_palm_z,height_cap_m=cap,
+                enabled=self._arm_segment_enabled & ~self._arm_segment_cancelled,sample_fresh=fresh)
+            guard_failed=evidence["requires_unsafe"] & ~self._arm_segment_cancelled
+            self._arm_segment_failure_hold[guard_failed]=measured[guard_failed]
+            self._arm_segment_cancelled |= guard_failed
+            self._unsafe |= guard_failed
+            target=torch.where(self._arm_segment_cancelled[:,None],self._arm_segment_failure_hold,target)
+            actual_delta=target-self._last_written_arm_target
+            nominal_norm=torch.linalg.vector_norm(evidence["nominal_increment_rad"],dim=-1)
+            evidence.update(segment_episode_id=self._arm_segment_episode_ids.clone(),
+                segment_start_native_step=self._arm_segment_start_native,
+                arm_schedule_cancelled=self._arm_segment_cancelled.clone(),
+                cancelled_measured_pose_hold_rad=self._arm_segment_failure_hold.clone(),
+                cancelled_pose_nonfinite_axis_fallback_to_last_successful_write=hold_fallback,
+                prepared_target_after_failure_override_rad=target.clone(),
+                written_increment_rad=actual_delta,
+                written_increment_rad_s=actual_delta/self.physics_dt,
+                written_target_minus_measured_arm_rad=target-measured,
+                written_delta_norm_over_nominal_delta_norm=torch.where(nominal_norm>1e-12,
+                    torch.linalg.vector_norm(actual_delta,dim=-1)/nominal_norm.clamp_min(1e-12),
+                    torch.zeros_like(nominal_norm)),
+                failure_override_is_not_velocity_certified=self._arm_segment_cancelled.clone())
+            return target,evidence
+
+        def _reset_native_arm_schedule(self,env_ids,arm):
+            """Reset actual-write history only with the real episode reset."""
+            self._last_written_arm_target[env_ids]=arm
+            self._last_written_arm_target_episode_ids[env_ids]=self._episode_ids[env_ids]
+            self._last_written_arm_target_next_native_step[env_ids]=int(self.sim.get_physics_step_count())+1
+            self._arm_segment_origin[env_ids]=arm
+            self._arm_segment_endpoint[env_ids]=arm
+            self._arm_segment_native_index[env_ids]=0
+            self._arm_segment_episode_ids[env_ids]=self._episode_ids[env_ids]
+            self._arm_segment_enabled[env_ids]=False
+            self._arm_segment_cancelled[env_ids]=False
+            self._arm_segment_failure_hold[env_ids]=arm
 
         def _apply_action(self):
             if self._pending_physics_sample:
@@ -2067,7 +2351,32 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._effort_grasp is not None:
                 self._update_effort_grasp()
                 position_ids = [i for i in range(43) if i not in self._action_ids[7:]]
-                self.robot.set_joint_position_target_index(target=self._targets[:, position_ids], joint_ids=position_ids)
+                position_target=self._targets[:,position_ids]
+                arm_evidence=None
+                if getattr(self,"_native_arm_interpolation",False):
+                    arm_target,arm_evidence=self._native_arm_substep_target()
+                    position_target=position_target.clone()
+                    columns=[position_ids.index(i) for i in self._action_ids[:7]]
+                    position_target[:,columns]=arm_target
+                self.robot.set_joint_position_target_index(target=position_target, joint_ids=position_ids)
+                if arm_evidence is not None:
+                    # Record only after the real SDK target-buffer write has
+                    # returned. This is not a getter of an isolated drive torque
+                    # or a guarantee of measured joint/object velocity.
+                    self._last_written_arm_target=arm_target.detach().clone()
+                    self._last_written_arm_target_episode_ids=self._episode_ids.clone()
+                    self._last_written_arm_target_next_native_step=torch.full_like(
+                        self._episode_ids,int(self.sim.get_physics_step_count())+1)
+                    self._write_control_probe({"event":"physics_arm_position_target_written",
+                        "command_id":self._control_command_id,"episode_id":self._episode_ids.clone(),
+                        "native_physics_step_count":int(self.sim.get_physics_step_count()),
+                        "target_applies_to_next_native_step":int(self.sim.get_physics_step_count())+1,
+                        "actually_written_arm_target_rad":self._last_written_arm_target,
+                        "measured_arm_rad":tensor(self.robot.data.joint_pos)[:,self._action_ids[:7]],
+                        "measured_arm_velocity_rad_s":tensor(self.robot.data.joint_vel)[:,self._action_ids[:7]],
+                        "position_write_joint_ids":position_ids,"arm_schedule":arm_evidence,
+                        "write_source":"arguments_of_successful_set_joint_position_target_index",
+                        "native_target_readback_claimed":False})
                 self._write_effort_targets()
             else:
                 self.robot.set_joint_position_target_index(target=self._targets)
@@ -2223,6 +2532,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             loaded points or alter the independent legacy acceptance formula.
             """
             jac = tensor(self.robot.data.body_link_jacobian_w)
+            self._effort_relative_motion_raw = None
             if jac.shape[1:] != (self.robot.num_bodies-1, 6, 43):
                 raise RLEnvironmentError("effort control requires fixed-base link-origin Jacobians")
             j = jac[:, [i-1 for i in self._effort_hand_body_ids]][:, :, :, self._action_ids[7:]]
@@ -2261,6 +2571,36 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 "current_normal_available": torch.stack(availability, 1).detach().clone(),
                 "episode_id": self._episode_ids.clone(),
                 "native_step": int(self.sim.get_physics_step_count())}
+            transition = getattr(self,"_effort_contact_transition",None)
+            if transition is not None and transition.get("version")=="g1_coordinated_contact_transition_v2_separating_preload":
+                try:
+                    motion,raw = current_relative_contact_motion(torch,
+                        link_jacobian_world=jac[:,[i-1 for i in self._effort_hand_body_ids]],
+                        link_position_world=link,
+                        joint_velocity_full43=tensor(self.robot.data.joint_vel),
+                        point_world=point,inward_normal_world=inward,control_point_valid=valid,
+                        physical_point_loaded=(hand["point_valid"][:,:7] &
+                            (hand["point_force"][:,:7].abs()>0) & (hand["separation"][:,:7]<=0)),
+                        point_weight=hand["point_force"][:,:7].abs()+.001,
+                        cube_com_position_world=tensor(self.cube.data.root_com_pos_w),
+                        cube_com_linear_velocity_world=tensor(self.cube.data.root_com_lin_vel_w),
+                        cube_angular_velocity_world=tensor(self.cube.data.root_com_ang_vel_w))
+                    identity={"episode_id":self._episode_ids.clone(),
+                        "native_step":int(self.sim.get_physics_step_count())}
+                    self._effort_geometry["relative_contact_motion"]={**motion,**identity,
+                        "available":True,"source":"current_full43_link_origin_Jqd_minus_Cube_COM_point_twist",
+                        "positive_velocity_is_inward_closing":True,
+                        "point_weight_semantics":"unchanged_abs_raw_Fn_plus_0p001_over_original_control_points",
+                        "all_physical_loaded_points_must_have_current_motion_proof":True}
+                    self._effort_relative_motion_raw={**raw,**identity}
+                except (AttributeError,TypeError,ValueError,RuntimeError) as exc:
+                    # An optional motion proof cannot invalidate successful
+                    # original force/geometry reads or fabricate separation.
+                    self._effort_geometry["relative_contact_motion"]={"available":False,
+                        "episode_id":self._episode_ids.clone(),
+                        "native_step":int(self.sim.get_physics_step_count()),
+                        "unavailable_reason":type(exc).__name__+": "+str(exc),
+                        "fallback":"original_unmodified_hand7_normal_feedback"}
 
         def _object_weight_support_torque(self, *, valid, tracking, geometry, current):
             """Request object weight through fresh physical points, never an attachment.
@@ -2338,6 +2678,21 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "actual_domain_lower_hand_rad": self._effort_actual_domain_lower,
                     "actual_domain_upper_hand_rad": self._effort_actual_domain_upper,
                     "physical_contact_safe": metrics.get("contact_safe", torch.zeros_like(valid))}
+            relative_feedback = {}
+            motion = geometry.get("relative_contact_motion") if geometry is not None else None
+            if motion is not None and motion.get("available") is True:
+                motion_fresh = (motion["episode_id"]==self._episode_ids) & (motion["native_step"]==native_step)
+                motion_current = motion["relative_velocity_current"] & current & fresh[:,None] & motion_fresh[:,None]
+                relative_feedback={"relative_velocity_current":motion_current,
+                    "relative_inward_velocity_m_s":torch.where(motion_current,
+                        motion["relative_inward_velocity_m_s"],torch.zeros_like(motion["relative_inward_velocity_m_s"])),
+                    "maximum_current_point_relative_inward_velocity_m_s":torch.where(motion_current,
+                        motion["maximum_current_point_relative_inward_velocity_m_s"],
+                        torch.zeros_like(motion["maximum_current_point_relative_inward_velocity_m_s"]))}
+            failure_feedback={}
+            if (getattr(self,"_keep_current_hand_force_on_full_failure",False) and
+                    bool(self._full_lift.failed.any())):
+                failure_feedback["freeze_reference_by_environment"]=self._full_lift.failed.clone()
             effort, evidence, unsafe = self._effort_grasp.update(sample_id=native_step,
                 episode_id=self._episode_ids, dt=self.physics_dt, measured_hand_rad=q,
                 measured_hand_velocity_rad_s=tensor(self.robot.data.joint_vel)[:, ids],
@@ -2351,7 +2706,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 nominal_velocity_limit_hand_rad_s=self._velocity[7:][None].expand_as(q),
                 penetration_m=metrics.get("maximum_penetration_m", torch.zeros(self.num_envs, device=self.device)),
                 closing_axis_hand7=ref["closing_axis_hand7"], object_support_torque_nm=support_torque,
-                **guard_feedback)
+                **guard_feedback, **relative_feedback, **failure_feedback)
             self._unsafe |= unsafe
             self._last_written_hand_effort = effort.clone()
             self._effort_update_count += 1
@@ -2837,7 +3192,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 newly_failed = self._full_lift.failed & ~was_failed
                 self._full_lift_failure_arm_target[newly_failed] = tensor(
                     self.robot.data.joint_pos)[newly_failed][:, self._action_ids[:7]]
-                self._unsafe |= self._full_lift.failed
+                if not getattr(self,"_keep_current_hand_force_on_full_failure",False):
+                    self._unsafe |= self._full_lift.failed
                 full_lift_metrics["original_hand_domain_current"] = original_domain
                 full_lift_metrics["raw_group_measurement_valid_current"] = torch.full_like(
                     finite, bool(group_measurement_available)) & finite
@@ -2876,6 +3232,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "episode_id": self._episode_ids, "episode_control_steps": self.episode_length_buf,
                     "measured_hand_rad": tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]],
                     "measured_hand_velocity_rad_s": tensor(self.robot.data.joint_vel)[:, self._action_ids[7:]],
+                    **({"measured_arm_rad":tensor(self.robot.data.joint_pos)[:,self._action_ids[:7]],
+                        "measured_arm_velocity_rad_s":tensor(self.robot.data.joint_vel)[:,self._action_ids[:7]],
+                        "actually_written_arm_position_target_rad":self._last_written_arm_target,
+                        "arm_target_write_episode_id":self._last_written_arm_target_episode_ids,
+                        "arm_target_write_applies_to_native_step":self._last_written_arm_target_next_native_step,
+                        "arm_target_measurement_scope":"completed_native_sample_and_last_successful_position_target_buffer_write_not_sdk_target_readback"}
+                       if getattr(self,"_native_arm_interpolation",False) else {}),
                     "actually_written_hand_target_rad": self._last_written_hand_target,
                     "actually_written_hand_effort_target_nm": self._last_written_hand_effort if active_effort else None,
                     "hand_position_target_active": not active_effort,
@@ -2951,6 +3314,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 "cube_angular_velocity_world_rad_s": angular, "cube_position_in_palm_m": relative,
                 "cube_rotation_in_palm_xyzw": relative_rotation, "raw_contacts": self._raw_contact_tensors,
                 "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False), "raw_capture_reasons": reasons}
+            relative_raw=getattr(self,"_effort_relative_motion_raw",None)
+            if (relative_raw is not None and relative_raw["native_step"]==int(self.sim.get_physics_step_count()) and
+                    torch.equal(relative_raw["episode_id"],self._episode_ids)):
+                row["relative_contact_motion_raw_reconstruction"]=relative_raw
+            if getattr(self,"_native_arm_interpolation",False):
+                row["actually_written_arm_position_target_rad"]=self._last_written_arm_target
+                row["arm_target_schedule"]="native_linear33_revalidated_v1"
             def frozen(value):
                 if torch.is_tensor(value):
                     return value.detach().clone()
@@ -3005,12 +3375,19 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "unsafe_latched": self._unsafe.detach().clone(),
                     "native_joint_load_measurement": self._control_probe_joint_load("post_physics_pre_reset"),
                     "native_self_pair_measurement": self._control_probe_self_pair("post_physics_pre_reset"),
-                    "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False), "pre_reset": True}
+                    "main_lift_authorized": (self._full_lift.main_lift_authorized.clone() if getattr(self, "_full_lift", None) is not None else False), "pre_reset": True}
+                if getattr(self,"_native_arm_interpolation",False):
+                    self._control_transition_snapshot["macro_endpoint_action_rad"]=self._targets.detach().clone()
+                    actual_target=self._targets.detach().clone()
+                    actual_target[:,self._action_ids[:7]]=self._last_written_arm_target
+                    self._control_transition_snapshot["applied_target_rad"]=actual_target
+                    self._control_transition_snapshot["arm_target_source"]="last_successful_native_position_target_write"
             if self._standalone_video:
                 self._capture_evaluation_frame()
             dropped = tensor(self.cube.data.root_pos_w)[:, 2] < 0.70
             success = self._local_success if getattr(self, "_full_lift", None) is None else self._full_lift.full_success
-            terminated = self._unsafe | success | dropped
+            failed = self._full_lift.failed if getattr(self,"_full_lift",None) is not None else torch.zeros_like(self._unsafe)
+            terminated = self._unsafe | success | failed | dropped
             truncated = self.episode_length_buf >= self.max_episode_length
             return terminated, truncated
 
@@ -3250,6 +3627,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._full_lift is not None:
                 self._full_lift.reset(env_ids)
                 self._full_lift_failure_arm_target[env_ids] = q[:, self._action_ids[:7]]
+            if getattr(self,"_native_arm_interpolation",False):
+                self._reset_native_arm_schedule(env_ids,q[:,self._action_ids[:7]])
             self._unsafe[env_ids] = False
             self._probe_overshoot[env_ids] = False
             self._grip_locked[env_ids] = False
@@ -3723,6 +4102,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "contact_domain_posture_guard": getattr(self, "_effort_domain_posture_guard", None),
                         "contact_transition_control": getattr(self, "_effort_contact_transition", None),
                         "full_lift_protocol": full_lift,
+                        "native_arm_target_schedule": (full_lift.get("arm_target_schedule") if full_lift is not None else None),
+                        "last_actually_written_arm_target_rad": (self._last_written_arm_target if
+                            getattr(self,"_native_arm_interpolation",False) else None),
                         "full_lift_current_state": self._full_lift.metrics() if self._full_lift is not None else None,
                         "controller_composition_version": getattr(self._effort_grasp, "contract", {}).get("version"),
                         "update_calls": self._effort_update_count, "last_feedback_sample": self._effort_last_sample,

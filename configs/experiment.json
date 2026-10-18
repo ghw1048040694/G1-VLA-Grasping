@@ -958,7 +958,7 @@
     "backend": "g1_control_physics_diagnostics_v6",
     "num_envs": 8,
     "episodes_per_env": 1,
-    "max_control_steps": 213,
+    "max_control_steps": 243,
     "max_wall_time_s": 3600,
     "optimizer_steps": 0,
     "training_allowed": false,
@@ -1176,11 +1176,11 @@
         "native_binding_readback_required": true
       },
       "evaluation": {
-        "protocol": "full_lift8_v1",
+        "protocol": "full_lift8_v2",
         "num_envs": 8,
         "episodes_per_env": 1,
-        "max_control_steps": 213,
-        "nominal_episode_budget_s": 14.0,
+        "max_control_steps": 243,
+        "nominal_episode_budget_s": 16.0,
         "physics_dt_s": 0.002,
         "control_period_s": 0.066,
         "max_wall_time_s": 3600.0,
@@ -1260,7 +1260,7 @@
       "all_original_acceptance_gates_unchanged": true
     },
     "contact_transition_control": {
-      "version": "g1_coordinated_contact_transition_v1",
+      "version": "g1_coordinated_contact_transition_v2_separating_preload",
       "unload_direction": "current_normal_jacobian_else_declared_axis",
       "missing_group_reference_velocity_limit_rad_s": 0.04,
       "reset_missing_reference_on_first_any_contact": true,
@@ -1275,10 +1275,13 @@
       "free_thumb2_restoring_stiffness_nm_rad": 2.0,
       "free_thumb2_maximum_guard_torque_nm": 0.004,
       "partial_thumb2_normal_world_z_guard": true,
-      "all_original_acceptance_gates_unchanged": true
+      "all_original_acceptance_gates_unchanged": true,
+      "separating_preload_command_floor_n": 0.0,
+      "all_current_points_separating_threshold_m_s": -1e-05,
+      "separating_floor_requires_physically_loaded_current_group": true
     },
     "full_lift": {
-      "version": "g1_contact_qualified_full_lift_v2_servo_headroom",
+      "version": "g1_contact_qualified_full_lift_v4_native_arm_16s",
       "target_corner_clearance_m": 0.1,
       "palm_total_lift_request_m": 0.105,
       "palm_lift_request_max_m": 0.11,
@@ -1288,7 +1291,7 @@
       "hold_duration_s": 0.5,
       "hold_consecutive_samples": 251,
       "actual_height_limit_m": 0.115,
-      "episode_length_s": 14.0,
+      "episode_length_s": 16.0,
       "physics_dt_s": 0.002,
       "local_support_consecutive_samples": 100,
       "local_support_first_to_last_s": 0.198,
@@ -1300,7 +1303,10 @@
       "all_other_original_physical_gates_unchanged": true,
       "training_allowed": false,
       "optimizer_steps": 0,
-      "palm_servo_speed_limit_m_s": 0.018
+      "palm_servo_speed_limit_m_s": 0.018,
+      "arm_target_schedule": "native_linear33_revalidated_v1",
+      "arm_target_interpolation_substeps": 33,
+      "full_lift_failure_response": "stop_arm_keep_current_hand_force_feedback_v1"
     }
   }
 }

@@ -945,6 +945,69 @@ def _transition_thumb_domain_recovery(t, declaration, projection_declaration, *,
     return torque, evidence
 
 
+def _separating_preload_command_floor(t, declaration, *, command, force, force_limit,
+                                      safe, tracking, normal_available, physical_loaded,
+                                      overforce, ramp_fraction, relative_velocity,
+                                      maximum_point_relative_velocity, velocity_current):
+    """Cancel active retreat only when every current point is separating.
+
+    This does not clamp measured force or inject extra positive preload. Missing,
+    stale, inconsistent or nonfinite velocity proof leaves the original command
+    unchanged. The existing hand7 damping law is deliberately unchanged.
+    """
+    n = command.shape[0]
+    for name, value in (("relative_inward_velocity_m_s", relative_velocity),
+                        ("maximum_current_point_relative_inward_velocity_m_s", maximum_point_relative_velocity)):
+        if value is not None and (not t.is_tensor(value) or tuple(value.shape) != (n, 3) or
+                not value.is_floating_point() or value.dtype != command.dtype or value.device != command.device):
+            raise ValueError(name+" requires matching native N by three floating tensor")
+    if velocity_current is not None and (not t.is_tensor(velocity_current) or
+            tuple(velocity_current.shape) != (n, 3) or velocity_current.dtype != t.bool or
+            velocity_current.device != command.device):
+        raise ValueError("relative_velocity_current requires matching native N by three boolean tensor")
+    supplied = all(x is not None for x in (relative_velocity, maximum_point_relative_velocity, velocity_current))
+    if supplied:
+        finite = t.isfinite(relative_velocity) & t.isfinite(maximum_point_relative_velocity)
+        consistent = relative_velocity <= maximum_point_relative_velocity
+        current = velocity_current & finite & consistent
+        separating = current & (maximum_point_relative_velocity <=
+                                 declaration["all_current_points_separating_threshold_m_s"])
+    else:
+        finite = t.zeros(n, 3, dtype=t.bool, device=command.device)
+        consistent = finite.clone()
+        current = finite.clone()
+        separating = finite.clone()
+    gate = ((safe & tracking & (ramp_fraction < 1) & ~overforce.any(-1))[:, None] &
+            normal_available & physical_loaded & (force < force_limit) & separating & (command < 0))
+    after = t.where(gate, t.full_like(command, declaration["separating_preload_command_floor_n"]), command)
+    evidence = {"velocity_inputs_supplied": supplied,
+        "relative_inward_velocity_m_s": relative_velocity,
+        "maximum_current_point_relative_inward_velocity_m_s": maximum_point_relative_velocity,
+        "relative_velocity_declared_current": velocity_current,
+        "relative_velocity_finite_by_group": finite,
+        "weighted_mean_not_above_point_maximum": consistent,
+        "relative_velocity_current_proof": current,
+        "all_current_points_proven_separating": separating,
+        "safe_fresh_sample": safe, "palm_tracking": tracking,
+        "preload_or_ramp_not_complete": ramp_fraction < 1,
+        "current_normal_available_by_group": normal_available,
+        "group_physically_loaded": physical_loaded,
+        "raw_group_force_below_original_limit": force < force_limit,
+        "any_group_overforce": overforce.any(-1),
+        "force_command_before_floor_n": command,
+        "force_command_after_floor_n": after,
+        "separating_preload_floor_applied_by_group": gate,
+        "removed_opening_force_request_n": after-command,
+        "relative_velocity_used_only_for_floor_gate_not_hand7_damping": True,
+        "force_targets_not_increased_and_measured_force_not_clipped": True,
+        "original_overforce_negative_unloading_priority_unchanged": True,
+        "missing_stale_nonfinite_or_inconsistent_proof_uses_original_law": True,
+        "fresh_current_point_proof_required_no_history": True,
+        "zero_force_request_is_not_zero_complete_joint_effort": True,
+        "requested_force_floor_is_not_a_measured_force_bound": True}
+    return after, evidence
+
+
 class BalancedEffortGraspController:
     """Joint efforts for the declared hand-only grasp intervention.
 
@@ -1010,7 +1073,10 @@ class BalancedEffortGraspController:
                geometry_upper_hand_rad, nominal_velocity_limit_hand_rad_s,
                penetration_m, closing_axis_hand7, object_support_torque_nm=None,
                contact_point_jacobian_world_m=None, actual_domain_lower_hand_rad=None,
-               actual_domain_upper_hand_rad=None, physical_contact_safe=None):
+               actual_domain_upper_hand_rad=None, physical_contact_safe=None,
+               relative_inward_velocity_m_s=None,
+               maximum_current_point_relative_inward_velocity_m_s=None,
+               relative_velocity_current=None, freeze_reference_by_environment=None):
         """Use completed native sample k to request efforts for k+1 exactly once."""
         t, p, n = self.torch, self.parameters, self.num_envs
         if (type(sample_id) is not int or sample_id < 0 or type(dt) not in (int, float) or
@@ -1042,6 +1108,12 @@ class BalancedEffortGraspController:
                 any(tuple(v.shape) != (n,) or v.dtype != t.bool
                     for v in (contact_measurement_valid, tracking, unsafe_latched))):
             raise ValueError("Balanced effort feedback dimensions or boolean types are invalid")
+        if freeze_reference_by_environment is not None:
+            if (not t.is_tensor(freeze_reference_by_environment) or
+                    tuple(freeze_reference_by_environment.shape) != (n,) or
+                    freeze_reference_by_environment.dtype != t.bool or
+                    freeze_reference_by_environment.device != self.seed.device):
+                raise ValueError("Reference freeze requires matching native N boolean environment mask")
         axis = closing_axis_hand7.to(device=self.seed.device, dtype=self.seed.dtype)
         if (closing_axis_hand7.dtype == t.bool or not bool(t.isfinite(axis).all()) or
                 not bool(((axis == 0) | (axis.abs() == 1)).all()) or
@@ -1130,12 +1202,23 @@ class BalancedEffortGraspController:
                 t.minimum(velocity_limit, t.full_like(velocity_limit,
                     self.contact_transition["missing_group_reference_velocity_limit_rad_s"])), velocity_limit)
         nominal = t.minimum(t.maximum(nominal_hand_rad, lower), upper)
+        if freeze_reference_by_environment is not None:
+            # A task failure can stop positional chasing without disabling
+            # current normal force feedback or emergency opening. Only fresh,
+            # otherwise-safe samples may replace the reference; duplicate,
+            # reset and unsafe handling below retain their original priority.
+            freeze_reference = safe & freeze_reference_by_environment
+            reference = t.where(freeze_reference[:, None], q, reference)
         if self.contact_transition is not None:
             reference_integration_origin = reference.clone()
         increment = (nominal-reference).clamp(min=-velocity_limit*dt, max=velocity_limit*dt)
+        if freeze_reference_by_environment is not None:
+            increment = t.where(freeze_reference[:, None], t.zeros_like(increment), increment)
         reference = reference + t.where((safe & tracking)[:, None], increment, t.zeros_like(increment))
         if self.contact_transition is None:
             reference = t.minimum(t.maximum(reference, lower), upper)
+            if freeze_reference_by_environment is not None:
+                reference = t.where(freeze_reference[:, None], q, reference)
         # A measured-q reset can start just outside the reference box while
         # remaining within the separate actual-domain tolerance. Projecting it
         # instantly back into the box defeats the native-sample slew bound.
@@ -1229,6 +1312,18 @@ class BalancedEffortGraspController:
         command = t.where(tracking[:, None] | overforce, command.clamp(max=p["group_force_command_upper_n"]),
                           command.clamp(max=0))
         command = t.where(normal_available, command, t.zeros_like(command))
+        separating_floor_evidence = None
+        if (self.contact_transition is not None and
+                "separating_preload_command_floor_n" in self.contact_transition):
+            command, separating_floor_evidence = _separating_preload_command_floor(
+                t, self.contact_transition, command=command, force=raw_group_force_n,
+                force_limit=p["group_force_limit_n"], safe=safe, tracking=tracking,
+                normal_available=normal_available, physical_loaded=group_physical_loaded,
+                overforce=overforce, ramp_fraction=ramp_fraction,
+                relative_velocity=relative_inward_velocity_m_s,
+                maximum_point_relative_velocity=maximum_current_point_relative_inward_velocity_m_s,
+                velocity_current=relative_velocity_current)
+            transition_evidence["separating_preload_floor"] = separating_floor_evidence
         force_torque = t.einsum("ngi,ng->ni", a, command)
         caps = t.tensor(p["joint_torque_limits_nm"], device=q.device, dtype=q.dtype)[None].expand(n, -1)
         gravity_clipped = g.clamp(min=-caps, max=caps)
@@ -1412,4 +1507,14 @@ class BalancedEffortGraspController:
             evidence["contact_domain_posture_guard"] = guard_evidence
         if transition_evidence is not None:
             evidence["contact_transition"] = transition_evidence
+        if freeze_reference_by_environment is not None:
+            evidence["positional_reference_freeze"] = {
+                "requested_by_environment": freeze_reference_by_environment.clone(),
+                "fresh_safe_sample_applied": freeze_reference,
+                "fresh_reference_equals_measured_hand": freeze_reference[:, None] & (reference == q),
+                "nominal_chasing_increment_disabled": freeze_reference,
+                "current_normal_feedback_gravity_and_overforce_law_unchanged": True,
+                "duplicate_keeps_prior_complete_effort_without_new_freeze": duplicate,
+                "hard_unsafe_zero_effort_priority_unchanged": True,
+                "freeze_is_not_a_force_cap_or_verified_safe_placement": True}
         return effort, evidence, unsafe

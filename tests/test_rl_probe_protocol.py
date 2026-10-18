@@ -176,6 +176,22 @@ class FullLiftProbeSettingsTests(unittest.TestCase):
             result["full_lift"]["hold_duration_s"] = .001
             self.assertEqual(value, before)
 
+    def test_named_16s_evaluation_requires_matching_task_deadline(self):
+        from g1_vla.rl_effort_protocol import full_lift_protocol_contract
+        for name in ("full_lift8_v2", "full_lift32_v2"):
+            value = self.settings(True, name)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                probe.validate_probe_settings(value)
+            value["full_lift"] = full_lift_protocol_contract(
+                "g1_contact_qualified_full_lift_v4_native_arm_16s")
+            result = probe.validate_probe_settings(value)
+            self.assertEqual(result["full_lift"]["episode_length_s"], 16.)
+            self.assertEqual(result["effort_grasp_controller"]["evaluation"]["nominal_episode_budget_s"], 16.)
+        value = self.settings(True)
+        value["full_lift"] = full_lift_protocol_contract("g1_contact_qualified_full_lift_v4_native_arm_16s")
+        with self.assertRaises(ValueError):
+            probe.validate_probe_settings(value)
+
     def test_new_task_cannot_use_local_effort_or_omit_task_declaration(self):
         for full in (True, False):
             value = self.settings(full)

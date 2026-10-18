@@ -1719,5 +1719,307 @@ class ContactTransitionControlTests(unittest.TestCase):
         self.assertIn("+g1_coordinated_contact_transition_v1", self.controller.contract["version"])
 
 
+@unittest.skipUnless(TORCH, "real torch is required for separating-preload proof gates")
+class SeparatingPreloadFloorTests(unittest.TestCase):
+    step = BalancedEffortGraspTests.step
+    reset_controller = ContactTransitionControlTests.reset_controller
+    VERSION = "g1_coordinated_contact_transition_v2_separating_preload"
+
+    def setUp(self):
+        ContactTransitionControlTests.setUp(self)
+        from g1_vla.rl_effort_protocol import contact_transition_control_contract
+        self.declaration = contact_transition_control_contract(self.VERSION)
+        self.kw["relative_inward_velocity_m_s"] = self.t.full((2, 3), -.02)
+        self.kw["maximum_current_point_relative_inward_velocity_m_s"] = self.t.full((2, 3), -.01)
+        self.kw["relative_velocity_current"] = self.t.ones(2, 3, dtype=self.t.bool)
+        self.kw["raw_group_force_n"][:] = self.t.tensor([.8, .7, .7])
+        self.reset_controller()
+
+    def floor(self):
+        effort, evidence, unsafe = self.step()
+        return effort, evidence["contact_transition"]["separating_preload_floor"], evidence, unsafe
+
+    def test_proven_all_point_separation_cancels_only_negative_preload_command(self):
+        self.kw["gravity_hand_nm"][:] = .003
+        effort, floor, evidence, unsafe = self.floor()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(floor["separating_preload_floor_applied_by_group"].all())
+        self.assertTrue((floor["force_command_before_floor_n"] < 0).all())
+        self.assertTrue(self.t.equal(evidence["group_force_command_n"], self.t.zeros(2, 3)))
+        self.assertTrue(self.t.equal(evidence["normal_force_torque_nm"], self.t.zeros(2, 7)))
+        self.assertTrue(self.t.allclose(effort, self.t.full((2, 7), .003), atol=1e-8, rtol=0))
+        self.assertTrue(self.t.equal(evidence["group_force_target_n"], self.t.tensor([[.2, .1, .1]]*2)))
+        self.assertTrue(self.t.equal(evidence["raw_group_normal_force_n"], self.kw["raw_group_force_n"]))
+        self.assertTrue(floor["zero_force_request_is_not_zero_complete_joint_effort"])
+
+    def test_a_closing_point_blocks_floor_even_with_negative_weighted_mean(self):
+        self.kw["maximum_current_point_relative_inward_velocity_m_s"][0, 1] = .001
+        _, floor, evidence, _ = self.floor()
+        self.assertFalse(bool(floor["all_current_points_proven_separating"][0, 1]))
+        self.assertFalse(bool(floor["separating_preload_floor_applied_by_group"][0, 1]))
+        self.assertLess(float(evidence["group_force_command_n"][0, 1]), 0.)
+        self.assertTrue(floor["separating_preload_floor_applied_by_group"][1].all())
+
+    def test_hand7_opening_alone_is_not_relative_separation_proof(self):
+        self.kw["measured_hand_velocity_rad_s"][:, 3:5] = -1.
+        self.kw["maximum_current_point_relative_inward_velocity_m_s"][:, 1] = .002
+        self.kw["relative_inward_velocity_m_s"][:, 1] = .001
+        _, floor, evidence, _ = self.floor()
+        self.assertTrue((evidence["inward_velocity_m_s"][:, 1] < 0).all())
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"][:, 1].any())
+        self.assertTrue((evidence["group_force_command_n"][:, 1] < 0).all())
+        expected = (.1+.5*(.1-.7)-.5*evidence["inward_velocity_m_s"][:, 1]).clamp(-.4, 1.2)
+        self.assertTrue(self.t.allclose(evidence["group_force_command_n"][:, 1], expected, atol=1e-7, rtol=0))
+
+    def test_exact_negative_separation_threshold_is_required(self):
+        self.kw["relative_inward_velocity_m_s"][:] = -2e-5
+        self.kw["maximum_current_point_relative_inward_velocity_m_s"][0] = -1e-5
+        self.kw["maximum_current_point_relative_inward_velocity_m_s"][1] = -.9e-5
+        _, floor, _, _ = self.floor()
+        self.assertTrue(floor["separating_preload_floor_applied_by_group"][0].all())
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"][1].any())
+
+    def test_missing_unknown_nonfinite_and_inconsistent_proof_use_original_law(self):
+        for key in ("relative_inward_velocity_m_s", "maximum_current_point_relative_inward_velocity_m_s",
+                    "relative_velocity_current"):
+            old = self.kw[key]
+            self.kw[key] = None
+            _, floor, evidence, _ = self.floor()
+            with self.subTest(missing=key):
+                self.assertFalse(floor["velocity_inputs_supplied"])
+                self.assertFalse(floor["separating_preload_floor_applied_by_group"].any())
+                self.assertTrue((evidence["group_force_command_n"] < 0).all())
+            self.kw[key] = old
+        cases = (("relative_velocity_current", False), ("relative_inward_velocity_m_s", float("nan")),
+                 ("maximum_current_point_relative_inward_velocity_m_s", float("inf")),
+                 ("relative_inward_velocity_m_s", -.005))
+        for key, value in cases:
+            original = self.kw[key].clone()
+            self.kw[key][0, 1] = value
+            _, floor, evidence, unsafe = self.floor()
+            with self.subTest(key=key, value=value):
+                self.assertFalse(bool(floor["separating_preload_floor_applied_by_group"][0, 1]))
+                self.assertLess(float(evidence["group_force_command_n"][0, 1]), 0.)
+                self.assertFalse(unsafe.any())
+            self.kw[key] = original
+
+    def test_every_original_current_safety_condition_is_required(self):
+        cases = (("tracking", (0,), False), ("group_contact_valid", (0, 1), False),
+                 ("group_physical_loaded", (0, 1), False), ("unsafe_latched", (0,), True))
+        for key, index, value in cases:
+            original = self.kw[key].clone()
+            self.kw[key][index] = value
+            _, floor, _, _ = self.floor()
+            with self.subTest(key=key):
+                self.assertFalse(bool(floor["separating_preload_floor_applied_by_group"][0, 1]))
+            self.kw[key] = original
+
+    def test_any_overforce_preserves_original_negative_unload_priority_and_total_caps(self):
+        self.kw["raw_group_force_n"][0, 1] = 1.5001
+        self.kw["gravity_hand_nm"][:] = .035
+        self.kw["object_support_torque_nm"] = self.t.full((2, 7), .02)
+        effort, floor, evidence, unsafe = self.floor()
+        self.assertFalse(unsafe.any())
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"][0].any())
+        self.assertAlmostEqual(float(evidence["group_force_command_n"][0, 1]), -.4, places=7)
+        self.assertTrue(evidence["raw_force_over_limit_by_group"][0, 1])
+        for key in ("gravity_command_nm", "posture_torque_after_normal_projection_nm",
+                    "object_support_torque_after_safety_mask_nm"):
+            self.assertTrue(self.t.equal(evidence[key][0, 3:5], self.t.zeros(2)), key)
+        self.assertTrue((effort[0, 3:5] < 0).all())
+        self.assertTrue((effort.abs() <= self.t.tensor(self.parameters["joint_torque_limits_nm"])+1e-8).all())
+        self.assertTrue(floor["original_overforce_negative_unloading_priority_unchanged"])
+
+    def test_at_original_limit_floor_stays_off_without_relabeling_force(self):
+        self.kw["raw_group_force_n"][:, 1] = 1.5
+        _, floor, evidence, _ = self.floor()
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"][:, 1].any())
+        self.assertFalse(evidence["raw_force_over_limit_by_group"][:, 1].any())
+        self.assertTrue((evidence["raw_group_normal_force_n"][:, 1] == 1.5).all())
+        self.assertTrue((evidence["group_force_command_n"][:, 1] < 0).all())
+
+    def test_nonfinite_raw_force_cannot_be_sanitized_into_floor_proof(self):
+        self.kw["raw_group_force_n"][0, 1] = float("nan")
+        effort, floor, _, unsafe = self.floor()
+        self.assertTrue(bool(unsafe[0]))
+        self.assertFalse(bool(floor["raw_group_force_below_original_limit"][0, 1]))
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"][0].any())
+        self.assertTrue(self.t.equal(effort[0], self.t.zeros(7)))
+        self.assertFalse(bool(unsafe[1]))
+        self.assertTrue(floor["separating_preload_floor_applied_by_group"][1].all())
+
+    def test_full_force_phase_keeps_original_negative_feedback(self):
+        self.kw["raw_group_force_n"][:] = 1.4
+        for _ in range(75):
+            _, floor, evidence, _ = self.floor()
+        self.assertTrue((self.controller.preload_ramp_sample_count == 50).all())
+        self.assertFalse(floor["preload_or_ramp_not_complete"].any())
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"].any())
+        self.assertTrue((evidence["group_force_command_n"][:, 1:] < 0).all())
+        self.assertTrue(self.t.allclose(evidence["group_force_command_n"][:, 1:], self.t.full((2, 2), -.1), atol=2e-7, rtol=0))
+
+    def test_positive_force_requests_are_never_increased(self):
+        self.kw["raw_group_force_n"][:] = .05
+        _, floor, evidence, _ = self.floor()
+        self.assertTrue((floor["force_command_before_floor_n"] > 0).all())
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"].any())
+        self.assertTrue(self.t.equal(floor["force_command_before_floor_n"], evidence["group_force_command_n"]))
+
+    def test_duplicate_reset_and_lost_measurement_do_not_reuse_separation_proof(self):
+        effort, _, _, _ = self.floor()
+        self.kw["relative_velocity_current"][:] = False
+        duplicate, evidence, _ = self.controller.update(sample_id=self.sample-1, **self.kw)
+        self.assertTrue(self.t.equal(duplicate, effort))
+        self.assertFalse(evidence["contact_transition"]["separating_preload_floor"]["separating_preload_floor_applied_by_group"].any())
+        _, floor, evidence, _ = self.floor()
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"].any())
+        self.assertTrue((evidence["group_force_command_n"] < 0).all())
+        self.kw["relative_velocity_current"][:] = True
+        self.kw["episode_id"] = self.ids+1
+        _, floor, _, _ = self.floor()
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"].any())
+        self.floor()
+        self.kw["contact_measurement_valid"][:] = False
+        effort, floor, _, unsafe = self.floor()
+        self.assertTrue(unsafe.all())
+        self.assertTrue(self.t.equal(effort, self.t.zeros_like(effort)))
+        self.assertFalse(floor["separating_preload_floor_applied_by_group"].any())
+
+    def test_new_velocity_argument_shapes_types_and_dtypes_are_explicit(self):
+        invalids = ([0.]*3, self.t.zeros(3), self.t.zeros(2, 2), self.t.zeros(2, 3, dtype=self.t.bool),
+                    self.t.zeros(2, 3, dtype=self.t.float64))
+        for key in ("relative_inward_velocity_m_s", "maximum_current_point_relative_inward_velocity_m_s"):
+            original = self.kw[key]
+            for value in invalids:
+                self.kw[key] = value
+                with self.subTest(key=key, value_type=type(value)), self.assertRaises(ValueError):
+                    self.floor()
+            self.kw[key] = original
+        self.kw["relative_velocity_current"] = self.t.zeros(2, 3)
+        with self.assertRaises(ValueError):
+            self.floor()
+
+    def test_none_and_v1_ignore_new_proof_inputs_with_every_legacy_tensor_bit_preserved(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        from g1_vla.rl_effort_protocol import contact_transition_control_contract
+        for declaration in (None, contact_transition_control_contract()):
+            left = BalancedEffortGraspController(self.t, self.seed, self.ids, contact_transition=declaration)
+            right = BalancedEffortGraspController(self.t, self.seed, self.ids, contact_transition=declaration)
+            self.assertEqual(left.contract_sha256, right.contract_sha256)
+            for sample in range(7):
+                inputs = {k: v for k, v in self.kw.items() if k not in (
+                    "relative_inward_velocity_m_s", "maximum_current_point_relative_inward_velocity_m_s", "relative_velocity_current")}
+                inputs["raw_group_force_n"] = self.t.full((2, 3), .2+sample*.24)
+                a = left.update(sample_id=sample, **inputs)
+                b = right.update(sample_id=sample, relative_inward_velocity_m_s=self.kw["relative_inward_velocity_m_s"],
+                    maximum_current_point_relative_inward_velocity_m_s=self.kw["maximum_current_point_relative_inward_velocity_m_s"],
+                    relative_velocity_current=self.kw["relative_velocity_current"], **inputs)
+                self.assertTrue(self.t.equal(a[0].view(self.t.int32), b[0].view(self.t.int32)))
+                self.assertTrue(self.t.equal(a[2], b[2]))
+                for key in a[1]:
+                    if self.t.is_tensor(a[1][key]):
+                        x, y = a[1][key], b[1][key]
+                        self.assertTrue(self.t.equal(x.view(self.t.int32), y.view(self.t.int32)) if x.dtype == self.t.float32 else self.t.equal(x, y), key)
+                if declaration is not None:
+                    self.assertNotIn("separating_preload_floor", a[1]["contact_transition"])
+                    self.assertNotIn("separating_preload_floor", b[1]["contact_transition"])
+
+    def test_v2_is_explicit_exact_deepcopied_and_keeps_default_factory_v1(self):
+        from g1_vla.rl_effort_protocol import contact_transition_control_contract, validate_contact_transition_control
+        original = contact_transition_control_contract()
+        self.assertEqual(original["version"], "g1_coordinated_contact_transition_v1")
+        self.assertNotIn("separating_preload_command_floor_n", original)
+        changed = contact_transition_control_contract(self.VERSION)
+        changed["preload_group_force_targets_n"][0] = 9.
+        self.assertEqual(contact_transition_control_contract()["preload_group_force_targets_n"], [.2, .1, .1])
+        self.assertEqual(contact_transition_control_contract(self.VERSION)["preload_group_force_targets_n"], [.2, .1, .1])
+        for key, value in (("separating_preload_command_floor_n", .01),
+                           ("all_current_points_separating_threshold_m_s", 0.),
+                           ("separating_floor_requires_physically_loaded_current_group", False)):
+            invalid = dict(self.declaration, **{key: value})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_contact_transition_control(invalid)
+        with self.assertRaises(ValueError):
+            contact_transition_control_contract("latest")
+        self.assertEqual(validate_contact_transition_control(self.declaration), self.declaration)
+
+
+@unittest.skipUnless(TORCH, "real torch is required for task-failure reference freezes")
+class TaskFailureReferenceFreezeTests(unittest.TestCase):
+    step = BalancedEffortGraspTests.step
+    reset_controller = ContactTransitionControlTests.reset_controller
+
+    def setUp(self):
+        ContactTransitionControlTests.setUp(self)
+
+    def test_failed_environment_stops_missing_group_chasing_but_keeps_current_feedback(self):
+        self.kw["nominal_hand_rad"][:] = .5
+        for _ in range(4):
+            self.step()
+        self.kw["measured_hand_rad"][:] = .01
+        self.kw["gravity_hand_nm"][:] = .003
+        self.kw["group_contact_valid"][:, 1] = False
+        self.kw["group_physical_loaded"][:, 1] = False
+        self.kw["raw_group_force_n"][:] = self.t.tensor([.2, 0., .1])
+        self.kw["freeze_reference_by_environment"] = self.t.tensor([True, False])
+        effort, evidence, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(self.t.equal(evidence["reference_hand_rad"][0], self.kw["measured_hand_rad"][0]))
+        self.assertTrue((evidence["reference_hand_rad"][1, 3:5] > self.kw["measured_hand_rad"][1, 3:5]).all())
+        self.assertTrue(self.t.equal(evidence["position_spring_after_contact_mode_mask_nm"][0], self.t.zeros(7)))
+        self.assertTrue(self.t.allclose(evidence["group_force_command_n"], self.t.tensor([[.2, 0., .1]]*2)))
+        self.assertTrue(self.t.equal(evidence["gravity_command_nm"], self.kw["gravity_hand_nm"]))
+        self.assertTrue(self.t.allclose(effort[0, 3:5], self.t.full((2,), .003)))
+        self.assertTrue(evidence["positional_reference_freeze"]["fresh_reference_equals_measured_hand"][0].all())
+        self.assertTrue(evidence["positional_reference_freeze"]["freeze_is_not_a_force_cap_or_verified_safe_placement"])
+
+    def test_freeze_does_not_override_emergency_duplicate_reset_or_hard_unsafe(self):
+        self.kw["freeze_reference_by_environment"] = self.t.ones(2, dtype=self.t.bool)
+        self.kw["gravity_hand_nm"][:] = .01
+        self.kw["nominal_hand_rad"][:] = .5
+        self.kw["raw_group_force_n"][0, 1] = 2.
+        self.kw["unsafe_latched"][1] = True
+        effort, evidence, unsafe = self.step()
+        self.assertFalse(bool(unsafe[0]))
+        self.assertTrue(bool(unsafe[1]))
+        self.assertTrue((effort[0, 3:5] < 0).all())
+        self.assertTrue(self.t.equal(effort[1], self.t.zeros(7)))
+        self.assertAlmostEqual(float(evidence["group_force_command_n"][0, 1]), self.parameters["group_force_command_lower_n"], places=7)
+        reference = self.controller.reference.clone()
+        self.kw["measured_hand_rad"][:] = .02
+        duplicate, repeated, _ = self.controller.update(sample_id=self.sample-1, **self.kw)
+        self.assertTrue(self.t.equal(duplicate, effort))
+        self.assertTrue(self.t.equal(self.controller.reference, reference))
+        self.assertFalse(repeated["positional_reference_freeze"]["fresh_safe_sample_applied"].any())
+        self.kw["episode_id"] = self.ids+1
+        conflict, repeated, unsafe = self.controller.update(sample_id=self.sample-1, **self.kw)
+        self.assertTrue(unsafe.all())
+        self.assertTrue(repeated["duplicate_sample_episode_conflict"].all())
+        self.assertTrue(self.t.equal(conflict, self.t.zeros_like(conflict)))
+        self.kw["unsafe_latched"][:] = False
+        self.kw["measured_hand_rad"][:] = self.seed
+        _, reset, _ = self.step()
+        self.assertFalse(reset["positional_reference_freeze"]["fresh_safe_sample_applied"].any())
+        _, fresh, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(fresh["positional_reference_freeze"]["fresh_safe_sample_applied"].all())
+
+    def test_mask_validation_and_omitted_or_none_preserve_legacy_path(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        for declaration in (None, self.declaration):
+            left = BalancedEffortGraspController(self.t, self.seed, self.ids, contact_transition=declaration)
+            right = BalancedEffortGraspController(self.t, self.seed, self.ids, contact_transition=declaration)
+            for sample in range(5):
+                a = left.update(sample_id=sample, **self.kw)
+                b = right.update(sample_id=sample, freeze_reference_by_environment=None, **self.kw)
+                self.assertTrue(self.t.equal(a[0].view(self.t.int32), b[0].view(self.t.int32)))
+                self.assertTrue(self.t.equal(a[2], b[2]))
+                self.assertNotIn("positional_reference_freeze", a[1])
+                self.assertNotIn("positional_reference_freeze", b[1])
+        for invalid in ([True, False], self.t.zeros(2), self.t.zeros(2, 1, dtype=self.t.bool)):
+            with self.subTest(mask=type(invalid)), self.assertRaises(ValueError):
+                self.controller.update(sample_id=self.sample, freeze_reference_by_environment=invalid, **self.kw)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -454,23 +454,66 @@ class FullLiftProtocolTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 validate_full_lift_protocol(bad)
 
+    def test_native_arm_schedule_is_separate_exact_task_version(self):
+        old = full_lift_protocol_contract()
+        new = full_lift_protocol_contract(
+            "g1_contact_qualified_full_lift_v3_native_arm_interpolation")
+        self.assertEqual(new["arm_target_schedule"], "native_linear33_revalidated_v1")
+        self.assertEqual(new["arm_target_interpolation_substeps"], 33)
+        self.assertEqual(new["full_lift_failure_response"],
+                         "stop_arm_keep_current_hand_force_feedback_v1")
+        self.assertEqual(validate_full_lift_protocol(new), new)
+        self.assertEqual(full_lift_protocol_contract(), old)
+        self.assertNotIn("arm_target_schedule", old)
+        for key in old:
+            if key != "version":
+                self.assertEqual(new[key], old[key])
+        for changed in [dict(new, arm_target_interpolation_substeps=32),
+                        dict(new, arm_target_interpolation_substeps=True),
+                        dict(new, arm_target_schedule="macro_step"),
+                        dict(new, full_lift_failure_response="zero_all_user_effort"),
+                        dict(new, version=old["version"]),
+                        dict(new, version=[]), dict(new, version={}), dict(new, version=True),
+                        {**old, "arm_target_schedule": new["arm_target_schedule"]}]:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                validate_full_lift_protocol(changed)
+
     def test_full_effort_preserves_all_physical_gates_except_declared_task_height(self):
         local = effort_grasp_contract()
-        for name, repeats, steps in [("full_lift8_v1", 1, 213), ("full_lift32_v1", 4, 852)]:
+        for name, repeats, steps, duration in [("full_lift8_v1", 1, 213, 14.),
+                ("full_lift32_v1", 4, 852, 14.), ("full_lift8_v2", 1, 243, 16.),
+                ("full_lift32_v2", 4, 972, 16.)]:
             value = full_lift_effort_grasp_contract(name)
             self.assertEqual(validate_effort_grasp_contract(value), value)
             self.assertEqual(value["version"], FULL_LIFT_EFFORT_GRASP_VERSION)
             self.assertEqual(value["evaluation"]["episodes_per_env"], repeats)
             self.assertEqual(value["evaluation"]["max_control_steps"], steps)
-            self.assertEqual(steps, math.ceil(14/.066)*repeats)
+            self.assertEqual(steps, math.ceil(duration/.066)*repeats)
             self.assertFalse(value["evaluation"]["training_allowed"])
             self.assertEqual(value["evaluation"]["optimizer_steps"], 0)
             expected = deepcopy(local)
             expected["version"] = value["version"]
             expected["acceptance"].update(main_lift_authorized=True, actual_height_limit_m=.115)
-            expected["evaluation"].update(protocol=name, nominal_episode_budget_s=14.,
+            expected["evaluation"].update(protocol=name, nominal_episode_budget_s=duration,
                 episodes_per_env=repeats, max_control_steps=steps)
             self.assertEqual(value, expected)
+
+    def test_native_16s_task_only_adds_declared_physical_deadline(self):
+        old = full_lift_protocol_contract("g1_contact_qualified_full_lift_v3_native_arm_interpolation")
+        new = full_lift_protocol_contract("g1_contact_qualified_full_lift_v4_native_arm_16s")
+        self.assertEqual(new["episode_length_s"], 16.)
+        self.assertEqual(validate_full_lift_protocol(new), new)
+        for key in old:
+            if key not in ("version", "episode_length_s"):
+                self.assertEqual(new[key], old[key])
+        for task, duration in [(old, 16.), (new, 14.)]:
+            with self.assertRaises(ValueError):
+                validate_full_lift_protocol(dict(task, episode_length_s=duration))
+        for name in ("full_lift8_v1", "full_lift8_v2"):
+            value = full_lift_effort_grasp_contract(name)
+            value["evaluation"]["nominal_episode_budget_s"] = 30.-value["evaluation"]["nominal_episode_budget_s"]
+            with self.assertRaises(ValueError):
+                validate_effort_grasp_contract(value)
 
     def test_task_version_deadline_height_and_quotas_cannot_be_mixed(self):
         full = full_lift_effort_grasp_contract()

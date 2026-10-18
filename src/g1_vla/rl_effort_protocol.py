@@ -39,6 +39,13 @@ _CONTACT_TRANSITION_CONTROL = {
     "partial_thumb2_normal_world_z_guard": True,
     "all_original_acceptance_gates_unchanged": True,
 }
+_CONTACT_TRANSITION_CONTROL_V2 = deepcopy(_CONTACT_TRANSITION_CONTROL)
+_CONTACT_TRANSITION_CONTROL_V2.update({
+    "version": "g1_coordinated_contact_transition_v2_separating_preload",
+    "separating_preload_command_floor_n": 0.0,
+    "all_current_points_separating_threshold_m_s": -1e-5,
+    "separating_floor_requires_physically_loaded_current_group": True,
+})
 _CONTACT_DOMAIN_POSTURE_GUARD = {
     "version": "g1_contact_domain_nullspace_posture_guard_v1",
     "hand_joint_index": 2,
@@ -265,6 +272,22 @@ _FULL_LIFT_PROTOCOL = {
     "version": "g1_contact_qualified_full_lift_v2_servo_headroom",
     "palm_servo_speed_limit_m_s": .018,
 }
+_FULL_LIFT_PROTOCOL_V3 = {
+    **_FULL_LIFT_PROTOCOL,
+    "version": "g1_contact_qualified_full_lift_v3_native_arm_interpolation",
+    "arm_target_schedule": "native_linear33_revalidated_v1",
+    "arm_target_interpolation_substeps": 33,
+    "full_lift_failure_response": "stop_arm_keep_current_hand_force_feedback_v1",
+}
+_FULL_LIFT_PROTOCOL_V4 = {
+    **_FULL_LIFT_PROTOCOL_V3,
+    "version": "g1_contact_qualified_full_lift_v4_native_arm_16s",
+    "episode_length_s": 16.0,
+}
+_FULL_LIFT_EVALUATION_QUOTAS = {
+    "full_lift8_v1": (1, 213, 14.0), "full_lift32_v1": (4, 852, 14.0),
+    "full_lift8_v2": (1, 243, 16.0), "full_lift32_v2": (4, 972, 16.0),
+}
 
 
 def full_lift_protocol_contract(version=None):
@@ -278,20 +301,24 @@ def full_lift_protocol_contract(version=None):
         return deepcopy(_FULL_LIFT_PROTOCOL)
     if version == _FULL_LIFT_PROTOCOL_V1["version"]:
         return deepcopy(_FULL_LIFT_PROTOCOL_V1)
+    if version == _FULL_LIFT_PROTOCOL_V3["version"]:
+        return deepcopy(_FULL_LIFT_PROTOCOL_V3)
+    if version == _FULL_LIFT_PROTOCOL_V4["version"]:
+        return deepcopy(_FULL_LIFT_PROTOCOL_V4)
     raise ValueError("Unknown full-lift task version")
 
 
 def full_lift_effort_grasp_contract(protocol="full_lift8_v1"):
     """Declare the new physical task while preserving the v4 local factory."""
-    quotas = {"full_lift8_v1": (1, 213), "full_lift32_v1": (4, 852)}
+    quotas = _FULL_LIFT_EVALUATION_QUOTAS
     if type(protocol) is not str or protocol not in quotas:
         raise ValueError("Unknown full-lift evaluation protocol")
-    episodes, steps = quotas[protocol]
+    episodes, steps, duration = quotas[protocol]
     value = effort_grasp_contract()
     value["version"] = FULL_LIFT_EFFORT_GRASP_VERSION
     value["acceptance"].update(main_lift_authorized=True, actual_height_limit_m=.115)
     value["evaluation"].update(protocol=protocol, episodes_per_env=episodes,
-        max_control_steps=steps, nominal_episode_budget_s=14.0)
+        max_control_steps=steps, nominal_episode_budget_s=duration)
     return value
 
 
@@ -350,21 +377,31 @@ def validate_full_lift_protocol(value):
     """Validate the exact new task; ``None`` preserves the local protocol."""
     if value is None:
         return None
-    expected = (_FULL_LIFT_PROTOCOL_V1 if isinstance(value, dict) and
-                value.get("version") == _FULL_LIFT_PROTOCOL_V1["version"] else _FULL_LIFT_PROTOCOL)
+    versions = {v["version"]: v for v in
+                (_FULL_LIFT_PROTOCOL_V1, _FULL_LIFT_PROTOCOL,
+                 _FULL_LIFT_PROTOCOL_V3, _FULL_LIFT_PROTOCOL_V4)}
+    version = value.get("version") if isinstance(value, dict) else None
+    expected = versions.get(version, _FULL_LIFT_PROTOCOL) if type(version) is str else _FULL_LIFT_PROTOCOL
     _exact(value, expected, "full_lift")
     return deepcopy(value)
 
 
-def contact_transition_control_contract():
+def contact_transition_control_contract(version=None):
     """Coordinated contact acquisition and unloading; not a force guarantee."""
-    return deepcopy(_CONTACT_TRANSITION_CONTROL)
+    if version is None or version == _CONTACT_TRANSITION_CONTROL["version"]:
+        return deepcopy(_CONTACT_TRANSITION_CONTROL)
+    if version == _CONTACT_TRANSITION_CONTROL_V2["version"]:
+        return deepcopy(_CONTACT_TRANSITION_CONTROL_V2)
+    raise ValueError("Unknown explicitly selected contact-transition version")
 
 
 def validate_contact_transition_control(value):
     if value is None:
         return None
-    _exact(value, _CONTACT_TRANSITION_CONTROL, "contact_transition_control")
+    expected = (_CONTACT_TRANSITION_CONTROL_V2 if isinstance(value, dict) and
+                value.get("version") == _CONTACT_TRANSITION_CONTROL_V2["version"]
+                else _CONTACT_TRANSITION_CONTROL)
+    _exact(value, expected, "contact_transition_control")
     return deepcopy(value)
 
 
@@ -465,15 +502,17 @@ def validate_effort_grasp_contract(value):
 
     evaluation = value["evaluation"]
     _keys(evaluation, _DEFAULTS["evaluation"], "evaluation")
-    quota = ({"full_lift8_v1": (1, 213), "full_lift32_v1": (4, 852)} if full_lift else
-             {"calibration8_v1": (1, 91), "acceptance32_v1": (4, 364)})
+    quota = (_FULL_LIFT_EVALUATION_QUOTAS if full_lift else
+             {"calibration8_v1": (1, 91, 6.0), "acceptance32_v1": (4, 364, 6.0)})
     name = evaluation["protocol"]
     if type(name) is not str or name not in quota:
         raise ValueError("unknown effort evaluation protocol")
     for key in evaluation:
-        if key not in ("protocol", "episodes_per_env", "max_control_steps", "max_wall_time_s"):
+        if key not in ("protocol", "episodes_per_env", "max_control_steps", "max_wall_time_s",
+                       "nominal_episode_budget_s"):
             _exact(evaluation[key], expected["evaluation"][key], "evaluation." + key)
-    episodes, steps = quota[name]
+    episodes, steps, duration = quota[name]
+    _exact(evaluation["nominal_episode_budget_s"], duration, "evaluation.nominal_episode_budget_s")
     if type(evaluation["episodes_per_env"]) is not int or evaluation["episodes_per_env"] != episodes:
         raise ValueError("evaluation quota does not match its named protocol")
     if type(evaluation["max_control_steps"]) is not int or evaluation["max_control_steps"] != steps:

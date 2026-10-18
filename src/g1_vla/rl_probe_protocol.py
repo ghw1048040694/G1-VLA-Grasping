@@ -256,6 +256,8 @@ def validate_probe_settings(value):
         result["full_lift"] = validate_full_lift_protocol(full_lift)
         if effort["version"] != FULL_LIFT_EFFORT_GRASP_VERSION:
             raise ValueError("Full lift requires its separately versioned effort/evaluation contract")
+        if effort["evaluation"]["nominal_episode_budget_s"] != result["full_lift"]["episode_length_s"]:
+            raise ValueError("Full-lift task and named evaluation must declare the same physical deadline")
     elif effort is not None:
         from .rl_effort_protocol import FULL_LIFT_EFFORT_GRASP_VERSION
         if effort["version"] == FULL_LIFT_EFFORT_GRASP_VERSION:
