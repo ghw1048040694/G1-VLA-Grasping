@@ -1475,6 +1475,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     effort_model = physics_protocol == RL_PHYSICS_EFFORT_GRASP
     fixed_palm_model = physics_protocol in (RL_PHYSICS_FIXED_PALM_ADJACENCY, RL_PHYSICS_EFFORT_GRASP)
     effort_contract, effort_candidate = None, None
+    control_preshape=config.get("rl_diagnostics",{}).get("control_preshape")
+    preshape_resolution=None
+    if control_preshape is not None and not effort_model:
+        raise RLEnvironmentError("Control preshape requires the explicit effort diagnostic model")
     if effort_model:
         from .rl_effort_protocol import validate_effort_grasp_contract
         diagnostic = config.get("rl_diagnostics", {})
@@ -1489,6 +1493,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         if hashlib.sha256(payload).hexdigest() != diagnostic["candidate_sha256"]:
             raise RLEnvironmentError("effort geometry/reset resource changed")
         effort_candidate = json.loads(payload)
+        if control_preshape is not None:
+            from .rl_preshape import validate_control_preshape, resolve_preshape_frames
+            control_preshape=validate_control_preshape(control_preshape)
+            preshape_resolution=resolve_preshape_frames(control_preshape,effort_candidate,diagnostic["candidate_sha256"])
     initial = _seed_state(config)
     original_initial = copy.deepcopy(initial)
     if effort_model and "reset_joint_positions_rad" in effort_candidate:
@@ -1764,6 +1772,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._actions = torch.zeros(self.num_envs, 14, device=self.device)
             self._previous_actions = torch.zeros_like(self._actions)
             self._episode_ids = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+            if control_preshape is not None:
+                self._control_preshape_contact_seen=torch.zeros_like(self._episode_ids,dtype=torch.bool)
+                self._control_preshape_first_contact_native=torch.full_like(self._episode_ids,-1)
+                self._control_preshape_contact_episode_ids=self._episode_ids.clone()
+                self._control_preshape_contact_last_native=-1
             self._table_positive_per_env = torch.zeros_like(self._episode_ids)
             self._episode_return = torch.zeros(self.num_envs, device=self.device)
             self._support_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
@@ -1774,6 +1787,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._full_lift is not None:
                 self._full_lift_failure_arm_target = self._targets[:, self._action_ids[:7]].clone()
                 frames = effort_candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+                if preshape_resolution is not None:
+                    # Execution frames never define the original physical score domain.
+                    frames=preshape_resolution["original_frames"]
                 trajectory = torch.as_tensor([f.get("hand_target_rad", f.get("target_rad")) for f in frames],
                     device=self.device, dtype=self._targets.dtype)
                 if tuple(trajectory.shape) != (6,7) or not bool(torch.isfinite(trajectory).all()):
@@ -2670,6 +2686,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             guard_arguments = {}
             if self._effort_domain_posture_guard is not None or contact_transition is not None or full_lift is not None:
                 frames = effort_candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+                if preshape_resolution is not None:
+                    frames=preshape_resolution["original_frames"]
                 trajectory = torch.as_tensor([f.get("hand_target_rad", f.get("target_rad")) for f in frames],
                     device=self.device, dtype=tensor(self.robot.data.joint_pos).dtype)
                 if tuple(trajectory.shape) != (6, 7) or not bool(torch.isfinite(trajectory).all()):
@@ -3335,6 +3353,22 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             clearance = cube_position[:, 2] - extent - 0.75
             return cube_position, cube_rotation, cube_velocity, cube_angular, relative_position, relative_rotation, clearance
 
+        def _update_preshape_contact_latch(self,physical_point_count,measurement_valid):
+            """Observe completed native samples; freeze only the next macro reference."""
+            native=int(self.sim.get_physics_step_count())
+            if native<=self._control_preshape_contact_last_native:
+                return
+            changed=self._control_preshape_contact_episode_ids!=self._episode_ids
+            self._control_preshape_contact_seen[changed]=False
+            self._control_preshape_first_contact_native[changed]=-1
+            self._control_preshape_contact_episode_ids=self._episode_ids.clone()
+            loaded=measurement_valid & (physical_point_count>0).any(-1)
+            first=loaded & ~self._control_preshape_contact_seen
+            self._control_preshape_first_contact_native=torch.where(first,
+                torch.full_like(self._episode_ids,native),self._control_preshape_first_contact_native)
+            self._control_preshape_contact_seen |= loaded
+            self._control_preshape_contact_last_native=native
+
         def _sample_physics(self):
             active_effort = getattr(self, "_effort_grasp", None) is not None
             if self._record:
@@ -3469,6 +3503,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             # This version terminates at qualified 2--6 mm support. It never
             # executes or claims the original 0.1 m lift / 0.5 s carry gate.
             self._local_success = qualified_now & ~self._unsafe
+            if hasattr(self,"_control_preshape_contact_seen"):
+                self._update_preshape_contact_latch(group_physical,finite & bool(group_measurement_available))
             full_lift_metrics = {}
             if getattr(self, "_full_lift", None) is not None:
                 hand = tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]]
@@ -3916,6 +3952,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._actions[env_ids] = 0
             self._previous_actions[env_ids] = 0
             self._episode_ids[env_ids] += 1
+            if hasattr(self,"_control_preshape_contact_seen"):
+                self._control_preshape_contact_seen[env_ids]=False
+                self._control_preshape_first_contact_native[env_ids]=-1
+                self._control_preshape_contact_episode_ids[env_ids]=self._episode_ids[env_ids]
             self._episode_return[env_ids] = 0
             self._support_count[env_ids] = 0
             self._support_qualified[env_ids] = False
@@ -4153,6 +4193,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                           native_physics_step_count=int(self.sim.get_physics_step_count()),
                           native_joint_load_measurement=self._control_probe_joint_load("current_episode_control_state"),
                           native_self_pair_measurement=self._control_probe_self_pair("current_episode_control_state"))
+            if hasattr(self,"_control_preshape_contact_seen"):
+                result.update(control_preshape_contact_seen=self._control_preshape_contact_seen.clone(),
+                    control_preshape_first_contact_native=self._control_preshape_first_contact_native.clone(),
+                    control_preshape_contact_episode_ids=self._control_preshape_contact_episode_ids.clone())
             return result
 
         def record_control_probe_transition(self):
@@ -4501,6 +4545,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 audit["relative_damping_native_status"]=damping_status
             if video_recording is not None:
                 audit["video_recording"]=video_recording
+            if control_preshape is not None:
+                audit["policy_contract"]["control_preshape"]=control_preshape
+                audit["control_preshape_resolution"]=preshape_resolution
             return _json_finite(_probe_payload(torch, audit))
 
         def step_audit(self):

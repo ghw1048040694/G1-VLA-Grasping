@@ -98,6 +98,20 @@ class EffortGraspGuide:
         q = state["q_action_rad"]
         self.seed = torch.as_tensor(initial_hand, dtype=q.dtype, device=q.device)[None].expand(q.shape[0], -1).clone()
         frames = candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+        self.control_preshape=settings.get("control_preshape")
+        if self.control_preshape is not None:
+            from .rl_preshape import resolve_preshape_frames
+            resolution=resolve_preshape_frames(self.control_preshape,candidate,settings["candidate_sha256"])
+            original=torch.as_tensor([f.get("hand_target_rad",f.get("target_rad")) for f in resolution["original_frames"]],
+                dtype=q.dtype,device=q.device)
+            self.original_acceptance_low=original.amin(0)[None].expand(q.shape[0],-1).clone()
+            self.original_acceptance_high=original.amax(0)[None].expand(q.shape[0],-1).clone()
+            frames=resolution["execution_frames"]
+            self.preshape_resolution=resolution
+            self.preshape_fraction=torch.zeros_like(q[:,0])
+            self.preshape_physical_contact_started=torch.zeros(q.shape[0],dtype=torch.bool,device=q.device)
+            self.preshape_world_offset=torch.as_tensor(self.control_preshape["palm_offset_world_m"],dtype=q.dtype,device=q.device)
+            self._preshape_native_contact(state)
         source = torch.as_tensor(frames[0].get("hand_target_rad", frames[0].get("target_rad")), dtype=q.dtype, device=q.device)
         if not torch.allclose(self.seed, source[None].expand_as(self.seed), atol=1e-4, rtol=0):
             raise ValueError("Effort grasp trajectory source differs from native reset")
@@ -124,6 +138,11 @@ class EffortGraspGuide:
         self.precontact_count = torch.zeros_like(self.ids)
         self.low = torch.minimum(self.seed, self.goals.amin(0)[None])
         self.high = torch.maximum(self.seed, self.goals.amax(0)[None])
+        if self.control_preshape is not None:
+            # This box constrains references only; physical scoring still uses
+            # the pinned original six frames, computed with the old Torch order.
+            self.low=torch.maximum(self.low,self.original_acceptance_low-.025)
+            self.high=torch.minimum(self.high,self.original_acceptance_high+.025)
         self.axis = torch.as_tensor(candidate.get("closing_axis_hand7", [-1., 0., 0., 1., 1., 1., 1.]), device=q.device, dtype=q.dtype)
         self.acquisition = settings.get("contact_acquisition")
         if self.acquisition is not None and (tuple(self.axis.shape) != (7,) or
@@ -133,8 +152,26 @@ class EffortGraspGuide:
         self.search_offset = torch.zeros(q.shape[0], 3, dtype=q.dtype, device=q.device)
         self.mechanical_low, self.mechanical_high = limits[..., 0].clone(), limits[..., 1].clone()
 
+    def _preshape_native_contact(self,state):
+        """Require episode-tagged 2ms history, including short inter-macro touches."""
+        t=self.torch;n=state["q_action_rad"].shape[0];device=state["q_action_rad"].device
+        names=("control_preshape_contact_seen","control_preshape_first_contact_native",
+               "control_preshape_contact_episode_ids")
+        values=[state.get(name) for name in names]
+        for index,value in enumerate(values):
+            if (not t.is_tensor(value) or tuple(value.shape)!=(n,) or value.device!=device or
+                    (value.dtype!=t.bool if index==0 else value.dtype not in (t.int32,t.int64))):
+                raise ValueError("Preshape requires current native contact history: "+names[index])
+        seen,first,episode=values;native=state.get("native_physics_step_count")
+        if (type(native) is not int or native<0 or bool((episode!=state["episode_id"]).any()) or
+                bool((seen & ((first<0)|(first>native))).any()) or bool((~seen & (first!=-1)).any())):
+            raise ValueError("Preshape native contact history has a stale epoch or contradictory native sample")
+        return seen
+
     def actions(self, actor_actions, state, action_source, dt, force_limit):
         t = self.torch
+        if self.control_preshape is not None:
+            native_preshape_contact=self._preshape_native_contact(state)
         changed = self.ids != state["episode_id"]
         self.ids = state["episode_id"].clone()
         self.stage[changed] = 0
@@ -148,6 +185,10 @@ class EffortGraspGuide:
         self.precontact_count[changed] = 0
         self.search_offset[changed] = 0
         delta = self.palm-state["palm_position_world_m"]
+        if self.control_preshape is not None:
+            self.preshape_fraction[changed]=0
+            self.preshape_physical_contact_started[changed]=False
+            delta=delta+self.preshape_fraction[:,None]*self.preshape_world_offset
         angle = _orientation_error(t, self.rotation, state["palm_quaternion_xyzw"])
         tracking = (t.linalg.vector_norm(delta, dim=-1) <= .003) & (t.linalg.vector_norm(angle, dim=-1) <= .05)
         metrics = state.get("metrics", {})
@@ -169,6 +210,11 @@ class EffortGraspGuide:
         contact_available = all(key in metrics for key in contact_fields)
         group_loaded = metrics.get("group_physical_loaded_contact_count",
                                    t.zeros_like(state["group_normal_force_n"], dtype=t.long))
+        if self.control_preshape is not None:
+            self.preshape_physical_contact_started |= native_preshape_contact
+            desired_fraction=t.where(index==0,blend,t.ones_like(blend))
+            self.preshape_fraction=t.where(self.preshape_physical_contact_started,
+                self.preshape_fraction,desired_fraction)
         unavailable = t.full_like(delta[:, 0], float("inf"))
         opposition = metrics.get("opposition_dot", unavailable)
         side_normal = metrics.get("maximum_abs_normal_z", unavailable)
@@ -189,6 +235,9 @@ class EffortGraspGuide:
         self.elapsed[advance] = 0
         actual_hand = state["q_action_rad"][:, 7:]
         in_domain = ((actual_hand >= self.low-.025) & (actual_hand <= self.high+.025)).all(-1)
+        if self.control_preshape is not None:
+            in_domain=((actual_hand>=self.original_acceptance_low-.025) &
+                (actual_hand<=self.original_acceptance_high+.025)).all(-1)
         orientation_arrived = (actual_hand[:, 1:3]-self.goals[-1, 1:3]).abs().amax(-1) <= .025
         complete = final & (fraction >= 1) & physical & tracking & in_domain
         search_active = t.zeros_like(state["group_normal_force_n"], dtype=t.bool)
@@ -215,6 +264,9 @@ class EffortGraspGuide:
             extension = self.search_offset[:, group_ids]*self.axis
             reference_low = t.maximum(self.mechanical_low, self.low+extension.clamp(max=0))
             reference_high = t.minimum(self.mechanical_high, self.high+extension.clamp(min=0))
+            if self.control_preshape is not None:
+                reference_low=t.maximum(reference_low,self.original_acceptance_low-.025)
+                reference_high=t.minimum(reference_high,self.original_acceptance_high+.025)
             nominal = t.minimum(t.maximum(nominal+extension,
                                           reference_low), reference_high)
         ready = state["preload_contact_ready"] & complete
@@ -239,6 +291,8 @@ class EffortGraspGuide:
                 (self.probe+self.main_lift_velocity*dt).clamp(max=self.full_lift["palm_total_lift_request_m"]),
                 self.probe)
         palm_goal = self.palm.clone()
+        if self.control_preshape is not None:
+            palm_goal=palm_goal+self.preshape_fraction[:,None]*self.preshape_world_offset
         palm_goal[:, 2] += self.probe
         gain, maximum_linear = POSE_SERVO["position_gain_per_s"], .01
         if self.full_lift is not None:
@@ -256,7 +310,7 @@ class EffortGraspGuide:
         result = t.zeros_like(actor_actions)
         desired_arm = state["target_action_rad"][:, :7]+velocity*dt
         result[:, :7] = ((desired_arm-state["target_action_rad"][:, :7])/state["per_step_action_rad"][..., :7]).clamp(-1, 1)
-        return result, {"action_source": action_source, "guided_target_hand_rad": nominal,
+        evidence={"action_source": action_source, "guided_target_hand_rad": nominal,
             "geometry_lower_hand_rad": reference_low, "geometry_upper_hand_rad": reference_high,
             "base_geometry_lower_hand_rad": self.low, "base_geometry_upper_hand_rad": self.high,
             "contact_acquisition_declaration": self.acquisition,
@@ -280,6 +334,21 @@ class EffortGraspGuide:
             "main_lift_reference_velocity_m_s": self.main_lift_velocity,
             "palm_rotation_reference_xyzw": self.rotation, "hand_position_target_not_applied": True,
             "physical_contact_equilibrium_not_support": True}
+        if self.control_preshape is not None:
+            evidence["control_preshape"]={"declaration":copy.deepcopy(self.control_preshape),
+                "palm_offset_fraction":self.preshape_fraction.clone(),
+                "palm_reference_world_offset_m":self.preshape_fraction[:,None]*self.preshape_world_offset,
+                "first_physical_contact_latched":self.preshape_physical_contact_started.clone(),
+                "native_first_physical_contact_sample":state["control_preshape_first_contact_native"].clone(),
+                "native_contact_latch_episode_ids":state["control_preshape_contact_episode_ids"].clone(),
+                "palm_freeze_scope":"next_macro_reference_only_not_instantaneous_motor_stop",
+                "offset_is_reference_not_native_pose_or_target_readback":True,
+                "original_acceptance_lower_hand_rad":self.original_acceptance_low-.025,
+                "original_acceptance_upper_hand_rad":self.original_acceptance_high+.025,
+                "execution_reference_lower_hand_rad":self.low,"execution_reference_upper_hand_rad":self.high,
+                "original_acceptance_frames_unchanged":True,"static_geometry_is_not_native_admission":True,
+                "force_mode_position_springs_unchanged_zero":True}
+        return result,evidence
 
 
 class GuidedClosure:

@@ -782,6 +782,79 @@ class NativeArmTargetScheduleTests(unittest.TestCase):
         self.assertFalse(fake._unsafe.any())
 
 
+@unittest.skipUnless(importlib.util.find_spec("torch"), "Score domain adapters require real Torch")
+class PreshapeImmutableScoreDomainTests(unittest.TestCase):
+    def test_native_contact_history_keeps_short_touches_and_partial_reset_identity(self):
+        import torch
+        tree=ast.parse((ROOT/"src/g1_vla/rl_environment.py").read_text())
+        owner=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=="Environment")
+        method=next(n for n in owner.body if isinstance(n,ast.FunctionDef) and n.name=="_update_preshape_contact_latch")
+        scope={"torch":torch};exec(compile(ast.Module(body=[method],type_ignores=[]),"<actual-preshape-native-latch>","exec"),scope)
+        native=[1];env=SimpleNamespace(_episode_ids=torch.full((8,),2,dtype=torch.long),
+            _control_preshape_contact_seen=torch.zeros(8,dtype=torch.bool),
+            _control_preshape_first_contact_native=torch.full((8,),-1,dtype=torch.long),
+            _control_preshape_contact_episode_ids=torch.full((8,),2,dtype=torch.long),
+            _control_preshape_contact_last_native=-1,sim=SimpleNamespace(get_physics_step_count=lambda:native[0]))
+        update=scope[method.name];counts=torch.zeros(8,3,dtype=torch.long);valid=torch.ones(8,dtype=torch.bool)
+        counts[2,0]=1;valid[2]=False;update(env,counts,valid)
+        self.assertFalse(env._control_preshape_contact_seen.any(),"Unknown measurements cannot witness contact")
+        native[0]=17;valid[:]=True;counts[2,0]=1;counts[5,1]=1;update(env,counts,valid)
+        self.assertEqual(env._control_preshape_first_contact_native.tolist(),[-1,-1,17,-1,-1,17,-1,-1])
+        counts[:]=0;native[0]=33;update(env,counts,valid)
+        self.assertTrue(env._control_preshape_contact_seen[2]);self.assertTrue(env._control_preshape_contact_seen[5])
+        counts[4,2]=1;update(env,counts,valid)
+        self.assertFalse(env._control_preshape_contact_seen[4],"Duplicate native steps cannot create a new proof")
+        reset=next(n for n in owner.body if isinstance(n,ast.FunctionDef) and n.name=="_reset_idx")
+        branch=next(n for n in reset.body if isinstance(n,ast.If) and isinstance(n.test,ast.Call) and
+            isinstance(n.test.func,ast.Name) and n.test.func.id=="hasattr" and len(n.test.args)>1 and
+            isinstance(n.test.args[1],ast.Constant) and n.test.args[1].value=="_control_preshape_contact_seen")
+        env._episode_ids[2]+=1
+        exec(compile(ast.Module(body=branch.body,type_ignores=[]),"<actual-preshape-partial-reset>","exec"),
+            {"self":env,"env_ids":torch.tensor([2])})
+        self.assertFalse(env._control_preshape_contact_seen[2]);self.assertEqual(int(env._control_preshape_first_contact_native[2]),-1)
+        self.assertTrue(env._control_preshape_contact_seen[5]);self.assertEqual(int(env._control_preshape_first_contact_native[5]),17)
+        self.assertTrue(torch.equal(env._control_preshape_contact_episode_ids,env._episode_ids))
+        native[0]=34;counts[:]=0;update(env,counts,valid)
+        self.assertFalse(env._control_preshape_contact_seen[2])
+
+    def test_both_native_domain_initializers_use_original_frames_even_if_execution_frames_change(self):
+        import torch
+        from g1_vla.rl_preshape import control_preshape_contract,resolve_preshape_frames
+        candidate=json.loads((ROOT/"resources/rl_geometry_candidates/opposed_face_effort_pinch_v2.json").read_text())
+        resolution=resolve_preshape_frames(control_preshape_contract(),candidate,
+            control_preshape_contract()["acceptance_candidate_sha256"])
+        # Deliberately corrupt only the separate execution copy. This adapter
+        # test proves neither native score-domain initializer reads that copy.
+        resolution["execution_frames"][1]["hand_target_rad"][1]=100.
+        tree=ast.parse((ROOT/"src/g1_vla/rl_environment.py").read_text())
+        owner=next(n for n in ast.walk(tree) if isinstance(n,ast.ClassDef) and n.name=="Environment")
+        original=torch.tensor([f["hand_target_rad"] for f in candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]])
+        expected_low=(original.amin(0)-.025)[None].repeat(8,1)
+        expected_high=(original.amax(0)+.025)[None].repeat(8,1)
+        for name in ("__init__","configure_effort_grasp"):
+            method=next(n for n in owner.body if isinstance(n,ast.FunctionDef) and n.name==name)
+            selected=None
+            for node in ast.walk(method):
+                body=getattr(node,"body",[])
+                for start,item in enumerate(body):
+                    if (isinstance(item,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="frames" for t in item.targets) and
+                            isinstance(item.value,ast.Subscript) and "effort_candidate" in ast.unparse(item.value)):
+                        for end in range(start,len(body)):
+                            target=body[end]
+                            if isinstance(target,ast.Assign) and any(isinstance(t,ast.Attribute) and t.attr=="_effort_actual_domain_upper" for t in target.targets):
+                                selected=body[start:end+1];break
+                        if selected:break
+                if selected:break
+            self.assertIsNotNone(selected,name)
+            fake=SimpleNamespace(device="cpu",num_envs=8,_targets=torch.zeros(8,43),
+                robot=SimpleNamespace(data=SimpleNamespace(joint_pos=torch.zeros(8,43))))
+            scope={"torch":torch,"tensor":lambda value:value,"self":fake,"effort_candidate":candidate,
+                "preshape_resolution":resolution,"RLEnvironmentError":RLEnvironmentError}
+            exec(compile(ast.Module(body=selected,type_ignores=[]),"<actual-original-score-domain>","exec"),scope)
+            self.assertTrue(torch.equal(fake._effort_actual_domain_lower,expected_low),name)
+            self.assertTrue(torch.equal(fake._effort_actual_domain_upper,expected_high),name)
+
+
 @unittest.skipUnless(importlib.util.find_spec("torch") and importlib.util.find_spec("PIL"), "Original camera adapters require Torch and Pillow")
 class DeclaredMultiCameraTests(unittest.TestCase):
     @contextmanager

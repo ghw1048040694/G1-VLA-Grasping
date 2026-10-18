@@ -1327,6 +1327,84 @@
         6,
         7
       ]
+    },
+    "control_preshape": {
+      "version": "g1_pinned_precontact_control_preshape_v1",
+      "acceptance_candidate_sha256": "2daa38dafba243eae42cd1450d9a0030f7d0503e6073647309109f3cbc885a60",
+      "acceptance_frames_sha256": "3e107979a990e65a1996481bc237621db1787ecaf5541dbf0dceff577eafcc19",
+      "static_geometry_evidence_sha256": "97f7afb5c1fed93bbd5a582530a576fde6c0072dd4daec54c671f9062df2b10a",
+      "static_geometry_qualification": "sampled_authored_geometry_only_not_native_support_or_dynamic_admission",
+      "palm_offset_world_m": [
+        0.0005,
+        0,
+        0
+      ],
+      "palm_offset_schedule": "smoothstep_existing_first_stage_then_hold_v1",
+      "palm_offset_freezes_on_first_fresh_physical_contact": true,
+      "contact_latch_cadence_s": 0.002,
+      "palm_reference_freeze_boundary": "next_macro_after_first_same_episode_native_loaded_point_v1",
+      "force_mode_hand_position_springs_remain_zero": true,
+      "execution_frame_hand_offsets_rad": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0.01,
+          0,
+          0.006825593136154828,
+          0.006401722017027434,
+          0.0028729982670930576,
+          0.008135523724513316
+        ],
+        [
+          0,
+          0.01,
+          0,
+          0.004337697881246272,
+          0.01578057645952391,
+          0.0037687095397486714,
+          0.006497875709490897
+        ],
+        [
+          0,
+          0.01,
+          0,
+          0.004337697881246272,
+          0.01578057645952391,
+          0.0037687095397486714,
+          0.006497875709490897
+        ],
+        [
+          0,
+          0.01,
+          0,
+          0.004337697881246272,
+          0.01578057645952391,
+          0.0037687095397486714,
+          0.006497875709490897
+        ],
+        [
+          0,
+          0.01,
+          0,
+          0.004337697881246272,
+          0.01578057645952391,
+          0.0037687095397486714,
+          0.006497875709490897
+        ]
+      ],
+      "first_stage_duration_s": 0.9,
+      "original_actual_geometry_tolerance_rad": 0.025,
+      "all_environments_same_preshape": true,
+      "original_reset_and_episode_budget_unchanged": true,
+      "training_allowed": false
     }
   }
 }

@@ -44,7 +44,7 @@ class NativeEffortAdapterTests(unittest.TestCase):
         import torch
         self.t = torch
         self.scope = {"torch": torch, "tensor": lambda v: v, "RLEnvironmentError": RuntimeError,
-                      "math": math, "json": json,
+                      "math": math, "json": json, "preshape_resolution": None,
                       "settings": {"contact_offset_m": .001, "max_abs_normal_z": .6}}
 
     def guide_fixture(self, *, acquisition=None, axis=None):

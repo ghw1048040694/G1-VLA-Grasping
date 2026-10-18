@@ -63,6 +63,125 @@ class DiagnosticVideoDeliveryTests(unittest.TestCase):
 
 
 @unittest.skipUnless(TORCH, "real torch is required for control math")
+class PreshapeGuideTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        from g1_vla.rl_diagnostics import EffortGraspGuide
+        from g1_vla.rl_preshape import control_preshape_contract
+        self.t=torch;root=Path(__file__).resolve().parents[1]
+        self.candidate=json.loads((root/"resources/rl_geometry_candidates/opposed_face_effort_pinch_v2.json").read_text())
+        self.declaration=control_preshape_contract();seed=self.candidate["source_hand_rad"]
+        origins=torch.arange(8,dtype=torch.float32)[:,None]*torch.tensor([[2.5,0.,0.]])
+        self.state={"q_action_rad":torch.zeros(8,14),"qd_action_rad_s":torch.zeros(8,14),
+            "target_action_rad":torch.zeros(8,14),"per_step_action_rad":torch.full((14,),.08),
+            "joint_limits_action_rad":torch.tensor([[[-2.,2.]]*14]*8),"palm_position_world_m":origins.clone(),
+            "palm_quaternion_xyzw":torch.tensor([[0.,0.,0.,1.]]*8),
+            "palm_point_jacobian_w":torch.cat((torch.eye(6),torch.zeros(6,1)),-1)[None].repeat(8,1,1),
+            "group_normal_force_n":torch.zeros(8,3),"episode_control_steps":torch.zeros(8,dtype=torch.long),
+            "episode_id":torch.full((8,),2,dtype=torch.long),"preload_contact_ready":torch.zeros(8,dtype=torch.bool),
+            "unsafe_latched":torch.zeros(8,dtype=torch.bool),"contact_metrics_current_episode":torch.zeros(8,dtype=torch.bool),
+            "control_preshape_contact_seen":torch.zeros(8,dtype=torch.bool),
+            "control_preshape_first_contact_native":torch.full((8,),-1,dtype=torch.long),
+            "control_preshape_contact_episode_ids":torch.full((8,),2,dtype=torch.long),
+            "native_physics_step_count":0}
+        self.state["q_action_rad"][:,7:]=torch.tensor(seed);self.state["target_action_rad"]=self.state["q_action_rad"].clone()
+        self.cfg={"control_preshape":self.declaration,"candidate_sha256":self.declaration["acceptance_candidate_sha256"],
+            "guided_preload_controls":3,"guided_probe_speed_m_s":.002,"guided_probe_height_m":.0025}
+        self.guide=EffortGraspGuide(torch,self.cfg,seed,self.state,self.candidate)
+
+    def action(self,dt=.15):
+        self.state["native_physics_step_count"]+=33
+        return self.guide.actions(self.t.zeros(8,14),self.state,"guided_hand_pose_hold",dt,1.5)
+
+    def test_first_original_stage_smooths_identical_offsets_without_reset_or_budget_changes(self):
+        before=copy.deepcopy(self.candidate);original=copy.deepcopy(self.state)
+        for _ in range(3):actions,e=self.action()
+        p=e["control_preshape"]
+        self.assertTrue(self.t.allclose(p["palm_offset_fraction"],self.t.full((8,),.5)))
+        expected=self.t.tensor([[.00025,0.,0.]]).repeat(8,1)
+        self.assertTrue(self.t.allclose(p["palm_reference_world_offset_m"],expected))
+        self.assertTrue(self.t.equal(e["palm_pose_reference_world_m"][:,2],original["palm_position_world_m"][:,2]))
+        self.assertTrue((actions[:,0]>0).all());self.assertTrue((actions[:,2]==0).all())
+        self.assertEqual(self.candidate,before);self.assertEqual(len(self.guide.durations),5)
+        self.assertAlmostEqual(float(self.guide.durations[0]),.9,places=6)
+        self.assertAlmostEqual(float(self.guide.durations.sum()),3.3,places=6)
+        self.assertTrue(self.t.equal(self.state["episode_id"],original["episode_id"]))
+        self.assertTrue(self.t.equal(self.state["q_action_rad"],original["q_action_rad"]))
+
+    def test_current_physical_contact_freezes_offset_and_partial_reset_clears_only_its_episode(self):
+        for _ in range(3):_,e=self.action()
+        previous=self.guide.preshape_fraction.clone()
+        # A real short contact at native100 has already disappeared from the
+        # current macro frame. Its same-episode native history must still stop
+        # new preshape reference progress.
+        self.state["metrics"]={"group_physical_loaded_contact_count":self.t.zeros(8,3,dtype=self.t.long)}
+        self.state["control_preshape_contact_seen"][:]=True
+        self.state["control_preshape_first_contact_native"][:]=100
+        self.action();self.assertTrue(self.t.equal(previous,self.guide.preshape_fraction))
+        self.state["episode_id"][3]+=1;self.state["contact_metrics_current_episode"][3]=False
+        self.state["control_preshape_contact_episode_ids"][3]=self.state["episode_id"][3]
+        self.state["control_preshape_contact_seen"][3]=False
+        self.state["control_preshape_first_contact_native"][3]=-1
+        self.action();self.assertFalse(self.guide.preshape_physical_contact_started[3])
+        self.assertTrue(self.t.equal(previous[self.t.arange(8)!=3],self.guide.preshape_fraction[self.t.arange(8)!=3]))
+        self.assertLess(float(self.guide.preshape_fraction[3]),float(previous[3]))
+
+    def test_missing_stale_or_future_native_contact_proof_cannot_advance_preshape(self):
+        for key in ("control_preshape_contact_seen","control_preshape_first_contact_native",
+                    "control_preshape_contact_episode_ids"):
+            original=self.state.pop(key)
+            with self.assertRaisesRegex(ValueError,"native contact history"):self.action()
+            self.state[key]=original
+        self.state["control_preshape_contact_episode_ids"][2]-=1
+        with self.assertRaisesRegex(ValueError,"stale epoch"):self.action()
+        self.state["control_preshape_contact_episode_ids"][2]+=1
+        self.state["control_preshape_contact_seen"][2]=True
+        self.state["control_preshape_first_contact_native"][2]=100000
+        with self.assertRaisesRegex(ValueError,"contradictory native sample"):self.action()
+
+    def test_original_score_domain_does_not_follow_shifted_execution_or_reference_search(self):
+        frames=self.candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+        original=self.t.tensor([f["hand_target_rad"] for f in frames])
+        self.assertTrue(self.t.equal(self.guide.original_acceptance_low,original.amin(0)[None].repeat(8,1)))
+        self.assertTrue(self.t.equal(self.guide.original_acceptance_high,original.amax(0)[None].repeat(8,1)))
+        self.assertTrue((self.guide.low>=self.guide.original_acceptance_low-.025).all())
+        self.assertTrue((self.guide.high<=self.guide.original_acceptance_high+.025).all())
+        self.guide.stage[:]=4;self.guide.elapsed[:]=.6;self.guide.preshape_fraction[:]=1
+        self.state["q_action_rad"][:,7:]=self.guide.goals[-1]
+        self.state["q_action_rad"][:,8]=self.guide.original_acceptance_high[:,1]+.026
+        self.state["contact_metrics_current_episode"][:]=True
+        self.state["metrics"]={"contact_safe":self.t.ones(8,dtype=self.t.bool),
+            "group_physical_loaded_contact_count":self.t.ones(8,3,dtype=self.t.long),
+            "opposition_dot":self.t.full((8,),-1.),"maximum_abs_normal_z":self.t.zeros(8),
+            "maximum_penetration_m":self.t.zeros(8)}
+        _,e=self.action();self.assertFalse(e["stage_final_actual_geometry_domain"].any())
+        self.assertFalse(e["closure_path_complete"].any())
+
+    def test_horizontal_offset_does_not_rebase_original_main_lift_z_reference(self):
+        from g1_vla.rl_effort_protocol import full_lift_protocol_contract
+        self.guide.full_lift=full_lift_protocol_contract("g1_contact_qualified_full_lift_v4_native_arm_16s")
+        self.guide.stage[:]=4;self.guide.elapsed[:]=.6;self.guide.probe[:]=.02
+        self.guide.preshape_fraction[:]=1;self.state["contact_metrics_current_episode"][:]=True
+        self.state["metrics"]={key:self.t.ones(8,dtype=self.t.bool) for key in
+            ("main_lift_started","main_lift_authorized","support_current")}
+        self.state["metrics"]["group_physical_loaded_contact_count"]=self.t.ones(8,3,dtype=self.t.long)
+        _,e=self.action(.066)
+        self.assertTrue(self.t.equal(e["palm_pose_reference_world_m"][:,2],self.guide.palm[:,2]+self.guide.probe))
+        self.assertTrue(self.t.allclose(e["control_preshape"]["palm_reference_world_offset_m"],
+            self.t.tensor([[.0005,0.,0.]]).repeat(8,1)))
+
+    def test_preshape_arm_request_still_passes_original_box_and_height_projection(self):
+        from g1_vla.rl_probe_control import apply_probe_guard
+        action,e=self.action(.45);previous=self.state["target_action_rad"][:,:7]
+        desired=previous+action[:,:7]*self.state["per_step_action_rad"][:7]
+        low=previous-.08;high=previous+.08;jz=self.t.zeros_like(desired);jz[:,2]=1
+        target,evidence=apply_probe_guard(self.t,desired,previous,self.state["q_action_rad"][:,:7],low,high,
+            jz,self.t.zeros(8),self.t.zeros(8),.006,mode="box_halfspace_projected_v2")
+        self.assertTrue(self.t.equal(target,desired));self.assertTrue((target>=low).all());self.assertTrue((target<=high).all())
+        self.assertTrue((target[:,2]<=.006).all())
+
+
+@unittest.skipUnless(TORCH, "real torch is required for control math")
 class DiagnosticControlTests(unittest.TestCase):
     def setUp(self):
         import torch

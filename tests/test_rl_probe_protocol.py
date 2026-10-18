@@ -141,6 +141,22 @@ class ProbeSettingsTests(unittest.TestCase):
 
 
 class FullLiftProbeSettingsTests(unittest.TestCase):
+    def test_preshape_is_optional_exact_and_does_not_change_selected_budget_or_controls(self):
+        from g1_vla.rl_preshape import control_preshape_contract
+        from g1_vla.rl_effort_protocol import full_lift_protocol_contract
+        value=self.settings(True,"full_lift8_v2")
+        value["full_lift"]=full_lift_protocol_contract("g1_contact_qualified_full_lift_v4_native_arm_16s")
+        old=probe.validate_probe_settings(value)
+        self.assertNotIn("control_preshape",old)
+        value["control_preshape"]=control_preshape_contract()
+        new=probe.validate_probe_settings(value)
+        self.assertEqual({k:v for k,v in new.items() if k!="control_preshape"},old)
+        with self.assertRaisesRegex(ValueError,"Native control preshape"):
+            probe.verify_probe_reference({"rl_diagnostics":value},current_audit={"policy_contract":{}})
+        wrong=copy.deepcopy(value);wrong["control_preshape"]["palm_offset_world_m"][2]=.0001
+        with self.assertRaises(ValueError):probe.validate_probe_settings(wrong)
+        with self.assertRaises(ValueError):probe.validate_probe_settings({"control_preshape":control_preshape_contract()})
+
     @staticmethod
     def settings(full=False, protocol="full_lift8_v1"):
         from g1_vla.rl_effort_protocol import (effort_grasp_contract,

@@ -119,6 +119,7 @@ RL_PROBE_DEFAULTS = {
     "contact_transition_control": None,
     "full_lift": None,
     "video_recording": None,
+    "control_preshape": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -318,6 +319,14 @@ def validate_probe_settings(value):
         result.pop("video_recording",None)
     else:
         result["video_recording"]=recording
+    preshape=result.get("control_preshape")
+    if preshape is None:
+        result.pop("control_preshape",None)
+    else:
+        from .rl_preshape import validate_control_preshape
+        if plan!="balanced_effort_v6":
+            raise ValueError("Control preshape is an explicit standalone effort diagnostic only")
+        result["control_preshape"]=validate_control_preshape(preshape)
     lead = result["guided_target_lead_max_rad"]
     if ((plan in ("four_way_v1", "compliant_pinch_v4", "physics_pinch_v5", "balanced_effort_v6") and lead is not None) or
             (plan in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3") and (type(lead) not in (int, float) or lead != .006))):
@@ -690,6 +699,10 @@ def _verify_effort_probe_reference(config, settings, current_audit):
     if _file_hash(candidate_path) != settings["candidate_sha256"]:
         raise ValueError("Effort grasp geometry changed after explicit selection")
     candidate = json.loads(candidate_path.read_text())
+    preshape_resolution=None
+    if settings.get("control_preshape") is not None:
+        from .rl_preshape import resolve_preshape_frames
+        preshape_resolution=resolve_preshape_frames(settings["control_preshape"],candidate,settings["candidate_sha256"])
     if (candidate.get("asset_sha256") != old["policy_contract"]["asset_sha256"] or
             candidate.get("oldseed_sha256") != old["policy_contract"]["seed_state_sha256"]):
         raise ValueError("New geometry/reset resource must pin the original official asset and unchanged seed bytes")
@@ -726,9 +739,11 @@ def _verify_effort_probe_reference(config, settings, current_audit):
                 actual.get("contact_generation") != contract["contact_generation"] or
                 current_audit.get("policy_contract_sha256") != _canonical(actual)):
             raise ValueError("Native effort/material/source readback differs from the explicit new model")
-        for key in ("contact_transition_control", "full_lift"):
+        for key in ("contact_transition_control", "full_lift", "control_preshape"):
             if actual.get(key) != settings.get(key):
                 raise ValueError("Native control/task declaration differs from the selected " + key)
+        if preshape_resolution is not None and current_audit.get("control_preshape_resolution")!=preshape_resolution:
+            raise ValueError("Native preshape execution frames or immutable score-frame source differ")
         filters = current_audit.get("fixed_cluster_collision_filter_override", {}).get("current_stage_readback", {})
         n = contract["evaluation"]["num_envs"]
         self_collisions = filters.get("global_self_collision_readback", {})
@@ -789,6 +804,9 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
     settings = validate_probe_settings(config.get("rl_diagnostics", {}))
     if current_audit is not None and current_audit.get("video_recording")!=settings.get("video_recording"):
         raise ValueError("Native camera recording differs from the declared original environment IDs")
+    if settings.get("control_preshape") is not None and current_audit is not None:
+        if current_audit.get("policy_contract",{}).get("control_preshape")!=settings["control_preshape"]:
+            raise ValueError("Native control preshape differs from its explicit declaration")
     if settings["profile_plan"] == "balanced_effort_v6":
         return _verify_effort_probe_reference(config, settings, current_audit)
     manifest_path, manifest = _read_pinned(config, settings, "reference_manifest_path", "reference_manifest_sha256")

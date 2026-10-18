@@ -195,6 +195,12 @@ The next stage audits the eight predeclared same-source coverage candidates befo
 - Old evaluations become regression evidence. A new independent holdout must be sealed before future model selection.
 - Event metrics separate physical contact, sustained lift, stable released placement and strict safety. An in-box flag or text classification alone cannot establish task success.
 
+## Pinned pre-contact control shaping
+
+The optional `rl_diagnostics.control_preshape` declaration (`g1_pinned_precontact_control_preshape_v1`) uses the same `rl-diagnose` entry. It selects one statically screened control change: a 0.5mm world-X palm reference shift during the existing first 0.9s segment, a 0.01rad thumb1 opening offset, and the declared index/middle compensation. Every environment receives the same declaration. Execution frames and their bounded control reference box are separate from the unchanged original six-frame actual-joint score domain, reset, timing and main-lift Z origin. Neither authored FK nor a static clearance screen establishes physical support.
+
+A same-episode observer latches the first valid physically loaded hand point at the original 2ms cadence. The next macro request freezes the last palm offset reference; it does not claim an instantaneous motor stop. Contact-mode hand position springs remain zero, and the original force, manifold, joint, drift and lift criteria remain independent. An absent/None declaration preserves historical control behavior. This option permits a physical diagnostic retest only, with no training or automatic promotion to a qualified teacher.
+
 ## Historical code
 
 The original source is preserved by Git tag `codex/g1-before-rebuild-20261014` and under `legacy/`. The 154 experiment scripts and former script-forwarding lifecycle are no longer active package entry points. Historical checkpoint 672 remains a research baseline, explicitly separate from a new-contract deployment checkpoint.
