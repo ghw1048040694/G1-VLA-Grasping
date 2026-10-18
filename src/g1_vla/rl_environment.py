@@ -3397,7 +3397,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._write_control_probe(row)
             self._write_evaluation_row(row)
             if self._video_manifest:
-                self._video_manifest.write(json.dumps({**row, "profile_name": selected["name"]})+"\n")
+                self._video_manifest.write(json.dumps(_json_finite(_probe_payload(torch,
+                    {**row, "profile_name": selected["name"]})), allow_nan=False)+"\n")
                 self._video_manifest.flush()
             return dict(selected)
 
@@ -3568,7 +3569,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._record:
                 if self._control_probe_enabled:
                     row = {**row, "control_probe_profile": dict(self._control_probe_profile)}
-                self._record.write(json.dumps(_json_finite(row), ensure_ascii=False, allow_nan=False) + "\n")
+                self._record.write(json.dumps(_json_finite(_probe_payload(torch, row)),
+                                              ensure_ascii=False, allow_nan=False) + "\n")
 
         def runtime_audit(self):
             audit = {"environment_version": ENVIRONMENT_VERSION, "settings": dict(settings),
@@ -3700,10 +3702,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "right arm7 and waist3 receive separately capped fresh native gravity feedforward; original implicit PD unchanged, combined PD plus FF torque not certified bounded by FF cap",
                     "declared finger-pad compliant-contact material variant; original rigid model and strict qualification retained as separate control",
                     "explicit new geometry/reset resource and measured arm pose reference; no old trained actor loaded"])
-            return audit
+            return _json_finite(_probe_payload(torch, audit))
 
         def step_audit(self):
-            return {"physics_samples": self._physics_samples, "reset_count": self._resets,
+            audit = {"physics_samples": self._physics_samples, "reset_count": self._resets,
                     "interrupted_episode_count": self._interrupted, "evaluation_mode": self._eval_mode,
                     "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False), "action_shield_count": self._shield_count,
                     "action_origin": self._action_origin,
@@ -3753,6 +3755,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "control_guard_unsafe_count": self._control_guard_unsafe_count,
                         "shield_count_semantics": "legacy applied scalar<1; projected actual target correction nonzero"}
                        if self._control_probe_enabled else {})}
+            return _json_finite(_probe_payload(torch, audit))
 
         def close(self):
             if getattr(self, "_control_probe_stream", None):

@@ -406,7 +406,8 @@ class FullLiftProtocolTests(unittest.TestCase):
 
     def test_full_task_has_real_10cm_clearance_and_half_second_sample_span(self):
         value = full_lift_protocol_contract()
-        self.assertEqual(value["version"], "g1_contact_qualified_full_lift_v1")
+        self.assertEqual(value["version"], "g1_contact_qualified_full_lift_v2_servo_headroom")
+        self.assertEqual(value["palm_servo_speed_limit_m_s"], .018)
         self.assertEqual(value["target_corner_clearance_m"], .1)
         self.assertEqual(value["palm_total_lift_request_m"], .105)
         self.assertEqual(value["palm_lift_request_max_m"], .11)
@@ -420,6 +421,20 @@ class FullLiftProtocolTests(unittest.TestCase):
         self.assertEqual(validate_full_lift_protocol(json.loads(json.dumps(value))), value)
         copy = full_lift_protocol_contract(); copy["target_corner_clearance_m"] = .001
         self.assertEqual(value, full_lift_protocol_contract())
+
+    def test_full_lift_servo_headroom_does_not_change_physical_speed_gate(self):
+        old = full_lift_protocol_contract("g1_contact_qualified_full_lift_v1")
+        new = full_lift_protocol_contract()
+        self.assertNotIn("palm_servo_speed_limit_m_s", old)
+        self.assertEqual(validate_full_lift_protocol(old), old)
+        for key in old:
+            if key != "version":
+                self.assertEqual(new[key], old[key])
+        mixed = dict(new, version=old["version"])
+        with self.assertRaises(ValueError):
+            validate_full_lift_protocol(mixed)
+        with self.assertRaises(ValueError):
+            full_lift_protocol_contract("unversioned")
 
     def test_full_declaration_is_exact_typed_and_has_no_optional_gate_bypass(self):
         original = full_lift_protocol_contract()

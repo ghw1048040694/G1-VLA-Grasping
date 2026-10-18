@@ -244,7 +244,7 @@ class EffortGraspGuide:
         if self.full_lift is not None:
             gain = t.where(main_started, t.full_like(self.probe, self.full_lift["palm_position_gain_per_s"]),
                            t.full_like(self.probe, gain))[:, None]
-            maximum_linear = self.full_lift["lift_speed_m_s"]
+            maximum_linear = self.full_lift.get("palm_servo_speed_limit_m_s", self.full_lift["lift_speed_m_s"])
         linear = _bounded_vector(t, (palm_goal-state["palm_position_world_m"])*gain, maximum_linear)
         may_advance = t.where(main_started, main_permitted, permit)
         linear[:, 2] = t.where((~may_advance) & (self.probe > 0), linear[:, 2].clamp(max=0), linear[:, 2])

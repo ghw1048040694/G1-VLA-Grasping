@@ -109,6 +109,20 @@ class DiagnosticControlTests(unittest.TestCase):
         self.assertFalse(evidence["main_lift_advance_permitted"].any())
         self.assertFalse(guide.probe.any())
 
+    def test_full_lift_servo_headroom_is_distinct_from_reference_speed_and_v1_retains_default(self):
+        for cap in (.015,.018):
+            guide,state = self.full_lift_guide()
+            guide.full_lift.pop("palm_servo_speed_limit_m_s",None)
+            if cap==.018:
+                guide.full_lift["palm_servo_speed_limit_m_s"]=cap
+            guide.probe[:] = .003
+            action,evidence=guide.actions(self.t.zeros(2,14),state,"guided_hand_pose_hold",.066,1.5)
+            # The fake J is identity in its first six columns. Recover the
+            # task velocity before the unchanged lambda=.02 DLS attenuation.
+            recovered=action[:,2]*.08/.066*(1+.02**2)
+            self.assertTrue(self.t.allclose(recovered,self.t.full((2,),cap),atol=1e-6,rtol=0))
+            self.assertTrue((evidence["main_lift_reference_velocity_m_s"] <= .015).all())
+
     def staged_controller(self, plan="geometry_pose_only_v2"):
         from g1_vla.rl_diagnostics import GuidedClosure
         cfg = copy.deepcopy(self.cfg)

@@ -17,6 +17,7 @@ from g1_vla.rl_environment import (
     ACTION_JOINT_NAMES,
     ContactQualifiedFullLift,
     DEFAULT_SETTINGS,
+    ENVIRONMENT_VERSION,
     FIXED_PALM_FILTER_ASSET_SHA256,
     author_fixed_palm_adjacency_filters,
     fixed_palm_adjacency_filter_contract,
@@ -32,6 +33,8 @@ from g1_vla.rl_environment import (
     _reduce_contact_pairs,
     _reduce_friction_pairs,
     _summarize_hand_contacts,
+    _probe_payload,
+    _json_finite,
     audit_asset_manifest,
     audit_fixed_root_joints,
     consecutive_window_samples,
@@ -312,6 +315,36 @@ class ControllerDiagnosticTensorTest(unittest.TestCase):
         self.assertAlmostEqual(shifted[0, 2, 1].item(), -.28, places=6)
         self.assertTrue(t.equal(jacobian, saved))
         self.assertTrue(t.equal(shifted[:, 3:], jacobian[:, 3:]))
+
+    def test_real_recording_header_serializes_full_lift_tensor_state(self):
+        t = self.torch
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            fake = SimpleNamespace(_record_index=0, _evaluation_seed=17, _record=None, num_envs=2,
+                _control_probe_enabled=True, _control_probe_profile={"name":"full_lift"},
+                robot=SimpleNamespace(joint_names=["joint"]), physics_dt=.002, step_dt=.066,
+                _full_lift=SimpleNamespace(main_lift_authorized=t.tensor([False,True])),
+                runtime_audit=lambda:{"policy_contract":{"full_lift":{"test_tensor":t.tensor([1,2])}},
+                                      "nested_state":{"force":t.tensor([float("nan"),1.5])}})
+            writer = self.method("_write_evaluation_row", json=json,
+                _probe_payload=_probe_payload, _json_finite=_json_finite)
+            fake._write_evaluation_row=lambda row:writer(fake,row)
+            opener=self.method("_open_evaluation_recording",output=output,ACTION_JOINT_NAMES=ACTION_JOINT_NAMES,
+                               ENVIRONMENT_VERSION=ENVIRONMENT_VERSION)
+            try:
+                opener(fake)
+                fake._record.flush()
+                header=json.loads((output/"evaluation_physics_0001.jsonl").read_text())
+                self.assertEqual(header["event"],"recording_header")
+                self.assertEqual(header["main_lift_authorized"],[False,True])
+                self.assertEqual(header["policy_contract"]["full_lift"]["test_tensor"],[1,2])
+                writer(fake,{"event":"physics_sample","nested":{"force":t.tensor([float("nan"),1.5])}})
+                fake._record.flush()
+                sample=json.loads((output/"evaluation_physics_0001.jsonl").read_text().splitlines()[1])
+                self.assertEqual(sample["nested"]["force"],[None,1.5])
+            finally:
+                if fake._record is not None:
+                    fake._record.close()
 
     def test_preload_readiness_requires_real_contact_but_does_not_claim_support(self):
         t = self.torch

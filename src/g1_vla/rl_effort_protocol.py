@@ -236,7 +236,7 @@ def balanced_effort_controller_contract():
 
 
 FULL_LIFT_EFFORT_GRASP_VERSION = "g1_explicit_effort_grasp_protocol_v5_full_lift"
-_FULL_LIFT_PROTOCOL = {
+_FULL_LIFT_PROTOCOL_V1 = {
     "version": "g1_contact_qualified_full_lift_v1",
     "target_corner_clearance_m": .1,
     "palm_total_lift_request_m": .105,
@@ -260,16 +260,25 @@ _FULL_LIFT_PROTOCOL = {
     "training_allowed": False,
     "optimizer_steps": 0,
 }
+_FULL_LIFT_PROTOCOL = {
+    **_FULL_LIFT_PROTOCOL_V1,
+    "version": "g1_contact_qualified_full_lift_v2_servo_headroom",
+    "palm_servo_speed_limit_m_s": .018,
+}
 
 
-def full_lift_protocol_contract():
+def full_lift_protocol_contract(version=None):
     """Return the independent 10cm task declaration, never an admission proof.
 
     The local 2mm/100-sample proof remains mandatory before any main lift.
     A full task has a separately declared physical deadline and height limit;
     neither the local protocol nor any training budget changes implicitly.
     """
-    return deepcopy(_FULL_LIFT_PROTOCOL)
+    if version is None or version == _FULL_LIFT_PROTOCOL["version"]:
+        return deepcopy(_FULL_LIFT_PROTOCOL)
+    if version == _FULL_LIFT_PROTOCOL_V1["version"]:
+        return deepcopy(_FULL_LIFT_PROTOCOL_V1)
+    raise ValueError("Unknown full-lift task version")
 
 
 def full_lift_effort_grasp_contract(protocol="full_lift8_v1"):
@@ -341,7 +350,9 @@ def validate_full_lift_protocol(value):
     """Validate the exact new task; ``None`` preserves the local protocol."""
     if value is None:
         return None
-    _exact(value, _FULL_LIFT_PROTOCOL, "full_lift")
+    expected = (_FULL_LIFT_PROTOCOL_V1 if isinstance(value, dict) and
+                value.get("version") == _FULL_LIFT_PROTOCOL_V1["version"] else _FULL_LIFT_PROTOCOL)
+    _exact(value, expected, "full_lift")
     return deepcopy(value)
 
 
