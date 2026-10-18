@@ -225,10 +225,13 @@ def validate_probe_settings(value):
         expected = {"enabled": True, "env_ids": [0], "body_names": [
             "right_hand_thumb_2_link", "right_hand_index_1_link", "right_hand_middle_1_link"],
             "require_complete": True}
-        if plan != "balanced_effort_v6" or geometry != expected:
+        surface = {**expected, "route": "live_surface_queries_v2", "enable_scene_query_support": True}
+        if plan != "balanced_effort_v6" or geometry not in (expected, surface):
             raise ValueError("Collision representation audit pins the three distal bodies in env0 and complete export")
         if type(geometry["enabled"]) is not bool or type(geometry["require_complete"]) is not bool:
             raise ValueError("Collision representation audit flags must be boolean")
+        if "enable_scene_query_support" in geometry and type(geometry["enable_scene_query_support"]) is not bool:
+            raise ValueError("Scene-query observation support must be an explicit boolean")
         if any(type(x) is not int for x in geometry["env_ids"]):
             raise ValueError("Collision representation audit env IDs must be integers")
     eval_plan = effort["evaluation"] if effort is not None else {"num_envs": 8, "episodes_per_env": 4, "max_control_steps": 364}

@@ -702,7 +702,8 @@ class CollisionGeometryBoundaryTests(unittest.TestCase):
             robot=SimpleNamespace(data=data, body_names=names,
                 root_view=SimpleNamespace(prim_paths=[f"/World/envs/env_{i}/Robot/root_joint" for i in range(8)])),
             cube=SimpleNamespace(data=cube))
-        env.sim = SimpleNamespace(get_physics_step_count=lambda: env.step)
+        env.sim = SimpleNamespace(get_physics_step_count=lambda: env.step,
+                                  cfg=SimpleNamespace(enable_scene_query_support=True))
         for name in ("get_dof_stiffnesses", "get_dof_dampings", "get_dof_max_forces", "get_dof_friction_properties",
                      "get_contact_offsets", "get_rest_offsets"):
             setattr(env.robot.root_view, name, lambda: t.ones(8, 43))
@@ -724,7 +725,7 @@ class CollisionGeometryBoundaryTests(unittest.TestCase):
         from unittest.mock import patch
         import sys
         with patch.dict(sys.modules, {"g1_vla.rl_collision_geometry":
-                SimpleNamespace(export_collision_geometry=callback)}):
+                SimpleNamespace(export_collision_geometry=callback, export_collision_surface_audit=callback)}):
             return method(env, declaration)
 
     def test_exports_same_stage_and_native_link_identity_without_task_step(self):
@@ -745,6 +746,14 @@ class CollisionGeometryBoundaryTests(unittest.TestCase):
         env, method, _, declaration = self.fixture()
         with self.assertRaises(RuntimeError):
             self.call(env, method, declaration, lambda *a, **k: {"complete": False})
+
+    def test_surface_route_is_explicit_and_does_not_claim_full_hull(self):
+        env, method, _, declaration = self.fixture()
+        declaration["route"] = "live_surface_queries_v2"
+        result = self.call(env, method, declaration,
+            lambda *a, **k: {"complete": True, "full_convex_hull_complete": False})
+        self.assertEqual(result["geometry_observation_route"], "live_surface_queries_v2")
+        self.assertFalse(result["full_convex_hull_complete"])
 
     def test_any_step_or_measured_state_mutation_rejects_before_profile(self):
         for change in ("step", "q", "cube_velocity", "body_pose", "native_drive", "usd_layer"):

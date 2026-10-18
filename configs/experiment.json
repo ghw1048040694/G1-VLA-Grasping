@@ -1244,7 +1244,9 @@
         "right_hand_index_1_link",
         "right_hand_middle_1_link"
       ],
-      "require_complete": true
+      "require_complete": true,
+      "route": "live_surface_queries_v2",
+      "enable_scene_query_support": true
     }
   }
 }

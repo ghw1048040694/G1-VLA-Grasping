@@ -24,6 +24,10 @@ class CollisionGeometrySettingsTests(unittest.TestCase):
         self.assertEqual(result["guided_probe_height_m"], .0025)
         self.assertFalse(result["training_allowed"])
         self.assertEqual(result["optimizer_steps"], 0)
+        value["collision_geometry_audit"]["route"] = "live_surface_queries_v2"
+        value["collision_geometry_audit"]["enable_scene_query_support"] = True
+        self.assertEqual(validate_probe_settings(value)["collision_geometry_audit"]["route"],
+                         "live_surface_queries_v2")
         value.pop("collision_geometry_audit")
         self.assertIsNone(validate_probe_settings(value)["collision_geometry_audit"])
         with self.assertRaises(ValueError):
@@ -33,6 +37,7 @@ class CollisionGeometrySettingsTests(unittest.TestCase):
         for key, change in [("env_ids", [0, 1]), ("env_ids", [False]),
                 ("body_names", ["Cube"]), ("enabled", False), ("enabled", 1),
                 ("require_complete", False), ("require_complete", 1),
+                ("route", "silently_recook_source_proxy"),
                 ("set_hull_vertex_limit", 256)]:
             value = copy.deepcopy(self.settings())
             value["collision_geometry_audit"][key] = change

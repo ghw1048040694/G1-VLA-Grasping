@@ -379,3 +379,335 @@ def export_collision_geometry(stage, *, bodies, output_path):
         "coverage": report.get("coverage"),
         "errors": report["errors"][:64], "attached_native_shape_identity_verified": False,
         "callback_vertex_coordinate_frame_certified": False, "request_may_cook_or_populate_cache": True}
+
+
+# This is a separate route. The v1 request and its failed MeshMerge reports are
+# intentionally retained: a scene query does not repair or reinterpret them.
+SURFACE_AUDIT_VERSION = "g1_live_collision_surface_queries_v2"
+SURFACE_ROUTE = "live_surface_queries_v2"
+_RAY_GRID_FRACTIONS = (.1, .3, .5, .7, .9)
+_RAY_PADDING_M = .005
+_HIT_POSITION_TOLERANCE_M = 5e-6
+_HIT_NORMAL_NORM_TOLERANCE = 1e-3
+_UNIQUE_POINT_TOLERANCE_M = 1e-7
+_NONCOPLANAR_DISTANCE_M = 1e-6
+_MIN_UNIQUE_SURFACE_POINTS = 12
+_MAX_HITS_PER_RAY = 256
+_ACTIVE_SURFACE_AUDITS = set()
+
+
+def _transform_point(matrix, point):
+    return [sum(matrix[i][j]*point[j] for j in range(3))+matrix[i][3] for i in range(3)]
+
+
+def _rotate_vector(matrix, vector):
+    return [sum(matrix[i][j]*vector[j] for j in range(3)) for i in range(3)]
+
+
+def _world_to_body(matrix, vector, *, point):
+    offset = [vector[i]-matrix[i][3] if point else vector[i] for i in range(3)]
+    return [sum(matrix[j][i]*offset[j] for j in range(3)) for i in range(3)]
+
+
+def _dot(a, b):
+    return sum(x*y for x, y in zip(a, b))
+
+
+def _cross(a, b):
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
+
+
+def make_surface_rays(bounds_min, bounds_max, native_world):
+    """150 finite rays: 25 from each of the six body-local AABB sides.
+
+    Source geometry sets the search extent only; no source point becomes a hit.
+    The 5 mm search margin is unrelated to any physical acceptance threshold.
+    """
+    low = _finite_vector(bounds_min, 3, "source AABB minimum")
+    high = _finite_vector(bounds_max, 3, "source AABB maximum")
+    spans = [b-a for a, b in zip(low, high)]
+    if any(span <= 0. or span > 1. for span in spans):
+        raise ValueError("source pad AABB requires three positive extents no greater than one metre")
+    rays = []
+    for axis in range(3):
+        transverse = [i for i in range(3) if i != axis]
+        for side in (-1, 1):
+            for u in _RAY_GRID_FRACTIONS:
+                for v in _RAY_GRID_FRACTIONS:
+                    origin = [(low[i]+high[i])*.5 for i in range(3)]
+                    origin[axis] = low[axis]-_RAY_PADDING_M if side == -1 else high[axis]+_RAY_PADDING_M
+                    for index, fraction in zip(transverse, (u, v)):
+                        origin[index] = low[index]+fraction*spans[index]
+                    direction = [0., 0., 0.]
+                    direction[axis] = float(-side)
+                    rays.append({"ray_index": len(rays), "side": f"{'xyz'[axis]}{'-' if side == -1 else '+'}",
+                        "origin_body_m": origin, "direction_body": direction,
+                        "origin_world_m": _transform_point(native_world, origin),
+                        "direction_world": _rotate_vector(native_world, direction),
+                        "distance_m": spans[axis]+2*_RAY_PADDING_M})
+    return rays
+
+
+def surface_point_coverage(points, sides):
+    """Require a bounded, spatially three-dimensional set of measured hits."""
+    unique = []
+    tolerance2 = _UNIQUE_POINT_TOLERANCE_M**2
+    for value in points:
+        point = _finite_vector(value, 3, "measured surface point")
+        if all(sum((a-b)**2 for a, b in zip(point, previous)) > tolerance2 for previous in unique):
+            unique.append(point)
+    noncoplanar = False
+    plane_distance = 0.
+    if len(unique) >= 4:
+        origin = unique[0]
+        first = max(unique[1:], key=lambda p: sum((p[i]-origin[i])**2 for i in range(3)))
+        line = [first[i]-origin[i] for i in range(3)]
+        second = max(unique[1:], key=lambda p: sum(v*v for v in _cross(line, [p[i]-origin[i] for i in range(3)])))
+        normal = _cross(line, [second[i]-origin[i] for i in range(3)])
+        length = math.sqrt(_dot(normal, normal))
+        if length > _NONCOPLANAR_DISTANCE_M**2:
+            plane_distance = max(abs(_dot(normal, [p[i]-origin[i] for i in range(3)]))/length for p in unique)
+            noncoplanar = plane_distance > _NONCOPLANAR_DISTANCE_M
+    covered_sides = sorted(set(sides))
+    all_sides = sorted(f"{axis}{side}" for axis in "xyz" for side in ("-", "+"))
+    complete = (len(unique) >= _MIN_UNIQUE_SURFACE_POINTS and noncoplanar and covered_sides == all_sides)
+    return {"unique_point_count": len(unique), "required_unique_point_count": _MIN_UNIQUE_SURFACE_POINTS,
+        "unique_point_tolerance_m": _UNIQUE_POINT_TOLERANCE_M,
+        "noncoplanar": noncoplanar, "noncoplanar_plane_distance_m": plane_distance,
+        "noncoplanar_minimum_distance_m": _NONCOPLANAR_DISTANCE_M,
+        "covered_sides": covered_sides, "required_sides": all_sides, "surface_complete": complete}
+
+
+def query_collision_surface(scene_query, *, body_path, collider_paths, native_world, rays, make_float3=tuple):
+    """Read actual synchronous RaycastHit callbacks, filtering both identities.
+
+    ``RaycastHit.rigid_body/collision`` are the installed SDK's object fields;
+    this helper never accepts a nearest foreign hit as the requested surface.
+    """
+    allowed = set(collider_paths)
+    if not allowed or any(not isinstance(path, str) or not path.startswith(body_path+"/") for path in allowed):
+        raise ValueError("surface query requires exact descendant collider paths")
+    if not isinstance(rays, list) or not rays or len(rays) > 512:
+        raise ValueError("missing or excessive sample rays")
+    rows, errors = [], []
+    for ray in rays:
+        row = {**ray, "hits": [], "foreign_hit_count": 0, "foreign_bindings": [], "callback_count": 0}
+        rows.append(row)
+        state = {"accepting": True}
+
+        def callback(hit, _ray=ray, _row=row, _state=state):
+            ray, row = _ray, _row
+            if not _state["accepting"]:
+                errors.append({"ray_index": ray["ray_index"], "error": "callback_after_synchronous_return"})
+                return False
+            row["callback_count"] += 1
+            if row["callback_count"] > _MAX_HITS_PER_RAY:
+                errors.append({"ray_index": ray["ray_index"], "error": "excessive_hit_count"})
+                return False
+            try:
+                rigid_body = str(_field(hit, "rigid_body"))
+                collision = str(_field(hit, "collision"))
+                if rigid_body != body_path or collision not in allowed:
+                    row["foreign_hit_count"] += 1
+                    identity = [rigid_body, collision]
+                    if identity not in row["foreign_bindings"] and len(row["foreign_bindings"]) < 32:
+                        row["foreign_bindings"].append(identity)
+                    return True
+                position = _finite_vector(list(_field(hit, "position")), 3, "native hit position")
+                normal = _finite_vector(list(_field(hit, "normal")), 3, "native hit normal")
+                distance = _finite_vector([_field(hit, "distance")], 1, "native hit distance")[0]
+                expected = [ray["origin_world_m"][i]+distance*ray["direction_world"][i] for i in range(3)]
+                residual = math.sqrt(sum((position[i]-expected[i])**2 for i in range(3)))
+                if not (-_HIT_POSITION_TOLERANCE_M <= distance <= ray["distance_m"]+_HIT_POSITION_TOLERANCE_M):
+                    raise ValueError("native hit distance outside requested ray segment")
+                if residual > _HIT_POSITION_TOLERANCE_M:
+                    raise ValueError("native hit position inconsistent with ray and distance")
+                norm = math.sqrt(_dot(normal, normal))
+                if abs(norm-1.) > _HIT_NORMAL_NORM_TOLERANCE:
+                    raise ValueError("native hit normal is not unit length")
+                row["hits"].append({"rigid_body_path": rigid_body, "collider_path": collision,
+                    "position_world_m": position, "normal_world": normal, "distance_m": distance,
+                    "position_body_m": _world_to_body(native_world, position, point=True),
+                    "normal_body": _world_to_body(native_world, normal, point=False),
+                    "position_on_ray_residual_m": residual,
+                    "face_index": _index(int(_field(hit, "face_index")), "native hit face index"),
+                    "material_path": str(_field(hit, "material")),
+                    "proto_index": _index(int(_field(hit, "protoIndex")), "native proto index")})
+            except Exception as exc:
+                errors.append({"ray_index": ray["ray_index"], "error_type": type(exc).__name__, "error": str(exc)})
+            return True
+
+        try:
+            returned = scene_query.raycast_all(make_float3(ray["origin_world_m"]),
+                make_float3(ray["direction_world"]), ray["distance_m"], callback, False)
+            row["native_returned_any_hit"] = bool(returned)
+            if bool(returned) != (row["callback_count"] > 0):
+                raise ValueError("raycast_all return does not match synchronous callback presence")
+        except Exception as exc:
+            errors.append({"ray_index": ray["ray_index"], "error_type": type(exc).__name__, "error": str(exc)})
+        finally:
+            state["accepting"] = False
+    points = [hit["position_body_m"] for row in rows for hit in row["hits"]]
+    sides = [row["side"] for row in rows if row["hits"]]
+    coverage = surface_point_coverage(points, sides)
+    coverage["surface_complete"] &= not errors
+    coverage.update(ray_count=len(rows), bound_hit_count=len(points),
+                    foreign_hit_count=sum(row["foreign_hit_count"] for row in rows))
+    covered_colliders = sorted({hit["collider_path"] for row in rows for hit in row["hits"]})
+    coverage["requested_collider_paths"] = sorted(allowed)
+    coverage["hit_collider_paths"] = covered_colliders
+    coverage["surface_complete"] &= covered_colliders == sorted(allowed)
+    return {"coverage": coverage, "errors": errors, "rays": rows}
+
+
+def _source_body_bounds(stage, bindings, UsdGeom):
+    low, high = [math.inf]*3, [-math.inf]*3
+    source_count = 0
+    for binding in bindings:
+        for source in binding["source_meshes"]:
+            mesh = stage.GetPrimAtPath(source["path"])
+            points = UsdGeom.Mesh(mesh).GetPointsAttr().Get()
+            if points is None or len(points) != source["point_count"]:
+                raise ValueError("source mesh changed while establishing ray search extent")
+            digest = hashlib.sha256()
+            for value in points:
+                raw_point = _finite_vector(list(value), 3, "source AABB point")
+                digest.update(struct.pack("<3f", *raw_point))
+                point = _transform_point(source["source_to_body_column_matrix"], raw_point)
+                low = [min(low[i], point[i]) for i in range(3)]
+                high = [max(high[i], point[i]) for i in range(3)]
+            if digest.hexdigest() != source["points_f32_sha256"]:
+                raise ValueError("source mesh bytes changed while establishing ray search extent")
+            source_count += 1
+    return {"minimum_body_m": low, "maximum_body_m": high, "source_mesh_count": source_count,
+        "purpose": "finite ray search extent only; not measured collider geometry"}
+
+
+def _surface_coverage(report, payload, requested):
+    expected = sorted(entry["body_path"] for entry in requested)
+    actual = sorted(entry["body_path"] for entry in report["bodies"])
+    exported = sorted(entry["body_path"] for entry in payload["bodies"])
+    successful = sorted(entry["body_path"] for entry in report["bodies"]
+                        if entry.get("coverage", {}).get("surface_complete") is True and "error" not in entry)
+    exact = (len(expected) == 3 and len(set(expected)) == 3 and expected == actual == exported and
+        all(body.get("binding_sha256") == data.get("binding_sha256")
+            for body, data in zip(sorted(report["bodies"], key=lambda b: b["body_path"]),
+                                  sorted(payload["bodies"], key=lambda b: b["body_path"]))))
+    complete = (not report["errors"] and exact and successful == expected and
+                report.get("stage_binding", {}).get("same_stage_verified") is True)
+    return {"requested_body_count": len(expected), "successful_body_count": len(successful),
+        "requested_body_paths": expected, "successful_body_paths": successful,
+        "all_payload_bindings_exact": exact, "surface_complete": bool(complete)}
+
+
+def export_collision_surface_audit(stage, *, bodies, output_path, scene_query_support=None):
+    """Observe finite actual hit surfaces on an already attached live scene.
+
+    The caller must explicitly enable and report scene-query support on its
+    existing SimulationContext. This function creates no App/scene/query manager,
+    calls no update/step/fetch or cook request, and authors no USD properties.
+    Completeness covers the declared sampled surfaces only, never a full hull.
+    """
+    path = Path(output_path)
+    payload_path = path.with_name(path.stem+"_surface_samples.json")
+    report = {"version": SURFACE_AUDIT_VERSION, "route": SURFACE_ROUTE,
+        "passed": False, "complete": False, "surface_complete": False,
+        "full_convex_hull_complete": False, "attached_native_shape_identity_verified": False,
+        "bodies": [], "errors": [], "scene_query_support": scene_query_support,
+        "request_may_cook_or_populate_cache": False, "physics_steps_requested": 0,
+        "app_updates_requested": 0, "usd_properties_authored": 0,
+        "completeness_scope": "all three requested pads have finite exact-bound, six-direction, noncoplanar live-scene ray hits; not a full hull export",
+        "pose_synchronization_scope": "queries must cover the current native tensor body pose; no manager refresh or USD world-pose fallback is performed",
+        "sampling": {"grid_fractions": list(_RAY_GRID_FRACTIONS), "ray_count_per_body": 150,
+            "padding_m": _RAY_PADDING_M, "position_on_ray_tolerance_m": _HIT_POSITION_TOLERANCE_M,
+            "normal_norm_tolerance": _HIT_NORMAL_NORM_TOLERANCE, "both_sides": False},
+        "sdk_contract": {"interface": "omni.physx.get_physx_scene_query_interface().raycast_all",
+            "installed_stub": "omni/physx/bindings/_physx.pyi:2149-2162",
+            "hit_fields": "RaycastHit.position/normal/distance/collision/rigid_body/face_index/material/protoIndex",
+            "installed_hit_fields": "_physx.pyi:3551-3642",
+            "installed_example": "omni/physxdemos/scenes/RaycastsDemo.py:86-90,135-136"}}
+    payload = {"version": SURFACE_AUDIT_VERSION, "route": SURFACE_ROUTE,
+        "coordinate_scope": "native scene-query world position/normal/distance, also expressed in current native rigid-body frame", "bodies": []}
+    key = None
+    try:
+        if not isinstance(scene_query_support, dict) or scene_query_support.get("enabled") is not True or not scene_query_support.get("source"):
+            raise ValueError("explicit enabled same-SimulationContext scene-query-support evidence is required")
+        if not isinstance(bodies, list) or len(bodies) != 3 or {b.get("body_name") for b in bodies} != set(PAD_BODY_NAMES):
+            raise ValueError("surface audit requires all three declared right distal pad bodies")
+        if len({b["body_path"] for b in bodies}) != 3:
+            raise ValueError("duplicate native body path")
+        import carb
+        import omni.timeline
+        import omni.usd
+        from omni.physx import get_physx_scene_query_interface
+        from pxr import Usd, UsdGeom, UsdPhysics, UsdUtils
+
+        context = omni.usd.get_context()
+        report["stage_binding"] = _stage_binding(stage, context, UsdUtils, UsdGeom)
+        report["timeline_is_stopped"] = bool(omni.timeline.get_timeline_interface().is_stopped())
+        if report["timeline_is_stopped"]:
+            raise ValueError("existing physics timeline is stopped; scene-query surface readiness is not established")
+        key = report["stage_binding"]["stage_id"]
+        if key in _ACTIVE_SURFACE_AUDITS:
+            key = None
+            raise ValueError("reentrant same-stage surface audit")
+        _ACTIVE_SURFACE_AUDITS.add(key)
+        query = get_physx_scene_query_interface()
+        cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+        for entry in bodies:
+            metadata = {name: entry.get(name) for name in ("env_id", "native_link_index", "native_articulation_prim_path")}
+            body_record = {"body_name": entry["body_name"], "body_path": entry["body_path"], **metadata, "colliders": []}
+            report["bodies"].append(body_record)
+            try:
+                body = stage.GetPrimAtPath(entry["body_path"])
+                if not body or not body.HasAPI(UsdPhysics.RigidBodyAPI) or body.GetName() != entry["body_name"]:
+                    raise ValueError("native body identity does not match the active RigidBodyAPI prim")
+                native_world = pose_matrix_xyzw(entry["current_position_world_m"], entry["current_quaternion_xyzw"])
+                body_record["native_pose_xyzw"] = list(entry["current_position_world_m"])+list(entry["current_quaternion_xyzw"])
+                colliders = sorted((p for p in Usd.PrimRange(body, Usd.TraverseInstanceProxies())
+                                    if p.HasAPI(UsdPhysics.CollisionAPI)), key=lambda p: str(p.GetPath()))
+                if not colliders or len(colliders) > 64:
+                    raise ValueError("missing or excessive CollisionAPI descendants")
+                for collider in colliders:
+                    binding = _collider_binding(stage, collider, body, native_world, Usd, UsdGeom, UsdPhysics, cache)
+                    binding["stage_id"] = key
+                    binding["native_body_pose_source"] = metadata
+                    body_record["colliders"].append(binding)
+                bounds = _source_body_bounds(stage, body_record["colliders"], UsdGeom)
+                body_record["source_search_bounds"] = bounds
+                body_record["binding_sha256"] = hashlib.sha256(_canonical_bytes(body_record)).hexdigest()
+                rays = make_surface_rays(bounds["minimum_body_m"], bounds["maximum_body_m"], native_world)
+                result = query_collision_surface(query, body_path=entry["body_path"],
+                    collider_paths=[str(c.GetPath()) for c in colliders], native_world=native_world,
+                    rays=rays, make_float3=lambda v: carb.Float3(*v))
+                body_record["coverage"] = result["coverage"]
+                body_record["query_errors"] = result["errors"]
+                if result["errors"]:
+                    report["errors"].append({"body_path": entry["body_path"], "error": "invalid_native_surface_query", "details": result["errors"][:64]})
+                payload["bodies"].append({"body_path": entry["body_path"], "binding_sha256": body_record["binding_sha256"],
+                    "rays": result["rays"]})
+            except Exception as exc:
+                body_record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                report["errors"].append({"body_path": entry.get("body_path"), **body_record["error"]})
+    except Exception as exc:
+        report["errors"].append({"type": type(exc).__name__, "message": str(exc)})
+    finally:
+        if key is not None:
+            _ACTIVE_SURFACE_AUDITS.discard(key)
+    try:
+        report["coverage"] = _surface_coverage(report, payload, bodies)
+        report["passed"] = report["complete"] = report["surface_complete"] = report["coverage"]["surface_complete"]
+    except Exception as exc:
+        report["errors"].append({"type": type(exc).__name__, "message": str(exc)})
+    try:
+        report["surface_payload"] = _write_json(payload_path, payload)
+        written = _write_json(path, report)
+    except Exception as exc:
+        return {"version": SURFACE_AUDIT_VERSION, "route": SURFACE_ROUTE, "passed": False,
+            "complete": False, "surface_complete": False, "full_convex_hull_complete": False,
+            "attached_native_shape_identity_verified": False, "error_type": type(exc).__name__, "error": str(exc)}
+    return {"version": SURFACE_AUDIT_VERSION, "route": SURFACE_ROUTE, "passed": report["passed"],
+        "complete": report["complete"], "surface_complete": report["surface_complete"],
+        "full_convex_hull_complete": False, "attached_native_shape_identity_verified": False,
+        "report": written, "surface_payload": report["surface_payload"], "coverage": report.get("coverage"),
+        "errors": report["errors"][:64], "request_may_cook_or_populate_cache": False}

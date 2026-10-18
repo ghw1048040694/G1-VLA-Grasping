@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 from g1_vla import rl_collision_geometry as geometry
 
@@ -183,6 +183,196 @@ class CollisionGeometryPureTests(unittest.TestCase):
             self.assertEqual(saved["physics_steps_requested"], 0)
             payload = json.loads((Path(directory)/"audit_hulls.json").read_text())
             self.assertEqual(payload["colliders"], [])
+
+
+class BoxSceneQuery:
+    """Synchronous test-only API oracle, not a simulation or production fallback."""
+    def __init__(self, world, body_path, *, foreign=False, mutate=None):
+        self.world, self.body_path = world, body_path
+        self.foreign, self.mutate = foreign, mutate
+        self.calls = []
+
+    def raycast_all(self, origin, direction, distance, callback, both_sides):
+        self.calls.append((origin, direction, distance, both_sides))
+        local_origin = geometry._world_to_body(self.world, list(origin), point=True)
+        local_direction = geometry._world_to_body(self.world, list(direction), point=False)
+        axis = max(range(3), key=lambda i: abs(local_direction[i]))
+        side = -1. if local_direction[axis] > 0. else 1.
+        t = (side*.01-local_origin[axis])/local_direction[axis]
+        p = [origin[i]+t*direction[i] for i in range(3)]
+        local_normal = [0., 0., 0.]; local_normal[axis] = side
+        normal = geometry._rotate_vector(self.world, local_normal)
+        hit = SimpleNamespace(rigid_body=self.body_path, collision=self.body_path+"/collisions",
+            position=p, normal=normal, distance=t, face_index=axis, material="/Material", protoIndex=0xFFFFFFFF)
+        if self.foreign:
+            other = copy.copy(hit); other.rigid_body = "/Other"; other.collision = "/Other/collisions"
+            callback(other)
+        if self.mutate:
+            self.mutate(hit)
+        callback(hit)
+        return True
+
+
+class CollisionSurfacePureTests(unittest.TestCase):
+    def setUp(self):
+        s = math.sqrt(.5)
+        self.world = geometry.pose_matrix_xyzw([.2, -.3, .8], [0., 0., s, s])
+        self.body = "/World/Robot/right_hand_thumb_2_link"
+        self.rays = geometry.make_surface_rays([-.01]*3, [.01]*3, self.world)
+
+    def query(self, backend):
+        return geometry.query_collision_surface(backend, body_path=self.body,
+            collider_paths=[self.body+"/collisions"], native_world=self.world, rays=self.rays)
+
+    def test_six_direction_rays_are_bounded_and_transform_with_native_pose(self):
+        self.assertEqual(len(self.rays), 150)
+        self.assertEqual({side: sum(r["side"] == side for r in self.rays)
+                          for side in {r["side"] for r in self.rays}},
+                         {axis+sign: 25 for axis in "xyz" for sign in "-+"})
+        for ray in self.rays:
+            self.assertAlmostEqual(sum(v*v for v in ray["direction_world"]), 1.)
+            self.assertAlmostEqual(ray["distance_m"], .03)
+            recovered = geometry._world_to_body(self.world, ray["origin_world_m"], point=True)
+            for actual, expected in zip(recovered, ray["origin_body_m"]):
+                self.assertAlmostEqual(actual, expected)
+        for low, high in [([0.]*3, [0.]*3), ([0.]*3, [2.]*3), ([0., 0., float("nan")], [1.]*3)]:
+            with self.assertRaises(ValueError):
+                geometry.make_surface_rays(low, high, self.world)
+
+    def test_live_hits_use_sdk_fields_filter_both_paths_and_recover_body_coordinates(self):
+        backend = BoxSceneQuery(self.world, self.body, foreign=True)
+        result = self.query(backend)
+        self.assertTrue(result["coverage"]["surface_complete"])
+        self.assertEqual(result["coverage"]["bound_hit_count"], 150)
+        self.assertEqual(result["coverage"]["foreign_hit_count"], 150)
+        self.assertEqual(result["errors"], [])
+        for row in result["rays"]:
+            hit = row["hits"][0]
+            self.assertEqual(hit["rigid_body_path"], self.body)
+            self.assertEqual(hit["collider_path"], self.body+"/collisions")
+            self.assertAlmostEqual(max(abs(v) for v in hit["position_body_m"]), .01)
+            self.assertAlmostEqual(sum(v*v for v in hit["normal_body"]), 1.)
+        self.assertTrue(all(call[3] is False for call in backend.calls))
+
+    def test_wrong_rigid_body_or_wrong_collider_cannot_complete(self):
+        for field, value in [("rigid_body", "/WrongBody"), ("collision", self.body+"/visualMesh")]:
+            result = self.query(BoxSceneQuery(self.world, self.body,
+                mutate=lambda hit, f=field, v=value: setattr(hit, f, v)))
+            self.assertFalse(result["coverage"]["surface_complete"])
+            self.assertEqual(result["coverage"]["bound_hit_count"], 0)
+            self.assertEqual(result["coverage"]["foreign_hit_count"], 150)
+
+    def test_nonfinite_off_ray_or_nonunit_native_hits_fail_closed(self):
+        mutations = [lambda h: setattr(h, "distance", float("nan")),
+                     lambda h: setattr(h, "normal", [0., 0., 0.]),
+                     lambda h: setattr(h, "position", [h.position[0]+.001, h.position[1], h.position[2]])]
+        for mutation in mutations:
+            result = self.query(BoxSceneQuery(self.world, self.body, mutate=mutation))
+            self.assertFalse(result["coverage"]["surface_complete"])
+            self.assertTrue(result["errors"])
+
+    def test_no_hits_and_coplanar_or_duplicate_points_are_incomplete(self):
+        class Empty:
+            def raycast_all(self, *args):
+                return False
+        result = self.query(Empty())
+        self.assertFalse(result["coverage"]["surface_complete"])
+        self.assertFalse(result["errors"])
+        all_sides = [a+s for a in "xyz" for s in "-+"]
+        for points in ([[0., 0., 0.]]*30, [[i*.0001, j*.0001, 0.] for i in range(5) for j in range(5)]):
+            self.assertFalse(geometry.surface_point_coverage(points, all_sides)["surface_complete"])
+        box_points = [[x, y, z] for x in [-.01, 0., .01] for y in [-.01, 0., .01] for z in [-.01, .01]]
+        self.assertTrue(geometry.surface_point_coverage(box_points, all_sides)["surface_complete"])
+        self.assertFalse(geometry.surface_point_coverage(box_points, all_sides[:-1])["surface_complete"])
+
+    def test_callback_after_return_is_not_allowed_to_attach_to_next_ray(self):
+        class Late(BoxSceneQuery):
+            previous = None
+            def raycast_all(self, origin, direction, distance, callback, both_sides):
+                if self.previous:
+                    self.previous(SimpleNamespace())
+                self.previous = callback
+                return super().raycast_all(origin, direction, distance, callback, both_sides)
+        result = self.query(Late(self.world, self.body))
+        self.assertFalse(result["coverage"]["surface_complete"])
+        self.assertEqual(result["errors"][0]["ray_index"], 0)
+        self.assertEqual(result["errors"][0]["error"], "callback_after_synchronous_return")
+
+    def test_surface_completeness_requires_three_exact_payload_bindings(self):
+        bodies = [{"body_path": "/"+name} for name in geometry.PAD_BODY_NAMES]
+        report = {"errors": [], "stage_binding": {"same_stage_verified": True},
+            "bodies": [{**body, "binding_sha256": str(i), "coverage": {"surface_complete": True}}
+                       for i, body in enumerate(bodies)]}
+        payload = {"bodies": [{**body, "binding_sha256": str(i)} for i, body in enumerate(bodies)]}
+        self.assertTrue(geometry._surface_coverage(report, payload, bodies)["surface_complete"])
+        payload["bodies"][0]["binding_sha256"] = "Wrong"
+        self.assertFalse(geometry._surface_coverage(report, payload, bodies)["surface_complete"])
+        payload["bodies"].pop()
+        self.assertFalse(geometry._surface_coverage(report, payload, bodies)["surface_complete"])
+
+    def test_scene_query_support_must_be_explicit_and_never_fakes_full_hulls(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)/"audit.json"
+            result = geometry.export_collision_surface_audit(None, bodies=[], output_path=path)
+            self.assertFalse(result["complete"])
+            self.assertFalse(result["surface_complete"])
+            self.assertFalse(result["full_convex_hull_complete"])
+            saved = json.loads(path.read_text())
+            self.assertIn("explicit enabled", saved["errors"][0]["message"])
+            self.assertEqual(saved["physics_steps_requested"], 0)
+            self.assertEqual(saved["app_updates_requested"], 0)
+            self.assertFalse(saved["request_may_cook_or_populate_cache"])
+            self.assertTrue((Path(directory)/"audit_surface_samples.json").is_file())
+
+    def test_export_preserves_three_native_metadata_bindings_without_calling_cook_or_step(self):
+        bodies = [{"body_name": name, "body_path": "/World/Robot/"+name,
+            "current_position_world_m": [0., 0., 0.], "current_quaternion_xyzw": [0., 0., 0., 1.],
+            "env_id": 0, "native_link_index": i+20, "native_articulation_prim_path": "/World/Robot"}
+            for i, name in enumerate(geometry.PAD_BODY_NAMES)]
+        body_prims, collider_prims = {}, {}
+        for entry in bodies:
+            body_prims[entry["body_path"]] = SimpleNamespace(HasAPI=lambda api: True, GetName=lambda n=entry["body_name"]: n)
+            collider_prims[entry["body_path"]] = SimpleNamespace(HasAPI=lambda api: True, GetPath=lambda p=entry["body_path"]+"/collisions": p)
+        class AllBodies:
+            def raycast_all(self, origin, direction, distance, callback, both_sides):
+                for entry in bodies:
+                    BoxSceneQuery(geometry.pose_matrix_xyzw([0., 0., 0.], [0., 0., 0., 1.]), entry["body_path"]).raycast_all(
+                        origin, direction, distance, callback, both_sides)
+                return True
+        omni = ModuleType("omni"); omni.__path__ = []
+        omni.usd = ModuleType("omni.usd"); omni.usd.get_context = lambda: None
+        omni.timeline = ModuleType("omni.timeline")
+        omni.timeline.get_timeline_interface = lambda: SimpleNamespace(is_stopped=lambda: False)
+        physx = ModuleType("omni.physx"); physx.get_physx_scene_query_interface = lambda: AllBodies()
+        carb = ModuleType("carb"); carb.Float3 = lambda *v: list(v)
+        pxr = ModuleType("pxr")
+        pxr.Usd = SimpleNamespace(PrimRange=lambda body, _: [collider_prims[next(path for path, b in body_prims.items() if b is body)]],
+            TraverseInstanceProxies=lambda: None, TimeCode=SimpleNamespace(Default=lambda: None))
+        pxr.UsdGeom = SimpleNamespace(XformCache=lambda _: None)
+        pxr.UsdPhysics = SimpleNamespace(RigidBodyAPI="rigid", CollisionAPI="collision")
+        pxr.UsdUtils = None
+        modules = {"omni": omni, "omni.usd": omni.usd, "omni.timeline": omni.timeline,
+                   "omni.physx": physx, "carb": carb, "pxr": pxr}
+        def binding(stage, collider, body, *args):
+            path = collider.GetPath(); ancestor = path.rsplit("/", 1)[0]
+            return {"collider_path": path, "rigid_body_ancestor_path": ancestor, "source_meshes": []}
+        with TemporaryDirectory() as directory, mock.patch.dict("sys.modules", modules), \
+             mock.patch.object(geometry, "_stage_binding", return_value={"stage_id": 19, "same_stage_verified": True}), \
+             mock.patch.object(geometry, "_collider_binding", side_effect=binding), \
+             mock.patch.object(geometry, "_source_body_bounds", return_value={"minimum_body_m": [-.01]*3, "maximum_body_m": [.01]*3}):
+            path = Path(directory)/"audit.json"
+            result = geometry.export_collision_surface_audit(SimpleNamespace(GetPrimAtPath=lambda p: body_prims[p]),
+                bodies=bodies, output_path=path, scene_query_support={"enabled": True, "source": "mock config evidence"})
+            self.assertTrue(result["complete"], result["errors"])
+            self.assertEqual(result["route"], "live_surface_queries_v2")
+            self.assertFalse(result["full_convex_hull_complete"])
+            self.assertFalse(result["attached_native_shape_identity_verified"])
+            saved = json.loads(path.read_text())
+            self.assertEqual([b["native_link_index"] for b in saved["bodies"]], [20, 21, 22])
+            self.assertEqual([b["env_id"] for b in saved["bodies"]], [0]*3)
+            payload = json.loads((path.parent/"audit_surface_samples.json").read_text())
+            self.assertEqual(len(payload["bodies"]), 3)
+            self.assertTrue(all(len(b["rays"]) == 150 for b in payload["bodies"]))
 
 
 if __name__ == "__main__":

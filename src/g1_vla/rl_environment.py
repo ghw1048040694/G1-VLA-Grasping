@@ -1160,6 +1160,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     else:
         robot_spawn = sim_utils.UsdFileCfg(usd_path=str(asset_path), **spawn_args)
 
+    geometry_observation = config.get("rl_diagnostics", {}).get("collision_geometry_audit") or {}
+    scene_query_observation = (effort_model and geometry_observation.get("route") == "live_surface_queries_v2"
+                               and geometry_observation.get("enable_scene_query_support") is True)
+
     @configclass
     class EnvironmentCfg(DirectRLEnvCfg):
         decimation = 33
@@ -1169,6 +1173,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         state_space = 0
         seed = int(train_seed)
         sim = SimulationCfg(dt=0.002, device=device, render_interval=33,
+                            enable_scene_query_support=scene_query_observation,
                             physics=PhysxCfg(solver_type=1, enable_stabilization=False,
                                              friction_offset_threshold=(effort_contract["contact_generation"]["friction_offset_threshold_m"]
                                                  if effort_model and "contact_generation" in effort_contract else .04),
@@ -3085,7 +3090,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             """
             if not effort_model or output is None or self._physics_samples or self._pending_physics_sample:
                 raise RLEnvironmentError("collision geometry export requires the effort model before task physics")
-            from .rl_collision_geometry import export_collision_geometry
+            route = declaration.get("route", "same_stage_convex_request_v1")
+            if route == "live_surface_queries_v2":
+                from .rl_collision_geometry import export_collision_surface_audit as export_collision_geometry
+            else:
+                from .rl_collision_geometry import export_collision_geometry
             stage = get_current_stage()
             def properties():
                 values = []
@@ -3130,8 +3139,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "native_articulation_prim_path": root_path, "native_link_index": index,
                         "current_position_world_m": before_positions[env_id, index].cpu().tolist(),
                         "current_quaternion_xyzw": before_rotations[env_id, index].cpu().tolist()})
+            extra = {}
+            if route == "live_surface_queries_v2":
+                extra["scene_query_support"] = {
+                    "enabled": bool(self.sim.cfg.enable_scene_query_support),
+                    "source": "resolved SimulationCfg readback; usable query coverage checked by actual hits, not a compiled manager getter",
+                    "protocol": "g1_live_scene_query_instrumentation_v2"}
             result = export_collision_geometry(stage, bodies=bodies,
-                output_path=output/"collision_geometry_representation.json")
+                output_path=output/"collision_geometry_representation.json", **extra)
             after_properties = properties()
             properties_unchanged = before_properties == after_properties
             unchanged = (int(self.sim.get_physics_step_count()) == before_step and
@@ -3141,6 +3156,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 torch.equal(before_positions, tensor(self.robot.data.body_pos_w)) and
                 torch.equal(before_rotations, tensor(self.robot.data.body_quat_w)))
             result.update(native_step_before=before_step,
+                          geometry_observation_route=route,
                           native_step_after=int(self.sim.get_physics_step_count()),
                           current_state_unchanged=bool(unchanged), task_physics_steps=self._physics_samples,
                           property_snapshot_before=before_properties, property_snapshot_after=after_properties,
