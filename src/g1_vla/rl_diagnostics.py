@@ -408,7 +408,12 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     native.set_evaluation_mode(True, seed=cfg["rl_teacher"]["evaluation_seed"])
     environment.reset()
     observations = environment.get_observations().to(cfg["rl_teacher"]["device"])
+    collision_geometry = None
+    if settings.get("collision_geometry_audit") is not None:
+        collision_geometry = native.export_collision_geometry_audit(settings["collision_geometry_audit"])
     audit = _environment_audit(environment)
+    if collision_geometry is not None:
+        audit["collision_geometry_representation"] = collision_geometry
     audit["source_tree_sha256"] = source_tree_identity()
     effort_mode = settings["profile_plan"] == "balanced_effort_v6"
     if settings["profile_plan"] in ("compliant_pinch_v4", "physics_pinch_v5"):

@@ -3077,6 +3077,80 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             result, self._outcomes = self._outcomes, []
             return result
 
+        def export_collision_geometry_audit(self, declaration):
+            """Export this stage's requested collision representation before task steps.
+
+            The cooking interface is not a getter for the attached GPU shape's
+            cached vertices. Keep that limitation with the exported identity.
+            """
+            if not effort_model or output is None or self._physics_samples or self._pending_physics_sample:
+                raise RLEnvironmentError("collision geometry export requires the effort model before task physics")
+            from .rl_collision_geometry import export_collision_geometry
+            stage = get_current_stage()
+            def properties():
+                values = []
+                for name, view, methods in (
+                    ("Robot", self.robot.root_view, ("get_dof_stiffnesses", "get_dof_dampings",
+                        "get_dof_max_forces", "get_dof_friction_properties", "get_contact_offsets", "get_rest_offsets")),
+                    ("Cube", self.cube.root_view, ("get_contact_offsets", "get_rest_offsets")),
+                    ("Table", self.table.root_view, ("get_contact_offsets", "get_rest_offsets"))):
+                    for method in methods:
+                        v = tensor(getattr(view, method)()).detach().clone().cpu()
+                        if not bool(torch.isfinite(v).all()):
+                            raise RLEnvironmentError("nonfinite native geometry-observation property: "+name+"/"+method)
+                        values.append({"body": name, "getter": method, "shape": list(v.shape),
+                            "values": v.tolist()})
+                layer_records = [{"identifier": layer.identifier,
+                    "sha256": hashlib.sha256(layer.ExportToString().encode()).hexdigest()}
+                    for layer in stage.GetLayerStack()]
+                encoded = json.dumps(values, sort_keys=True, allow_nan=False).encode()
+                return {"native_drive_friction_shape_offsets_sha256": hashlib.sha256(encoded).hexdigest(),
+                    "native_getter_shapes": [{k: v for k, v in row.items() if k != "values"} for row in values],
+                    "usd_local_layer_stack": layer_records}
+            before_properties = properties()
+            before_step = int(self.sim.get_physics_step_count())
+            before_q = tensor(self.robot.data.joint_pos).detach().clone()
+            before_qd = tensor(self.robot.data.joint_vel).detach().clone()
+            def cube_state():
+                return torch.cat([tensor(getattr(self.cube.data, name)) for name in
+                    ("root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w")], dim=-1)
+            before_cube = cube_state().detach().clone()
+            before_positions = tensor(self.robot.data.body_pos_w).detach().clone()
+            before_rotations = tensor(self.robot.data.body_quat_w).detach().clone()
+            roots = list(self.robot.root_view.prim_paths)
+            bodies = []
+            for env_id in declaration["env_ids"]:
+                root_path = roots[env_id]
+                if root_path != f"/World/envs/env_{env_id}/Robot/root_joint":
+                    raise RLEnvironmentError("collision export native articulation path is not the declared Robot root")
+                for name in declaration["body_names"]:
+                    index = self.robot.body_names.index(name)
+                    bodies.append({"env_id": env_id, "body_name": name,
+                        "body_path": root_path.rsplit("/", 1)[0]+"/"+name,
+                        "native_articulation_prim_path": root_path, "native_link_index": index,
+                        "current_position_world_m": before_positions[env_id, index].cpu().tolist(),
+                        "current_quaternion_xyzw": before_rotations[env_id, index].cpu().tolist()})
+            result = export_collision_geometry(stage, bodies=bodies,
+                output_path=output/"collision_geometry_representation.json")
+            after_properties = properties()
+            properties_unchanged = before_properties == after_properties
+            unchanged = (int(self.sim.get_physics_step_count()) == before_step and
+                torch.equal(before_q, tensor(self.robot.data.joint_pos)) and
+                torch.equal(before_qd, tensor(self.robot.data.joint_vel)) and
+                torch.equal(before_cube, cube_state()) and
+                torch.equal(before_positions, tensor(self.robot.data.body_pos_w)) and
+                torch.equal(before_rotations, tensor(self.robot.data.body_quat_w)))
+            result.update(native_step_before=before_step,
+                          native_step_after=int(self.sim.get_physics_step_count()),
+                          current_state_unchanged=bool(unchanged), task_physics_steps=self._physics_samples,
+                          property_snapshot_before=before_properties, property_snapshot_after=after_properties,
+                          observed_native_properties_and_usd_layers_unchanged=properties_unchanged,
+                          property_scope="fresh native drives/friction/shape offsets and USD local layer contents; not a getter of attached cooked vertices or all compiled material/filter internals")
+            if (not unchanged or not properties_unchanged or
+                    (declaration["require_complete"] and result.get("complete") is not True)):
+                raise RLEnvironmentError("collision geometry export unavailable or changed current state: "+json.dumps(result))
+            return result
+
         def _write_control_probe(self, row):
             if not self._control_probe_enabled or self._control_probe_stream is None:
                 raise RLEnvironmentError("diagnostic evidence stream is not enabled")

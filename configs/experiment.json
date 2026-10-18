@@ -957,8 +957,8 @@
     "enabled": true,
     "backend": "g1_control_physics_diagnostics_v6",
     "num_envs": 8,
-    "episodes_per_env": 4,
-    "max_control_steps": 364,
+    "episodes_per_env": 1,
+    "max_control_steps": 91,
     "max_wall_time_s": 3600,
     "optimizer_steps": 0,
     "training_allowed": false,
@@ -1176,10 +1176,10 @@
         "native_binding_readback_required": true
       },
       "evaluation": {
-        "protocol": "acceptance32_v1",
+        "protocol": "calibration8_v1",
         "num_envs": 8,
-        "episodes_per_env": 4,
-        "max_control_steps": 364,
+        "episodes_per_env": 1,
+        "max_control_steps": 91,
         "nominal_episode_budget_s": 6.0,
         "physics_dt_s": 0.002,
         "control_period_s": 0.066,
@@ -1233,6 +1233,18 @@
         "raw_omissions_and_truncation_reported": true,
         "native_q_velocity_written_target_and_total_effort_required": true
       }
+    },
+    "collision_geometry_audit": {
+      "enabled": true,
+      "env_ids": [
+        0
+      ],
+      "body_names": [
+        "right_hand_thumb_2_link",
+        "right_hand_index_1_link",
+        "right_hand_middle_1_link"
+      ],
+      "require_complete": true
     }
   }
 }

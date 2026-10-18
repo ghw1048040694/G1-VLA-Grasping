@@ -686,5 +686,91 @@ class NativeEffortAdapterTests(unittest.TestCase):
         self.assertFalse(calls[0]["group_contact_valid"][1].any())
 
 
+@unittest.skipUnless(TORCH, "real torch is required for state invariance checks")
+class CollisionGeometryBoundaryTests(unittest.TestCase):
+    def fixture(self):
+        import hashlib
+        import torch
+        t = torch
+        names = ["right_hand_thumb_2_link", "right_hand_index_1_link", "right_hand_middle_1_link"]
+        data = SimpleNamespace(joint_pos=t.zeros(8, 43), joint_vel=t.zeros(8, 43),
+            body_pos_w=t.zeros(8, 3, 3), body_quat_w=t.tensor([0., 0., 0., 1.]).repeat(8, 3, 1))
+        cube = SimpleNamespace(root_pos_w=t.zeros(8, 3),
+            root_quat_w=t.tensor([0., 0., 0., 1.]).repeat(8, 1),
+            root_lin_vel_w=t.zeros(8, 3), root_ang_vel_w=t.zeros(8, 3))
+        env = SimpleNamespace(_physics_samples=0, _pending_physics_sample=False, step=0,
+            robot=SimpleNamespace(data=data, body_names=names,
+                root_view=SimpleNamespace(prim_paths=[f"/World/envs/env_{i}/Robot/root_joint" for i in range(8)])),
+            cube=SimpleNamespace(data=cube))
+        env.sim = SimpleNamespace(get_physics_step_count=lambda: env.step)
+        for name in ("get_dof_stiffnesses", "get_dof_dampings", "get_dof_max_forces", "get_dof_friction_properties",
+                     "get_contact_offsets", "get_rest_offsets"):
+            setattr(env.robot.root_view, name, lambda: t.ones(8, 43))
+        for body in (env.cube,):
+            body.root_view = SimpleNamespace(get_contact_offsets=lambda: t.zeros(8, 1),
+                                             get_rest_offsets=lambda: -t.ones(8, 1)*1e-6)
+        env.table = SimpleNamespace(root_view=env.cube.root_view)
+        stage = SimpleNamespace(layer_text="unchanged stage")
+        layer = SimpleNamespace(identifier="active-layer", ExportToString=lambda: stage.layer_text)
+        stage.GetLayerStack = lambda: [layer]
+        method = actual_method("export_collision_geometry_audit", {
+            "torch": t, "tensor": lambda v: v, "RLEnvironmentError": RuntimeError,
+            "effort_model": True, "output": Path("/unused-audit-output"),
+            "get_current_stage": lambda: stage, "json": json, "hashlib": hashlib,
+            "__package__": "g1_vla", "__name__": "g1_vla.rl_environment"})
+        return env, method, stage, {"env_ids": [0], "body_names": names, "require_complete": True}
+
+    def call(self, env, method, declaration, callback):
+        from unittest.mock import patch
+        import sys
+        with patch.dict(sys.modules, {"g1_vla.rl_collision_geometry":
+                SimpleNamespace(export_collision_geometry=callback)}):
+            return method(env, declaration)
+
+    def test_exports_same_stage_and_native_link_identity_without_task_step(self):
+        env, method, stage, declaration = self.fixture()
+        def export(actual, *, bodies, output_path):
+            self.assertIs(actual, stage)
+            self.assertEqual([x["native_link_index"] for x in bodies], [0, 1, 2])
+            self.assertTrue(all(x["body_path"].startswith("/World/envs/env_0/Robot/") for x in bodies))
+            return {"complete": True, "attached_shape_cache_verified": False}
+        result = self.call(env, method, declaration, export)
+        self.assertTrue(result["current_state_unchanged"])
+        self.assertEqual(result["native_step_before"], result["native_step_after"])
+        self.assertEqual(result["task_physics_steps"], 0)
+        self.assertFalse(result["attached_shape_cache_verified"])
+        self.assertTrue(result["observed_native_properties_and_usd_layers_unchanged"])
+
+    def test_unavailable_representation_cannot_start_the_physical_profile(self):
+        env, method, _, declaration = self.fixture()
+        with self.assertRaises(RuntimeError):
+            self.call(env, method, declaration, lambda *a, **k: {"complete": False})
+
+    def test_any_step_or_measured_state_mutation_rejects_before_profile(self):
+        for change in ("step", "q", "cube_velocity", "body_pose", "native_drive", "usd_layer"):
+            env, method, stage, declaration = self.fixture()
+            def export(*a, **k):
+                if change == "step": env.step += 1
+                elif change == "q": env.robot.data.joint_pos[0, 0] += .00001
+                elif change == "cube_velocity": env.cube.data.root_lin_vel_w[0, 0] += .00001
+                elif change == "body_pose": env.robot.data.body_pos_w[0, 0, 0] += .00001
+                elif change == "usd_layer": stage.layer_text = "unexpected changed layer"
+                else:
+                    old = env.robot.root_view.get_dof_max_forces
+                    env.robot.root_view.get_dof_max_forces = lambda: old()*2
+                return {"complete": True}
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                self.call(env, method, declaration, export)
+
+    def test_after_physics_or_wrong_native_root_cannot_export(self):
+        for change in ("physics", "pending", "root"):
+            env, method, _, declaration = self.fixture()
+            if change == "physics": env._physics_samples = 1
+            elif change == "pending": env._pending_physics_sample = True
+            else: env.robot.root_view.prim_paths[0] = "/World/unrelated/Robot/root_joint"
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                self.call(env, method, declaration, lambda *a, **k: {"complete": True})
+
+
 if __name__ == "__main__":
     unittest.main()

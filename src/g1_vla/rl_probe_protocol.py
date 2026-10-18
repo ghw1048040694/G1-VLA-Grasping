@@ -113,6 +113,7 @@ RL_PROBE_DEFAULTS = {
     "guided_target_lead_max_rad": None,
     "compliant_pinch_controller": None,
     "effort_grasp_controller": None,
+    "collision_geometry_audit": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -219,6 +220,17 @@ def validate_probe_settings(value):
         result["effort_grasp_controller"] = effort
     elif result["effort_grasp_controller"] is not None:
         raise ValueError("Legacy diagnostics cannot silently install a new effort/material/reset model")
+    geometry = result["collision_geometry_audit"]
+    if geometry is not None:
+        expected = {"enabled": True, "env_ids": [0], "body_names": [
+            "right_hand_thumb_2_link", "right_hand_index_1_link", "right_hand_middle_1_link"],
+            "require_complete": True}
+        if plan != "balanced_effort_v6" or geometry != expected:
+            raise ValueError("Collision representation audit pins the three distal bodies in env0 and complete export")
+        if type(geometry["enabled"]) is not bool or type(geometry["require_complete"]) is not bool:
+            raise ValueError("Collision representation audit flags must be boolean")
+        if any(type(x) is not int for x in geometry["env_ids"]):
+            raise ValueError("Collision representation audit env IDs must be integers")
     eval_plan = effort["evaluation"] if effort is not None else {"num_envs": 8, "episodes_per_env": 4, "max_control_steps": 364}
     for key, expected in (("num_envs", eval_plan["num_envs"]), ("episodes_per_env", eval_plan["episodes_per_env"]),
                           ("max_control_steps", eval_plan["max_control_steps"]),
