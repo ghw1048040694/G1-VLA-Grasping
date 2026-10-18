@@ -957,8 +957,8 @@
     "enabled": true,
     "backend": "g1_control_physics_diagnostics_v6",
     "num_envs": 8,
-    "episodes_per_env": 4,
-    "max_control_steps": 364,
+    "episodes_per_env": 1,
+    "max_control_steps": 91,
     "max_wall_time_s": 3600,
     "optimizer_steps": 0,
     "training_allowed": false,
@@ -1176,10 +1176,10 @@
         "native_binding_readback_required": true
       },
       "evaluation": {
-        "protocol": "acceptance32_v1",
+        "protocol": "calibration8_v1",
         "num_envs": 8,
-        "episodes_per_env": 4,
-        "max_control_steps": 364,
+        "episodes_per_env": 1,
+        "max_control_steps": 91,
         "nominal_episode_budget_s": 6.0,
         "physics_dt_s": 0.002,
         "control_period_s": 0.066,
@@ -1258,6 +1258,25 @@
       "requires_all_groups_physically_loaded": true,
       "requires_original_contact_safe": true,
       "all_original_acceptance_gates_unchanged": true
-    }
+    },
+    "contact_transition_control": {
+      "version": "g1_coordinated_contact_transition_v1",
+      "unload_direction": "current_normal_jacobian_else_declared_axis",
+      "missing_group_reference_velocity_limit_rad_s": 0.04,
+      "reset_missing_reference_on_first_any_contact": true,
+      "preload_group_force_targets_n": [
+        0.2,
+        0.1,
+        0.1
+      ],
+      "full_contact_settle_samples": 25,
+      "full_force_ramp_s": 0.1,
+      "free_thumb2_activation_margin_rad": 0.006,
+      "free_thumb2_restoring_stiffness_nm_rad": 2.0,
+      "free_thumb2_maximum_guard_torque_nm": 0.004,
+      "partial_thumb2_normal_world_z_guard": true,
+      "all_original_acceptance_gates_unchanged": true
+    },
+    "full_lift": null
   }
 }

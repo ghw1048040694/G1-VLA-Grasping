@@ -93,6 +93,91 @@ class RLEnvironmentError(ValueError):
     """An unsafe or incompatible RL environment specification."""
 
 
+class ContactQualifiedFullLift:
+    """Per-physics-sample full-task gates, separate from the local milestone.
+
+    Admission uses the original fixed grip reference and 100-sample support
+    window. No previously failed force/domain sample can be cleared by a later
+    good window. Once lifting starts, loss of any original support gate is a
+    terminal failure, rather than a reason to keep pushing upward.
+    """
+
+    def __init__(self, torch, num_envs, device, declaration):
+        from .rl_effort_protocol import validate_full_lift_protocol
+        self.torch = torch
+        self.declaration = validate_full_lift_protocol(declaration)
+        if self.declaration is None:
+            raise ValueError("Full-lift state requires an explicit declaration")
+        self.local_support_qualified = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self.main_lift_started = torch.zeros_like(self.local_support_qualified)
+        self.main_lift_authorized = torch.zeros_like(self.local_support_qualified)
+        self.main_lift_support_lost = torch.zeros_like(self.local_support_qualified)
+        self.failed = torch.zeros_like(self.local_support_qualified)
+        self.full_success = torch.zeros_like(self.local_support_qualified)
+        self.whole_episode_force_clean = torch.ones_like(self.local_support_qualified)
+        self.whole_episode_original_domain_clean = torch.ones_like(self.local_support_qualified)
+        self.hold_samples = torch.zeros(num_envs, dtype=torch.int64, device=device)
+        self.maximum_hold_samples = torch.zeros_like(self.hold_samples)
+        self.physics_samples = torch.zeros_like(self.hold_samples)
+        self.first_failure_sample = torch.zeros_like(self.hold_samples)
+        self.first_failure_code = torch.zeros_like(self.hold_samples)
+
+    def reset(self, env_ids):
+        for name in ("local_support_qualified", "main_lift_started", "main_lift_authorized", "main_lift_support_lost",
+                     "failed", "full_success", "hold_samples", "maximum_hold_samples", "physics_samples",
+                     "first_failure_sample", "first_failure_code"):
+            getattr(self, name)[env_ids] = 0
+        self.whole_episode_force_clean[env_ids] = True
+        self.whole_episode_original_domain_clean[env_ids] = True
+
+    def update(self, *, measurement_valid, group_force_n, original_hand_domain,
+               local_support_qualified, support_current, clearance_m, object_lift_m, unsafe):
+        t, declaration = self.torch, self.declaration
+        self.physics_samples += 1
+        was_failed = self.failed.clone()
+        force_clean = (measurement_valid & t.isfinite(group_force_n).all(-1) &
+                       (group_force_n >= 0).all(-1) & (group_force_n <= 1.5).all(-1))
+        domain_clean = measurement_valid & original_hand_domain
+        self.whole_episode_force_clean &= force_clean
+        self.whole_episode_original_domain_clean &= domain_clean
+        self.local_support_qualified |= local_support_qualified
+        height_safe = (t.isfinite(clearance_m) & t.isfinite(object_lift_m) &
+                       (clearance_m <= declaration["actual_height_limit_m"]) &
+                       (object_lift_m <= declaration["actual_height_limit_m"]))
+        physical_safe = (support_current & force_clean & domain_clean & height_safe & ~unsafe)
+        self.main_lift_support_lost |= self.main_lift_started & ~physical_safe
+        # These histories can never become clean again in this episode. End
+        # an inadmissible full-task attempt rather than waiting out its budget.
+        self.failed |= (self.main_lift_support_lost | ~self.whole_episode_force_clean |
+                        ~self.whole_episode_original_domain_clean | unsafe | ~height_safe)
+        first = self.failed & ~was_failed
+        # Bitset: 1 missing raw sample, 2 force, 4 original hand domain,
+        # 8 loss of an original main-lift support gate, 16 height, 32 unsafe.
+        code = ((~measurement_valid).long() + (measurement_valid & ~force_clean).long()*2 +
+                (~original_hand_domain).long()*4 + self.main_lift_support_lost.long()*8 +
+                (~height_safe).long()*16 + unsafe.long()*32)
+        self.first_failure_sample[first] = self.physics_samples[first]
+        self.first_failure_code[first] = code[first]
+        admit = (local_support_qualified & physical_safe & self.whole_episode_force_clean &
+                 self.whole_episode_original_domain_clean & ~self.failed)
+        self.main_lift_started |= admit
+        self.main_lift_authorized = self.main_lift_started & physical_safe & ~self.failed
+        hold = (self.main_lift_authorized & (clearance_m >= declaration["target_corner_clearance_m"]) &
+                (object_lift_m >= declaration["target_corner_clearance_m"]))
+        self.hold_samples = t.where(hold, self.hold_samples+1, t.zeros_like(self.hold_samples))
+        self.maximum_hold_samples = t.maximum(self.maximum_hold_samples, self.hold_samples)
+        self.full_success = ((self.hold_samples >= declaration["hold_consecutive_samples"]) &
+                             ~self.failed & self.whole_episode_force_clean &
+                             self.whole_episode_original_domain_clean)
+        return self.metrics()
+
+    def metrics(self):
+        return {name: getattr(self, name).clone() for name in (
+            "local_support_qualified", "main_lift_started", "main_lift_authorized", "main_lift_support_lost", "failed",
+            "full_success", "whole_episode_force_clean", "whole_episode_original_domain_clean",
+            "hold_samples", "maximum_hold_samples", "physics_samples", "first_failure_sample", "first_failure_code")}
+
+
 class ContactEquivalenceError(AssertionError):
     """A same-step native contact-view crosscheck failed; never unsupported."""
 
@@ -727,6 +812,13 @@ def resolve_settings(config):
         raise RLEnvironmentError("version 1 requires explicitly declared max friction combination")
     if settings["lift_height_m"] != 0.006:
         raise RLEnvironmentError("this local curriculum permits only the 6 mm probe target")
+    declaration = config.get("rl_diagnostics", {}).get("full_lift")
+    if declaration is not None:
+        from .rl_effort_protocol import validate_full_lift_protocol
+        declaration = validate_full_lift_protocol(declaration)
+        # The local 6 mm milestone remains intact. The independently versioned
+        # full-task declaration owns the later height bounds and episode time.
+        settings["episode_length_s"] = declaration["episode_length_s"]
     if rl.get("action_joint_names", list(ACTION_JOINT_NAMES)) != list(ACTION_JOINT_NAMES):
         raise RLEnvironmentError("RL policy action joint order differs from the explicit 14-joint contract")
     policy_velocity_limits(config)
@@ -1045,6 +1137,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     if probe_profile is not None and (not eval_mode or output_dir is None or num_envs > 8):
         raise RLEnvironmentError("control diagnostics require standalone evaluation, output and at most eight environments")
     settings = resolve_settings(config)
+    from .rl_effort_protocol import validate_full_lift_protocol
+    full_lift = validate_full_lift_protocol(config.get("rl_diagnostics", {}).get("full_lift"))
     physics_protocol = config["rl_teacher"]["physics_protocol"]
     if physics_protocol not in (RL_PHYSICS, RL_PHYSICS_FIXED_PALM_ADJACENCY, RL_PHYSICS_EFFORT_GRASP):
         raise RLEnvironmentError("unsupported explicit RL physics protocol")
@@ -1323,6 +1417,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._support_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
             self._support_qualified = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self._local_success = torch.zeros_like(self._support_qualified)
+            self._full_lift = (ContactQualifiedFullLift(torch, self.num_envs, self.device, full_lift)
+                               if full_lift is not None else None)
+            if self._full_lift is not None:
+                self._full_lift_failure_arm_target = self._targets[:, self._action_ids[:7]].clone()
+                frames = effort_candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+                trajectory = torch.as_tensor([f.get("hand_target_rad", f.get("target_rad")) for f in frames],
+                    device=self.device, dtype=self._targets.dtype)
+                if tuple(trajectory.shape) != (6,7) or not bool(torch.isfinite(trajectory).all()):
+                    raise RLEnvironmentError("full lift requires immutable original six-keyframe hand bounds")
+                self._effort_actual_domain_lower = (trajectory.amin(0)-.025)[None].expand(self.num_envs,-1).clone()
+                self._effort_actual_domain_upper = (trajectory.amax(0)+.025)[None].expand(self.num_envs,-1).clone()
             self._unsafe = torch.zeros_like(self._support_qualified)
             self._probe_overshoot = torch.zeros_like(self._support_qualified)
             self._grip_locked = torch.zeros_like(self._support_qualified)
@@ -1881,7 +1986,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             increment = desired[:, :7] - previous_arm
             previous_prediction = palm_z + torch.sum(point_jz*(previous_arm-current_arm), dim=-1)
             predicted_increment = torch.sum(point_jz*increment, dim=-1)
-            allowance = (self._start_palm_z + settings["probe_clearance_max_m"] - previous_prediction).clamp_min(0)
+            palm_height_limit = settings["probe_clearance_max_m"]
+            if getattr(self, "_full_lift", None) is not None:
+                palm_height_limit = torch.where(self._full_lift.main_lift_authorized,
+                    torch.full_like(palm_z, full_lift["palm_lift_request_max_m"]),
+                    torch.full_like(palm_z, settings["probe_clearance_max_m"]))
+            allowance = (self._start_palm_z + palm_height_limit - previous_prediction).clamp_min(0)
             factor = torch.where(predicted_increment > allowance,
                                  allowance/predicted_increment.clamp_min(1e-12), torch.ones_like(allowance)).clamp(0, 1)
             if not self._control_probe_enabled:
@@ -1894,7 +2004,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 version = self._control_probe_profile["control_guard_version"]
                 guarded, evidence = apply_probe_guard(
                     torch, desired[:, :7], previous_arm, current_arm, low[:, :7], high[:, :7],
-                    point_jz, palm_z, self._start_palm_z, settings["probe_clearance_max_m"], mode=version)
+                    point_jz, palm_z, self._start_palm_z, palm_height_limit, mode=version)
                 desired[:, :7] = guarded
                 bound_tolerance = LEGACY_JOINT_ROUNDOFF_TOLERANCE_RAD if version == "legacy_scalar_v1" else 0.0
                 lower_violation = (low-desired).clamp_min(0)
@@ -1946,6 +2056,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         def _apply_action(self):
             if self._pending_physics_sample:
                 self._sample_physics()
+            if getattr(self, "_full_lift", None) is not None:
+                # Stop the pending macro ascent at the very next 2 ms command,
+                # holding the measured arm pose captured on the failure sample.
+                failed = self._full_lift.failed
+                self._targets[:, self._action_ids[:7]] = torch.where(failed[:, None],
+                    self._full_lift_failure_arm_target, self._targets[:, self._action_ids[:7]])
             if self._physics_pinch is not None:
                 self._update_physics_pinch()
             if self._effort_grasp is not None:
@@ -2054,7 +2170,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._last_written_full_effort[env_ids] = 0
             self._last_written_hand_effort[env_ids] = 0
 
-        def configure_effort_grasp(self, contract, *, domain_posture_guard=None):
+        def configure_effort_grasp(self, contract, *, domain_posture_guard=None, contact_transition=None):
             from .rl_effort_protocol import validate_effort_grasp_contract, validate_contact_domain_posture_guard
             from .rl_hand_control import BalancedEffortGraspController
             if not effort_model or validate_effort_grasp_contract(contract) != effort_contract:
@@ -2062,17 +2178,21 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._effort_grasp is not None:
                 raise RLEnvironmentError("effort controller cannot be replaced during a run")
             self._effort_domain_posture_guard = validate_contact_domain_posture_guard(domain_posture_guard)
+            self._effort_contact_transition = contact_transition
             guard_arguments = {}
-            if self._effort_domain_posture_guard is not None:
+            if self._effort_domain_posture_guard is not None or contact_transition is not None or full_lift is not None:
                 frames = effort_candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
                 trajectory = torch.as_tensor([f.get("hand_target_rad", f.get("target_rad")) for f in frames],
                     device=self.device, dtype=tensor(self.robot.data.joint_pos).dtype)
                 if tuple(trajectory.shape) != (6, 7) or not bool(torch.isfinite(trajectory).all()):
                     raise RLEnvironmentError("domain posture guard requires the pinned original six keyframes")
-                tolerance = self._effort_domain_posture_guard["original_actual_geometry_tolerance_rad"]
+                tolerance = .025
                 self._effort_actual_domain_lower = (trajectory.amin(0)-tolerance)[None].expand(self.num_envs, -1).clone()
                 self._effort_actual_domain_upper = (trajectory.amax(0)+tolerance)[None].expand(self.num_envs, -1).clone()
-                guard_arguments["domain_posture_guard"] = self._effort_domain_posture_guard
+                if self._effort_domain_posture_guard is not None:
+                    guard_arguments["domain_posture_guard"] = self._effort_domain_posture_guard
+            if contact_transition is not None:
+                guard_arguments["contact_transition"] = contact_transition
             self._effort_grasp = BalancedEffortGraspController(torch,
                 tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]], self._episode_ids,
                 parameters=contract["controller"]["parameters"], **guard_arguments)
@@ -2081,6 +2201,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._object_support_last_sample = None
             self._write_control_probe({"event": "effort_grasp_controller_installed", "contract": contract,
                 "contact_domain_posture_guard": self._effort_domain_posture_guard,
+                "contact_transition_control": contact_transition,
                 "actual_domain_lower_hand_rad": getattr(self, "_effort_actual_domain_lower", None),
                 "actual_domain_upper_hand_rad": getattr(self, "_effort_actual_domain_upper", None),
                 "native_physics_step_count": int(self.sim.get_physics_step_count()),
@@ -2210,7 +2331,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             support_torque, support_evidence = self._object_weight_support_torque(
                 valid=valid, tracking=tracking, geometry=geometry, current=current)
             guard_feedback = {}
-            if getattr(self, "_effort_domain_posture_guard", None) is not None:
+            if (getattr(self, "_effort_domain_posture_guard", None) is not None or
+                    getattr(self, "_effort_contact_transition", None) is not None):
                 guard_feedback = {"contact_point_jacobian_world_m": geometry["point_jacobian_world_m"]
                     if geometry is not None else torch.zeros(self.num_envs, 3, 3, 7, device=self.device),
                     "actual_domain_lower_hand_rad": self._effort_actual_domain_lower,
@@ -2583,6 +2705,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             friction_manifold = torch.zeros_like(no_positive_gap_load)
             reference_summary = None
             contact_available = self._force_unavailable is None
+            group_measurement_available = False
             try:
                 x, y, z, w = rotation.unbind(-1)
                 object_up_world = torch.stack((2*(x*z+w*y), 2*(y*z-w*x), 1-2*(x*x+y*y)), dim=-1)
@@ -2606,6 +2729,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 depth = torch.maximum(depth, cube_contacts["maximum_penetration_m"])
                 other_force = cube_contacts["other_fn"] + cube_contacts["unfiltered_normal_residual_n"]
                 other_loaded_count = cube_contacts["other_loaded_count"]
+                group_measurement_available = True
                 table_supported = self._table_contact_channel.snapshot()["supported"]
                 self._qualification_supported = self._force_unavailable is None and table_supported
                 contact_available &= table_supported
@@ -2685,11 +2809,39 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._support_qualified = qualified_now
             lift_height = position[:, 2] - self._start_cube_z
             probe_limit = settings["probe_clearance_max_m"] + settings["probe_overshoot_tolerance_m"]
+            if getattr(self, "_full_lift", None) is not None:
+                probe_limit = torch.where(self._full_lift.main_lift_started,
+                    torch.full_like(clearance, full_lift["actual_height_limit_m"]),
+                    torch.full_like(clearance, probe_limit))
             self._probe_overshoot |= (clearance > probe_limit) | (lift_height > probe_limit)
             self._unsafe |= ~finite | ~joint_safe | self._probe_overshoot | (depth > settings["max_penetration_m"])
             # This version terminates at qualified 2--6 mm support. It never
             # executes or claims the original 0.1 m lift / 0.5 s carry gate.
             self._local_success = qualified_now & ~self._unsafe
+            full_lift_metrics = {}
+            if getattr(self, "_full_lift", None) is not None:
+                hand = tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]]
+                original_domain = (torch.isfinite(hand).all(-1) &
+                    (hand >= self._effort_actual_domain_lower).all(-1) &
+                    (hand <= self._effort_actual_domain_upper).all(-1))
+                was_failed = self._full_lift.failed.clone()
+                full_lift_metrics = self._full_lift.update(
+                    # Successful raw hand/Cube data can witness zero hand
+                    # force while the separate Table channel is still waiting
+                    # for its first positive-load capability witness. Table
+                    # capability remains mandatory in support/admission.
+                    measurement_valid=finite & bool(group_measurement_available),
+                    group_force_n=groups, original_hand_domain=original_domain,
+                    local_support_qualified=self._local_success, support_current=support,
+                    clearance_m=clearance, object_lift_m=lift_height, unsafe=self._unsafe)
+                newly_failed = self._full_lift.failed & ~was_failed
+                self._full_lift_failure_arm_target[newly_failed] = tensor(
+                    self.robot.data.joint_pos)[newly_failed][:, self._action_ids[:7]]
+                self._unsafe |= self._full_lift.failed
+                full_lift_metrics["original_hand_domain_current"] = original_domain
+                full_lift_metrics["raw_group_measurement_valid_current"] = torch.full_like(
+                    finite, bool(group_measurement_available)) & finite
+                full_lift_metrics["full_lift_failure_arm_target_held"] = self._full_lift.failed.clone()
             self._max_clearance = torch.maximum(self._max_clearance, clearance)
             table_supported = self._table_contact_channel.snapshot()["supported"]
             unknown_table = torch.full_like(table_fn, float("nan"))
@@ -2712,6 +2864,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                   "finite": finite, "joint_safe": joint_safe, "contact_safe": contact_safe,
                                   "support_current": support, "support_qualified": self._support_qualified,
                                   "unsafe_probe_overshoot": self._probe_overshoot, "success": self._local_success}
+            if getattr(self, "_full_lift", None) is not None:
+                self._last_metrics.update(full_lift_metrics)
+                self._last_metrics["success"] = self._full_lift.full_success
             self._last_contact_episode_ids = self._episode_ids.clone()
             self._last_contact_native_step = int(self.sim.get_physics_step_count())
             if self._physics_pinch is not None or active_effort:
@@ -2741,7 +2896,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                        "env_ids": list(range(count)), "force_unavailable": self._force_unavailable,
                        "qualification_supported": self._qualification_supported,
                        "table_contact_channel": self._table_contact_channel.snapshot(),
-                       "main_lift_authorized": False,
+                       "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False),
                        "metrics": {name: value[:count].detach().cpu().tolist() for name, value in self._last_metrics.items()},
                        "joint_position_rad": tensor(self.robot.data.joint_pos)[:count].detach().cpu().tolist(),
                        "joint_velocity_rad_s": tensor(self.robot.data.joint_vel)[:count].detach().cpu().tolist(),
@@ -2795,7 +2950,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 "cube_quaternion_xyzw": rotation, "cube_linear_velocity_world_m_s": velocity,
                 "cube_angular_velocity_world_rad_s": angular, "cube_position_in_palm_m": relative,
                 "cube_rotation_in_palm_xyzw": relative_rotation, "raw_contacts": self._raw_contact_tensors,
-                "main_lift_authorized": False, "raw_capture_reasons": reasons}
+                "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False), "raw_capture_reasons": reasons}
             def frozen(value):
                 if torch.is_tensor(value):
                     return value.detach().clone()
@@ -2850,11 +3005,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "unsafe_latched": self._unsafe.detach().clone(),
                     "native_joint_load_measurement": self._control_probe_joint_load("post_physics_pre_reset"),
                     "native_self_pair_measurement": self._control_probe_self_pair("post_physics_pre_reset"),
-                    "main_lift_authorized": False, "pre_reset": True}
+                    "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False), "pre_reset": True}
             if self._standalone_video:
                 self._capture_evaluation_frame()
             dropped = tensor(self.cube.data.root_pos_w)[:, 2] < 0.70
-            terminated = self._unsafe | self._local_success | dropped
+            success = self._local_success if getattr(self, "_full_lift", None) is None else self._full_lift.full_success
+            terminated = self._unsafe | success | dropped
             truncated = self.episode_length_buf >= self.max_episode_length
             return terminated, truncated
 
@@ -2995,6 +3151,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                       "episode_id": self._episode_ids, "elapsed_steps": self.episode_length_buf,
                       "episode_return": self._episode_return, "max_clearance_m": self._max_clearance,
                       "maximum_support_samples": self._max_support_samples}
+            if self._full_lift is not None:
+                fields.update(self._full_lift.metrics())
             field_batch = {name: value[terminal_ids].detach().cpu().tolist()
                            for name, value in fields.items()} if terminal_indices else {}
             measurement_unavailable = self._force_unavailable or self._table_contact_channel.snapshot()["unavailable_reason"]
@@ -3006,13 +3164,25 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 if self._force_unavailable:
                     failure.append("contact_measurement_unavailable")
                 if episode["probe_overshoot"]:
-                    failure.append("local_probe_exceeded_6mm_before_qualification")
+                    failure.append("full_lift_or_local_height_bound_exceeded" if self._full_lift is not None else
+                                   "local_probe_exceeded_6mm_before_qualification")
                 if episode["unsafe"]:
                     failure.append("unsafe_physical_state")
                 if not episode["support_qualified"]:
                     failure.append("continuous_support_not_qualified")
                 if not episode["local_success"]:
                     failure.append("local_support_window_not_qualified")
+                if self._full_lift is not None:
+                    if episode["local_support_qualified"]:
+                        failure = [reason for reason in failure if reason not in (
+                            "local_support_window_not_qualified", "continuous_support_not_qualified")]
+                    for key, reason in (("whole_episode_force_clean", "whole_episode_1p5n_force_limit_failed"),
+                                        ("whole_episode_original_domain_clean", "whole_episode_original_hand_domain_failed"),
+                                        ("full_success", "full_10cm_500ms_hold_not_qualified")):
+                        if not episode[key]:
+                            failure.append(reason)
+                    if episode["main_lift_support_lost"]:
+                        failure.append("main_lift_original_support_gate_lost")
                 if not metrics.get("no_positive_gap_hand_load", False):
                     failure.append("positive_gap_hand_normal_load_or_measurement_unavailable")
                 if not metrics.get("friction_partner_manifold_certified", False):
@@ -3026,13 +3196,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                        "elapsed_steps": int(episode["elapsed_steps"]),
                                        "sim_time_s": float(episode["elapsed_steps"]*self.step_dt),
                                        "episode_return": float(episode["episode_return"]),
-                                       "success": None if measurement_unavailable else bool(episode["local_success"]),
+                                       "success": None if measurement_unavailable else bool(episode[
+                                           "local_success" if self._full_lift is None else "full_success"]),
                                        "local_success": False if measurement_unavailable else bool(episode["local_success"]),
                                        "qualification_supported": self._qualification_supported,
                                        "unavailable_reason": measurement_unavailable, "gates": gates, "metrics": metrics,
                                        "max_clearance_m": float(episode["max_clearance_m"]),
                                        "maximum_support_samples": int(episode["maximum_support_samples"]),
                                        "failure_reasons": failure,
+                                       **({key: episode[key] for key in self._full_lift.metrics()}
+                                          if self._full_lift is not None else {}),
                                        **({"control_probe_profile": dict(self._control_probe_profile)} if self._control_probe_enabled else {})})
             self._interrupted += int(((~terminal) & (self.episode_length_buf[env_ids] > 0)).sum().item())
             super()._reset_idx(env_ids)
@@ -3074,6 +3247,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._support_count[env_ids] = 0
             self._support_qualified[env_ids] = False
             self._local_success[env_ids] = False
+            if self._full_lift is not None:
+                self._full_lift.reset(env_ids)
+                self._full_lift_failure_arm_target[env_ids] = q[:, self._action_ids[:7]]
             self._unsafe[env_ids] = False
             self._probe_overshoot[env_ids] = False
             self._grip_locked[env_ids] = False
@@ -3215,7 +3391,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                    "next_frame_index": self._video_status["frames"],
                    "next_command_id": self._control_command_id+1,
                    "joint_names": list(self.robot.joint_names), "action_joint_names": list(ACTION_JOINT_NAMES),
-                   "action_joint_ids": list(self._action_ids), "main_lift_authorized": False,
+                   "action_joint_ids": list(self._action_ids), "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False),
                    "native_joint_load_readback": self._native_joint_load_diagnostic.readback,
                    "native_self_pair_readback": self._native_self_pair_diagnostic.summary()}
             self._write_control_probe(row)
@@ -3386,7 +3562,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                         "action_joint_names": list(ACTION_JOINT_NAMES),
                                         "physics_dt_s": self.physics_dt, "control_period_s": self.step_dt,
                                         "contact_force_semantics": "raw PhysX point normal force and separated friction aggregate, both divided by actual physics dt",
-                                        "main_lift_authorized": False, "policy_contract": self.runtime_audit()["policy_contract"]})
+                                        "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False), "policy_contract": self.runtime_audit()["policy_contract"]})
 
         def _write_evaluation_row(self, row):
             if self._record:
@@ -3470,8 +3646,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "qualification_supported": self._qualification_supported,
                     "mechanical_migration_qualification": self._mechanical_migration,
                     "support_required_samples": consecutive_window_samples(settings["support_window_s"], self.physics_dt),
-                    "original_main_lift_enabled": False,
-                    "main_lift_authorized": False,
+                    "original_main_lift_enabled": full_lift is not None,
+                    "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False),
                     "observation_cameras": [], "in_episode_object_state_writes": 0, "object_attachments": 0}
             if fixed_palm_model:
                 if effort_model:
@@ -3500,6 +3676,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     reset_protocol=effort_candidate["reset_protocol"],
                     historical_reset_protocol=config["rl_teacher"]["reset_protocol"],
                     original_seed_state_retained_sha256=hashlib.sha256(json.dumps(original_initial, sort_keys=True).encode()).hexdigest())
+                if full_lift is not None:
+                    audit["policy_contract"]["full_lift"] = copy.deepcopy(full_lift)
+                    audit["success_scope"] = "contact-qualified 10cm corner clearance and continuous 0.5s hold; original20 not certified"
+                transition = config.get("rl_diagnostics", {}).get("contact_transition_control")
+                if transition is not None:
+                    audit["policy_contract"]["contact_transition_control"] = copy.deepcopy(transition)
                 if "contact_generation" in effort_contract:
                     audit["policy_contract"]["contact_generation"] = copy.deepcopy(effort_contract["contact_generation"])
                     audit["diagnostic_contact_generation_readback"] = self._effort_contact_generation_readback
@@ -3523,7 +3705,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
         def step_audit(self):
             return {"physics_samples": self._physics_samples, "reset_count": self._resets,
                     "interrupted_episode_count": self._interrupted, "evaluation_mode": self._eval_mode,
-                    "main_lift_authorized": False, "action_shield_count": self._shield_count,
+                    "main_lift_authorized": (self._full_lift.main_lift_authorized if getattr(self, "_full_lift", None) is not None else False), "action_shield_count": self._shield_count,
                     "action_origin": self._action_origin,
                     "zero_action_semantics": "previous_target_hold",
                     "measured_state_hold_request_clipped_count": self._state_hold_request_clipped,
@@ -3537,6 +3719,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "declared_feedback_period_s": self.physics_dt if self._physics_pinch is not None else None},
                     "effort_grasp_feedback": {"enabled": self._effort_grasp is not None,
                         "contact_domain_posture_guard": getattr(self, "_effort_domain_posture_guard", None),
+                        "contact_transition_control": getattr(self, "_effort_contact_transition", None),
+                        "full_lift_protocol": full_lift,
+                        "full_lift_current_state": self._full_lift.metrics() if self._full_lift is not None else None,
                         "controller_composition_version": getattr(self._effort_grasp, "contract", {}).get("version"),
                         "update_calls": self._effort_update_count, "last_feedback_sample": self._effort_last_sample,
                         "declared_feedback_period_s": self.physics_dt if self._effort_grasp is not None else None,

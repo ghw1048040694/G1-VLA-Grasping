@@ -118,6 +118,178 @@ class ProbeSettingsTests(unittest.TestCase):
             probe.validate_probe_settings({"reference_checkpoint_path": "../other.pt"})
 
 
+class FullLiftProbeSettingsTests(unittest.TestCase):
+    @staticmethod
+    def settings(full=False, protocol="full_lift8_v1"):
+        from g1_vla.rl_effort_protocol import (effort_grasp_contract,
+            contact_transition_control_contract, full_lift_protocol_contract,
+            full_lift_effort_grasp_contract)
+        value = copy.deepcopy(probe.RL_PROBE_DEFAULTS)
+        value.update(enabled=True, profile_plan="balanced_effort_v6",
+            backend="g1_control_physics_diagnostics_v6", candidate_path="candidate.json",
+            candidate_sha256="a"*64, candidate_id="unit_candidate", guided_hand_target_rad=[0.]*7,
+            profiles=copy.deepcopy(probe._PLANS["balanced_effort_v6"][1]),
+            effort_grasp_controller=effort_grasp_contract(), episodes_per_env=1, max_control_steps=91,
+            contact_acquisition={"version": "g1_bounded_measured_touch_search_v2",
+                "reference_closing_rate_rad_s": .04, "maximum_extra_closure_rad": .02,
+                "raw_force_stop_n": .02, "start_phase": "final_stage_duration_complete",
+                "original_actual_geometry_tolerance_rad": .025,
+                "requires_no_physical_loaded_point": True, "all_original_acceptance_gates_unchanged": True},
+            contact_domain_posture_guard={"version": "g1_contact_domain_nullspace_posture_guard_v1",
+                "hand_joint_index": 2, "activation_margin_rad": .006,
+                "restoring_stiffness_nm_rad": 2., "maximum_guard_joint_torque_nm": .004,
+                "minimum_nullspace_joint_component": .05, "svd_tolerance_m": .0001,
+                "original_actual_geometry_tolerance_rad": .025,
+                "protect_current_normal_and_world_z": True,
+                "requires_all_groups_physically_loaded": True,
+                "requires_original_contact_safe": True, "all_original_acceptance_gates_unchanged": True},
+            contact_transition_control=contact_transition_control_contract())
+        if full:
+            value["full_lift"] = full_lift_protocol_contract()
+            value["effort_grasp_controller"] = full_lift_effort_grasp_contract(protocol)
+            value.update({key: value["effort_grasp_controller"]["evaluation"][key]
+                          for key in ("episodes_per_env", "max_control_steps")})
+        return value
+
+    def test_optional_declarations_preserve_legacy_default(self):
+        settings = probe.validate_probe_settings({})
+        self.assertIsNone(settings["full_lift"])
+        self.assertIsNone(settings["contact_transition_control"])
+        self.assertEqual(settings["max_control_steps"], 364)
+        old = self.settings(); old.pop("full_lift"); old.pop("contact_transition_control")
+        settings = probe.validate_probe_settings(old)
+        self.assertIsNone(settings["full_lift"])
+        self.assertIsNone(settings["contact_transition_control"])
+        self.assertEqual(settings["max_control_steps"], 91)
+
+    def test_full_lift_quotas_declarations_and_original_probe_are_independent(self):
+        for protocol, repeats, steps in [("full_lift8_v1", 1, 213), ("full_lift32_v1", 4, 852)]:
+            value = self.settings(True, protocol)
+            before = copy.deepcopy(value)
+            result = probe.validate_probe_settings(value)
+            self.assertEqual(result["episodes_per_env"], repeats)
+            self.assertEqual(result["max_control_steps"], steps)
+            self.assertEqual(result["guided_probe_height_m"], .0025)
+            self.assertEqual(result["guided_preload_controls"], 3)
+            self.assertFalse(result["training_allowed"])
+            self.assertEqual(result["optimizer_steps"], 0)
+            result["full_lift"]["hold_duration_s"] = .001
+            self.assertEqual(value, before)
+
+    def test_new_task_cannot_use_local_effort_or_omit_task_declaration(self):
+        for full in (True, False):
+            value = self.settings(full)
+            value["full_lift"] = self.settings(not full)["full_lift"]
+            with self.subTest(full=full), self.assertRaises(ValueError):
+                probe.validate_probe_settings(value)
+
+    def test_transition_and_main_lift_require_original_guard_and_acquisition(self):
+        for full in (False, True):
+            for missing in ("contact_acquisition", "contact_domain_posture_guard"):
+                value = self.settings(full); value[missing] = None
+                with self.subTest(full=full, missing=missing), self.assertRaises(ValueError):
+                    probe.validate_probe_settings(value)
+        value = self.settings(True); value["contact_transition_control"] = None
+        with self.assertRaises(ValueError):
+            probe.validate_probe_settings(value)
+        for key in ("contact_transition_control", "full_lift"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                probe.validate_probe_settings({key: self.settings(True)[key]})
+
+    def test_full_task_cannot_change_original_layouts_force_or_optimizer_budget(self):
+        for key, bad in [("max_control_steps", 91), ("episodes_per_env", 4),
+                         ("num_envs", 32), ("optimizer_steps", 1), ("training_allowed", True),
+                         ("guided_probe_height_m", .1)]:
+            value = self.settings(True); value[key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                probe.validate_probe_settings(value)
+
+        for key in ("full_lift", "contact_transition_control"):
+            value = self.settings(True); value[key]["hidden_force_override"] = True
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                probe.validate_probe_settings(value)
+
+    @contextmanager
+    def native_contract_fixture(self, full=True):
+        """Synthetic native readbacks; no simulator or physical admission."""
+        from g1_vla.rl_protocol import RL_PHYSICS_EFFORT_GRASP
+        settings = probe.validate_probe_settings(self.settings(full))
+        contract = settings["effort_grasp_controller"]
+        required = {"group_force_max_n": 1.5, "max_penetration_m": .003,
+                    "opposition_dot_max": -.6, "max_abs_normal_z": .6,
+                    "support_window_s": .198, "support_clearance_min_m": .002,
+                    "episode_length_s": 6., "lift_height_m": .006,
+                    "probe_clearance_max_m": .006, "contact_offset_m": .001, "rest_offset_m": 0.}
+        original = {"asset_sha256": "b"*64, "seed_state_sha256": "c"*64,
+                    "resolved_settings": required}
+        settings["reference_policy_contract_sha256"] = probe._canonical(original)
+        old = {"policy_contract": original, "policy_contract_sha256": probe._canonical(original)}
+        reset = {"joint_"+str(i): 0. for i in range(43)}
+        candidate = {"asset_sha256": original["asset_sha256"],
+            "oldseed_sha256": original["seed_state_sha256"], "candidate_id": settings["candidate_id"],
+            "geometry_evidence": {"source_detail": {"stage_keyframes": [
+                {"target_rad": [0.]*7}, {"target_rad": [0.]*7}]}},
+            "reset_joint_positions_rad": reset, "closing_axis_hand7": [-1.,-1.,-1.,1.,-1.,1.,1.]}
+        actual_settings = {**required, "contact_offset_m": 0., "rest_offset_m": -1e-6}
+        if full:
+            actual_settings["episode_length_s"] = 14.
+        actual = {"effort_grasp_controller": copy.deepcopy(contract),
+            "contact_generation": copy.deepcopy(contract["contact_generation"]),
+            "explicit_reset_resource_sha256": settings["candidate_sha256"],
+            "resolved_settings": actual_settings,
+            "asset_sha256": original["asset_sha256"], "seed_state_sha256": original["seed_state_sha256"],
+            "full_lift": copy.deepcopy(settings["full_lift"]),
+            "contact_transition_control": copy.deepcopy(settings["contact_transition_control"])}
+        audit = {"policy_contract": actual, "source_tree_sha256": "d"*64,
+            "physics_version": RL_PHYSICS_EFFORT_GRASP,
+            "policy_contract_sha256": probe._canonical(actual),
+            "diagnostic_effort_drive_readback": {"verified": True},
+            "diagnostic_material_readback": {"verified": True},
+            "diagnostic_contact_generation_readback": {"verified": True},
+            "initial_state": {"joint_positions_rad": reset},
+            "fixed_cluster_collision_filter_override": {"current_stage_readback": {
+                "available": True, "num_envs": 8, "excluded_pair_count_per_env": 30,
+                "excluded_pair_count_total": 240, "source_graph_verified_env_count": 8,
+                "global_self_collision_readback": {str(i): {"enabled_self_collisions": True} for i in range(8)}}}}
+        config = {"rl_teacher": {"physics_protocol": RL_PHYSICS_EFFORT_GRASP,
+                                  "contact_offset_m": 0., "rest_offset_m": -1e-6}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"candidate.json"; path.write_text(json.dumps(candidate))
+            with mock.patch.object(probe, "_read_pinned", side_effect=[(path, {}), (path, old)]), \
+                 mock.patch.object(probe, "_path", return_value=path), \
+                 mock.patch.object(probe, "_file_hash", return_value=settings["candidate_sha256"]), \
+                 mock.patch.object(probe, "_reference_source_identity", return_value=settings["reference_source_tree_sha256"]), \
+                 mock.patch.object(probe, "_current_source_identity", return_value="d"*64):
+                yield config, settings, audit
+
+    def test_native_full_readback_admits_only_explicit_duration_change(self):
+        for full in (False, True):
+            with self.subTest(full=full), self.native_contract_fixture(full) as (config, settings, audit):
+                value = probe._verify_effort_probe_reference(config, settings, audit)
+                self.assertTrue(value["ready_for_physical_probe"])
+                self.assertEqual(value["full_lift"], settings["full_lift"])
+                self.assertFalse(value["actor_loaded"])
+                self.assertEqual(value["optimizer_steps"], 0)
+
+    def test_native_full_and_transition_readbacks_cannot_be_missing_or_altered(self):
+        for key in ("full_lift", "contact_transition_control"):
+            with self.subTest(key=key), self.native_contract_fixture() as (config, settings, audit):
+                actual = audit["policy_contract"]; actual.pop(key)
+                audit["policy_contract_sha256"] = probe._canonical(actual)
+                with self.assertRaisesRegex(ValueError, "control/task declaration"):
+                    probe._verify_effort_probe_reference(config, settings, audit)
+
+    def test_native_full_task_cannot_relabel_local_gate_settings(self):
+        for key, bad in [("episode_length_s", 6.), ("lift_height_m", .1),
+                         ("probe_clearance_max_m", .1145), ("group_force_max_n", 2.),
+                         ("support_window_s", .1)]:
+            with self.subTest(key=key), self.native_contract_fixture() as (config, settings, audit):
+                actual = audit["policy_contract"]; actual["resolved_settings"][key] = bad
+                audit["policy_contract_sha256"] = probe._canonical(actual)
+                with self.assertRaisesRegex(ValueError, "original local qualification"):
+                    probe._verify_effort_probe_reference(config, settings, audit)
+
+
 class ProbeReferenceTests(unittest.TestCase):
     def test_preflight_never_grants_physics_and_snapshot_contains_only_three_references(self):
         with fixture() as (config, _, _, _, _):

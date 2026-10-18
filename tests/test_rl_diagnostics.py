@@ -68,6 +68,47 @@ class DiagnosticControlTests(unittest.TestCase):
         self.state["target_action_rad"][:, 7:] = torch.tensor(self.seed)
         self.state["q_action_rad"][:, 7:] = torch.tensor(self.seed)
 
+    def full_lift_guide(self):
+        from g1_vla.rl_diagnostics import EffortGraspGuide
+        from g1_vla.rl_effort_protocol import full_lift_protocol_contract
+        candidate = json.loads((Path(__file__).resolve().parents[1] /
+            "resources/rl_geometry_candidates/opposed_face_effort_pinch_v1.json").read_text())
+        state = copy.deepcopy(self.state)
+        state["q_action_rad"][:,7:] = self.t.tensor(candidate["source_hand_rad"])
+        state["target_action_rad"] = state["q_action_rad"].clone()
+        state["unsafe_latched"] = self.t.zeros(2,dtype=self.t.bool)
+        state["contact_metrics_current_episode"] = self.t.ones(2,dtype=self.t.bool)
+        state["metrics"] = {key:self.t.ones(2,dtype=self.t.bool) for key in
+            ("main_lift_started","main_lift_authorized","support_current")}
+        cfg = {"full_lift":full_lift_protocol_contract(), "guided_preload_controls":3,
+            "guided_probe_speed_m_s":.002,"guided_probe_height_m":.0025}
+        return EffortGraspGuide(self.t,cfg,candidate["source_hand_rad"],state,candidate),state
+
+    def test_full_lift_reference_accelerates_and_stops_on_current_gate_loss(self):
+        guide,state = self.full_lift_guide()
+        guide.probe[:] = .0025
+        _, evidence = guide.actions(self.t.zeros(2,14),state,"guided_hand_pose_hold",.066,1.5)
+        self.assertTrue(self.t.allclose(evidence["main_lift_reference_velocity_m_s"],self.t.full((2,),.00198)))
+        self.assertTrue(self.t.allclose(evidence["probe_offset_m"],self.t.full((2,),.00263068)))
+        for _ in range(200):
+            _,evidence = guide.actions(self.t.zeros(2,14),state,"guided_hand_pose_hold",.066,1.5)
+        self.assertTrue((evidence["main_lift_reference_velocity_m_s"] <= .015).all())
+        self.assertTrue(self.t.allclose(evidence["probe_offset_m"],self.t.full((2,),.105)))
+        before = guide.probe.clone()
+        state["metrics"]["main_lift_authorized"][:] = False
+        action,evidence = guide.actions(self.t.zeros(2,14),state,"guided_hand_pose_hold",.066,1.5)
+        self.assertTrue(self.t.equal(before,guide.probe))
+        self.assertFalse(evidence["main_lift_reference_velocity_m_s"].any())
+        self.assertTrue((action[:,2] <= 0).all())
+
+    def test_full_lift_never_uses_previous_episode_authorization(self):
+        guide,state = self.full_lift_guide()
+        state["contact_metrics_current_episode"][:] = False
+        _,evidence = guide.actions(self.t.zeros(2,14),state,"guided_hand_pose_hold",.066,1.5)
+        self.assertFalse(evidence["main_lift_started"].any())
+        self.assertFalse(evidence["main_lift_advance_permitted"].any())
+        self.assertFalse(guide.probe.any())
+
     def staged_controller(self, plan="geometry_pose_only_v2"):
         from g1_vla.rl_diagnostics import GuidedClosure
         cfg = copy.deepcopy(self.cfg)

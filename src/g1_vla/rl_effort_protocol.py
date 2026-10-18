@@ -25,6 +25,20 @@ ALWAYS_RIGID_BODY_NAMES = (
 )
 _NATIVE_EFFORT_UPPER_NM = (2.45, 1.4, 1.4, 1.4, 1.4, 1.4, 1.4)
 _KINDS = "explicit_hand_effort_and_material_calibration"
+_CONTACT_TRANSITION_CONTROL = {
+    "version": "g1_coordinated_contact_transition_v1",
+    "unload_direction": "current_normal_jacobian_else_declared_axis",
+    "missing_group_reference_velocity_limit_rad_s": .04,
+    "reset_missing_reference_on_first_any_contact": True,
+    "preload_group_force_targets_n": [.2, .1, .1],
+    "full_contact_settle_samples": 25,
+    "full_force_ramp_s": .1,
+    "free_thumb2_activation_margin_rad": .006,
+    "free_thumb2_restoring_stiffness_nm_rad": 2.0,
+    "free_thumb2_maximum_guard_torque_nm": .004,
+    "partial_thumb2_normal_world_z_guard": True,
+    "all_original_acceptance_gates_unchanged": True,
+}
 _CONTACT_DOMAIN_POSTURE_GUARD = {
     "version": "g1_contact_domain_nullspace_posture_guard_v1",
     "hand_joint_index": 2,
@@ -221,6 +235,57 @@ def balanced_effort_controller_contract():
     return deepcopy(_BALANCED_DEFAULTS)
 
 
+FULL_LIFT_EFFORT_GRASP_VERSION = "g1_explicit_effort_grasp_protocol_v5_full_lift"
+_FULL_LIFT_PROTOCOL = {
+    "version": "g1_contact_qualified_full_lift_v1",
+    "target_corner_clearance_m": .1,
+    "palm_total_lift_request_m": .105,
+    "palm_lift_request_max_m": .11,
+    "lift_speed_m_s": .015,
+    "lift_acceleration_m_s2": .03,
+    "palm_position_gain_per_s": 8.0,
+    "hold_duration_s": .5,
+    "hold_consecutive_samples": 251,
+    "actual_height_limit_m": .115,
+    "episode_length_s": 14.0,
+    "physics_dt_s": .002,
+    "local_support_consecutive_samples": 100,
+    "local_support_first_to_last_s": .198,
+    "requires_local_support_before_lift": True,
+    "requires_whole_episode_force_clean_before_lift": True,
+    "requires_whole_episode_original_hand_domain_clean_before_lift": True,
+    "original_hand_domain_tolerance_rad": .025,
+    "fixed_pre_transfer_grip_reference_required": True,
+    "all_other_original_physical_gates_unchanged": True,
+    "training_allowed": False,
+    "optimizer_steps": 0,
+}
+
+
+def full_lift_protocol_contract():
+    """Return the independent 10cm task declaration, never an admission proof.
+
+    The local 2mm/100-sample proof remains mandatory before any main lift.
+    A full task has a separately declared physical deadline and height limit;
+    neither the local protocol nor any training budget changes implicitly.
+    """
+    return deepcopy(_FULL_LIFT_PROTOCOL)
+
+
+def full_lift_effort_grasp_contract(protocol="full_lift8_v1"):
+    """Declare the new physical task while preserving the v4 local factory."""
+    quotas = {"full_lift8_v1": (1, 213), "full_lift32_v1": (4, 852)}
+    if type(protocol) is not str or protocol not in quotas:
+        raise ValueError("Unknown full-lift evaluation protocol")
+    episodes, steps = quotas[protocol]
+    value = effort_grasp_contract()
+    value["version"] = FULL_LIFT_EFFORT_GRASP_VERSION
+    value["acceptance"].update(main_lift_authorized=True, actual_height_limit_m=.115)
+    value["evaluation"].update(protocol=protocol, episodes_per_env=episodes,
+        max_control_steps=steps, nominal_episode_budget_s=14.0)
+    return value
+
+
 def _keys(value, expected, name):
     if type(value) is not dict or set(value) != set(expected):
         raise ValueError(name + " requires exactly the declared fields")
@@ -269,6 +334,26 @@ def validate_contact_domain_posture_guard(value):
     if value is None:
         return None
     _exact(value, _CONTACT_DOMAIN_POSTURE_GUARD, "contact_domain_posture_guard")
+    return deepcopy(value)
+
+
+def validate_full_lift_protocol(value):
+    """Validate the exact new task; ``None`` preserves the local protocol."""
+    if value is None:
+        return None
+    _exact(value, _FULL_LIFT_PROTOCOL, "full_lift")
+    return deepcopy(value)
+
+
+def contact_transition_control_contract():
+    """Coordinated contact acquisition and unloading; not a force guarantee."""
+    return deepcopy(_CONTACT_TRANSITION_CONTROL)
+
+
+def validate_contact_transition_control(value):
+    if value is None:
+        return None
+    _exact(value, _CONTACT_TRANSITION_CONTROL, "contact_transition_control")
     return deepcopy(value)
 
 
@@ -323,8 +408,10 @@ def validate_effort_grasp_contract(value):
     acceptance, friction and drive-disable semantics cannot drift here.
     """
     _keys(value, _DEFAULTS, "effort_grasp")
+    full_lift = value["version"] == FULL_LIFT_EFFORT_GRASP_VERSION
+    expected = full_lift_effort_grasp_contract() if full_lift else _DEFAULTS
     for key in ("version", "kind", "joint_order", "acceptance", "contact_generation"):
-        _exact(value[key], _DEFAULTS[key], "effort_grasp." + key)
+        _exact(value[key], expected[key], "effort_grasp." + key)
 
     actuation = value["actuation"]
     _keys(actuation, _DEFAULTS["actuation"], "actuation")
@@ -367,13 +454,14 @@ def validate_effort_grasp_contract(value):
 
     evaluation = value["evaluation"]
     _keys(evaluation, _DEFAULTS["evaluation"], "evaluation")
-    quota = {"calibration8_v1": (1, 91), "acceptance32_v1": (4, 364)}
+    quota = ({"full_lift8_v1": (1, 213), "full_lift32_v1": (4, 852)} if full_lift else
+             {"calibration8_v1": (1, 91), "acceptance32_v1": (4, 364)})
     name = evaluation["protocol"]
     if type(name) is not str or name not in quota:
         raise ValueError("unknown effort evaluation protocol")
     for key in evaluation:
         if key not in ("protocol", "episodes_per_env", "max_control_steps", "max_wall_time_s"):
-            _exact(evaluation[key], _DEFAULTS["evaluation"][key], "evaluation." + key)
+            _exact(evaluation[key], expected["evaluation"][key], "evaluation." + key)
     episodes, steps = quota[name]
     if type(evaluation["episodes_per_env"]) is not int or evaluation["episodes_per_env"] != episodes:
         raise ValueError("evaluation quota does not match its named protocol")

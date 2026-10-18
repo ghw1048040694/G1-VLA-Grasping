@@ -119,6 +119,8 @@ class EffortGraspGuide:
         self.rotation = state["palm_quaternion_xyzw"].clone()
         self.ready_count = torch.zeros_like(self.ids)
         self.probe = torch.zeros_like(q[:, 0])
+        self.full_lift = settings.get("full_lift")
+        self.main_lift_velocity = torch.zeros_like(self.probe)
         self.precontact_count = torch.zeros_like(self.ids)
         self.low = torch.minimum(self.seed, self.goals.amin(0)[None])
         self.high = torch.maximum(self.seed, self.goals.amax(0)[None])
@@ -142,6 +144,7 @@ class EffortGraspGuide:
         self.rotation[changed] = state["palm_quaternion_xyzw"][changed]
         self.ready_count[changed] = 0
         self.probe[changed] = 0
+        self.main_lift_velocity[changed] = 0
         self.precontact_count[changed] = 0
         self.search_offset[changed] = 0
         delta = self.palm-state["palm_position_world_m"]
@@ -217,12 +220,34 @@ class EffortGraspGuide:
         ready = state["preload_contact_ready"] & complete
         self.ready_count = t.where(ready, self.ready_count+1, t.zeros_like(self.ready_count))
         permit = self.ready_count >= self.settings["guided_preload_controls"]
-        self.probe = t.where(permit, (self.probe+self.settings["guided_probe_speed_m_s"]*dt).clamp(
-            max=self.settings["guided_probe_height_m"]), self.probe)
+        main_started = t.zeros_like(permit)
+        main_permitted = t.zeros_like(permit)
+        if self.full_lift is not None:
+            current_episode = state.get("contact_metrics_current_episode", t.zeros_like(permit))
+            main_started = metrics.get("main_lift_started", t.zeros_like(permit)) & current_episode
+            main_permitted = (metrics.get("main_lift_authorized", t.zeros_like(permit)) &
+                metrics.get("support_current", t.zeros_like(permit)) &
+                current_episode & ~state["unsafe_latched"] & ~overforce)
+        self.probe = t.where(permit & ~main_started,
+            (self.probe+self.settings["guided_probe_speed_m_s"]*dt).clamp(
+                max=self.settings["guided_probe_height_m"]), self.probe)
+        if self.full_lift is not None:
+            self.main_lift_velocity = t.where(main_permitted,
+                (self.main_lift_velocity+self.full_lift["lift_acceleration_m_s2"]*dt).clamp(
+                    max=self.full_lift["lift_speed_m_s"]), t.zeros_like(self.main_lift_velocity))
+            self.probe = t.where(main_permitted,
+                (self.probe+self.main_lift_velocity*dt).clamp(max=self.full_lift["palm_total_lift_request_m"]),
+                self.probe)
         palm_goal = self.palm.clone()
         palm_goal[:, 2] += self.probe
-        linear = _bounded_vector(t, (palm_goal-state["palm_position_world_m"])*POSE_SERVO["position_gain_per_s"], .01)
-        linear[:, 2] = t.where((~permit) & (self.probe > 0), linear[:, 2].clamp(max=0), linear[:, 2])
+        gain, maximum_linear = POSE_SERVO["position_gain_per_s"], .01
+        if self.full_lift is not None:
+            gain = t.where(main_started, t.full_like(self.probe, self.full_lift["palm_position_gain_per_s"]),
+                           t.full_like(self.probe, gain))[:, None]
+            maximum_linear = self.full_lift["lift_speed_m_s"]
+        linear = _bounded_vector(t, (palm_goal-state["palm_position_world_m"])*gain, maximum_linear)
+        may_advance = t.where(main_started, main_permitted, permit)
+        linear[:, 2] = t.where((~may_advance) & (self.probe > 0), linear[:, 2].clamp(max=0), linear[:, 2])
         angular = _bounded_vector(t, angle*POSE_SERVO["orientation_gain_per_s"], .1)
         jac = state["palm_point_jacobian_w"]
         regular = t.eye(6, dtype=jac.dtype, device=jac.device)[None]*POSE_SERVO["dls_regularizer"]**2
@@ -250,6 +275,9 @@ class EffortGraspGuide:
             "closure_path_complete": complete, "preload_contact_ready": ready,
             "preload_control_boundary_count": self.ready_count, "probe_advance_permitted": permit,
             "probe_offset_m": self.probe, "palm_pose_reference_world_m": palm_goal,
+            "full_lift_declaration": self.full_lift, "main_lift_started": main_started,
+            "main_lift_advance_permitted": main_permitted,
+            "main_lift_reference_velocity_m_s": self.main_lift_velocity,
             "palm_rotation_reference_xyzw": self.rotation, "hand_position_target_not_applied": True,
             "physical_contact_equilibrium_not_support": True}
 
@@ -484,10 +512,13 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
         native.configure_physics_pinch(settings["compliant_pinch_controller"])
     if effort_mode:
         guard = settings.get("contact_domain_posture_guard")
-        if guard is None:
-            native.configure_effort_grasp(settings["effort_grasp_controller"])
-        else:
-            native.configure_effort_grasp(settings["effort_grasp_controller"], domain_posture_guard=guard)
+        options = {}
+        if guard is not None:
+            options["domain_posture_guard"] = guard
+        transition = settings.get("contact_transition_control")
+        if transition is not None:
+            options["contact_transition"] = transition
+        native.configure_effort_grasp(settings["effort_grasp_controller"], **options)
     quota = EvaluationQuota(settings["num_envs"], settings["num_envs"] * settings["episodes_per_env"])
     steps = 0
     environment._g1_last_step_audit = _json_safe(native.step_audit())

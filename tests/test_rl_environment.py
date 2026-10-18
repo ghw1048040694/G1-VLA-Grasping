@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from g1_vla.rl_environment import (
     ACTION_JOINT_NAMES,
+    ContactQualifiedFullLift,
     DEFAULT_SETTINGS,
     FIXED_PALM_FILTER_ASSET_SHA256,
     author_fixed_palm_adjacency_filters,
@@ -353,6 +354,27 @@ class ControllerDiagnosticTensorTest(unittest.TestCase):
         self.assertEqual(fake._shield_count, 1)
         self.assertFalse(fake._unsafe.any())
 
+    def test_full_lift_palm_guard_uses_declared_height_only_after_admission(self):
+        t = self.torch
+        jac = t.zeros(1, 1, 6, 43); jac[0, 0, 2, 0] = 1
+        data = SimpleNamespace(joint_pos=t.zeros(1, 43), body_quat_w=t.tensor([[[0.,0,0,1],[0.,0,0,1]]]),
+            body_pos_w=t.zeros(1, 2, 3), body_link_jacobian_w=jac)
+        base = dict(num_envs=1, _control_probe_enabled=False, _physics_pinch=None, _effort_grasp=None,
+            _previous_actions=t.zeros(1,14), _actions=t.zeros(1,14), _next_action_origin="guide",
+            _targets=t.zeros(1,43), _action_ids=list(range(14)), _velocity=t.full((14,),.5), step_dt=.066,
+            _limits=t.tensor([[[-1.,1.]]*43]), _unsafe=t.zeros(1,dtype=t.bool),
+            robot=SimpleNamespace(data=data,num_bodies=2), _palm_id=1, _palm_local=t.zeros(1,3),
+            _start_palm_z=t.full((1,),float("nan")), _shield_count=0)
+        function = self.method("_pre_physics_step", quat_apply=lambda q, offset: offset,
+            config={"rl_teacher":{"action_scale_rad":.08},"control":{"max_anchor_delta_rad":.08}},
+            settings={"probe_clearance_max_m":.006}, full_lift={"palm_lift_request_max_m":.11})
+        for admitted, expected in ((False,.006),(True,.033)):
+            fake = SimpleNamespace(**copy.deepcopy(base))
+            fake._full_lift = SimpleNamespace(main_lift_authorized=t.tensor([admitted]))
+            function(fake,t.ones(1,14))
+            self.assertAlmostEqual(fake._targets[0,0].item(),expected,places=6)
+
+
     def test_terminal_transition_keeps_actual_pre_reset_state_and_records_once(self):
         t = self.torch
         profile = {"name": "guided", "action_source": "guidance", "control_guard_version": "box_halfspace_projected_v2"}
@@ -423,6 +445,84 @@ class ControllerDiagnosticTensorTest(unittest.TestCase):
                                _control_transition_snapshot={"command_id": 1})
         with self.assertRaises(RLEnvironmentError):
             self.method("configure_control_probe")(fake, {"name": "next"})
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "CPU Torch is required")
+class ContactQualifiedFullLiftTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        from g1_vla.rl_effort_protocol import full_lift_protocol_contract
+        self.t = torch
+        self.state = ContactQualifiedFullLift(torch,2,"cpu",full_lift_protocol_contract())
+        self.inputs = dict(measurement_valid=torch.ones(2,dtype=torch.bool),
+            group_force_n=torch.tensor([[.8,.4,.4]]*2), original_hand_domain=torch.ones(2,dtype=torch.bool),
+            local_support_qualified=torch.zeros(2,dtype=torch.bool), support_current=torch.ones(2,dtype=torch.bool),
+            clearance_m=torch.full((2,),.0023), object_lift_m=torch.full((2,),.0023),
+            unsafe=torch.zeros(2,dtype=torch.bool))
+
+    def test_local_milestone_does_not_complete_full_task_and_hold_is_251_samples(self):
+        for _ in range(99):
+            self.state.update(**self.inputs)
+        self.assertFalse(self.state.main_lift_started.any())
+        self.inputs["local_support_qualified"][:] = True
+        self.state.update(**self.inputs)
+        self.assertTrue(self.state.main_lift_authorized.all())
+        self.assertFalse(self.state.full_success.any())
+        self.inputs["clearance_m"][:] = .1
+        self.inputs["object_lift_m"][:] = .1
+        for _ in range(250):
+            self.state.update(**self.inputs)
+        self.assertFalse(self.state.full_success.any())
+        self.state.update(**self.inputs)
+        self.assertTrue(self.state.full_success.all())
+        self.assertEqual(self.state.hold_samples.tolist(),[251,251])
+
+    def test_earlier_force_or_original_domain_failure_prevents_later_admission(self):
+        self.inputs["group_force_n"][0,1] = 1.5001
+        self.inputs["original_hand_domain"][1] = False
+        self.state.update(**self.inputs)
+        self.inputs["group_force_n"][:] = .4
+        self.inputs["original_hand_domain"][:] = True
+        self.inputs["local_support_qualified"][:] = True
+        for _ in range(300):
+            self.state.update(**self.inputs)
+        self.assertTrue(self.state.local_support_qualified.all())
+        self.assertFalse(self.state.main_lift_started.any())
+        self.state.reset(self.t.tensor([0]))
+        self.state.update(**self.inputs)
+        self.assertEqual(self.state.main_lift_started.tolist(),[True,False])
+
+    def test_corner_clearance_alone_cannot_replace_original_10cm_object_rise(self):
+        self.inputs["local_support_qualified"][:] = True
+        self.state.update(**self.inputs)
+        self.inputs["clearance_m"][:] = .1
+        self.inputs["object_lift_m"][:] = .09999
+        for _ in range(251):
+            self.state.update(**self.inputs)
+        self.assertTrue(self.state.main_lift_authorized.all())
+        self.assertFalse(self.state.full_success.any())
+        self.assertEqual(self.state.hold_samples.tolist(),[0,0])
+        self.inputs["object_lift_m"][:] = .1
+        for _ in range(251):
+            self.state.update(**self.inputs)
+        self.assertTrue(self.state.full_success.all())
+
+    def test_main_support_loss_is_sticky_failure_and_cannot_resume_upward(self):
+        self.inputs["local_support_qualified"][:] = True
+        self.state.update(**self.inputs)
+        self.inputs["support_current"][0] = False
+        self.inputs["clearance_m"][1] = .116
+        self.state.update(**self.inputs)
+        self.assertTrue(self.state.failed.all())
+        self.assertFalse(self.state.main_lift_authorized.any())
+        self.inputs["support_current"][:] = True
+        self.inputs["clearance_m"][:] = .1
+        self.inputs["object_lift_m"][:] = .1
+        for _ in range(300):
+            self.state.update(**self.inputs)
+        self.assertFalse(self.state.full_success.any())
+        self.assertEqual(self.state.maximum_hold_samples.tolist(),[0,0])
+
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "Torch-free host; run sparse contact tests in the native runtime")

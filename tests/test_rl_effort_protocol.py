@@ -9,6 +9,9 @@ from g1_vla.rl_effort_protocol import (
     balanced_effort_controller_contract, effort_grasp_contract,
     validate_balanced_effort_controller_contract, validate_effort_grasp_contract,
     validate_contact_domain_posture_guard,
+    full_lift_protocol_contract, validate_full_lift_protocol,
+    full_lift_effort_grasp_contract, FULL_LIFT_EFFORT_GRASP_VERSION,
+    contact_transition_control_contract, validate_contact_transition_control,
     ALWAYS_RIGID_BODY_NAMES, FINGER_BODY_NAMES,
 )
 
@@ -23,11 +26,21 @@ class EffortGraspProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_effort_grasp_contract(candidate)
 
-    def test_touch_acquisition_requires_exact_versioned_declaration(self):
+    @staticmethod
+    def local_probe_settings():
+        """Exercise the preserved local ABI independently of the active task."""
         from pathlib import Path
-        from g1_vla.rl_probe_protocol import validate_probe_settings
         config = json.loads((Path(__file__).resolve().parents[1]/"configs/experiment.json").read_text())
         value = config["rl_diagnostics"]
+        contract = effort_grasp_contract()
+        contract["evaluation"].update(protocol="acceptance32_v1", episodes_per_env=4, max_control_steps=364)
+        value.update(full_lift=None, contact_transition_control=None,
+            effort_grasp_controller=contract, num_envs=8, episodes_per_env=4, max_control_steps=364)
+        return value
+
+    def test_touch_acquisition_requires_exact_versioned_declaration(self):
+        from g1_vla.rl_probe_protocol import validate_probe_settings
+        value = self.local_probe_settings()
         declaration = value["contact_acquisition"]
         self.assertEqual(validate_probe_settings(value)["contact_acquisition"], declaration)
         previous = deepcopy(value)
@@ -48,10 +61,8 @@ class EffortGraspProtocolTests(unittest.TestCase):
                 validate_probe_settings(changed)
 
     def test_touch_acquisition_v1_and_v2_require_matched_exact_rates(self):
-        from pathlib import Path
         from g1_vla.rl_probe_protocol import validate_probe_settings
-        config = json.loads((Path(__file__).resolve().parents[1]/"configs/experiment.json").read_text())
-        original = config["rl_diagnostics"]
+        original = self.local_probe_settings()
         for version, rate in [("g1_bounded_measured_touch_search_v1", .02),
                               ("g1_bounded_measured_touch_search_v2", .04)]:
             value = deepcopy(original)
@@ -139,10 +150,8 @@ class EffortGraspProtocolTests(unittest.TestCase):
                 validate_contact_domain_posture_guard(value)
 
     def test_domain_guard_probe_requires_balanced_effort_and_contact_acquisition(self):
-        from pathlib import Path
         from g1_vla.rl_probe_protocol import validate_probe_settings
-        config = json.loads((Path(__file__).resolve().parents[1]/"configs/experiment.json").read_text())
-        value = config["rl_diagnostics"]
+        value = self.local_probe_settings()
         value["contact_domain_posture_guard"] = self.domain_guard()
         self.assertEqual(validate_probe_settings(value)["contact_domain_posture_guard"], self.domain_guard())
         for acquisition in (None,):
@@ -382,6 +391,105 @@ class EffortGraspProtocolTests(unittest.TestCase):
         value["actuation"]["total_torque_caps_nm"][0] = 0.05
         with self.assertRaises(ValueError):
             validate_effort_grasp_contract(value)
+
+
+class FullLiftProtocolTests(unittest.TestCase):
+    def test_local_factory_stays_six_seconds_and_cannot_authorize_a_main_lift(self):
+        local = effort_grasp_contract()
+        self.assertEqual(local["version"], "g1_explicit_effort_grasp_protocol_v4_object_support")
+        self.assertEqual(local["evaluation"]["nominal_episode_budget_s"], 6.)
+        self.assertEqual(local["evaluation"]["max_control_steps"], 91)
+        self.assertFalse(local["acceptance"]["main_lift_authorized"])
+        self.assertEqual(local["acceptance"]["actual_height_limit_m"], .0065)
+        self.assertIsNone(validate_full_lift_protocol(None))
+        self.assertIsNone(validate_contact_transition_control(None))
+
+    def test_full_task_has_real_10cm_clearance_and_half_second_sample_span(self):
+        value = full_lift_protocol_contract()
+        self.assertEqual(value["version"], "g1_contact_qualified_full_lift_v1")
+        self.assertEqual(value["target_corner_clearance_m"], .1)
+        self.assertEqual(value["palm_total_lift_request_m"], .105)
+        self.assertEqual(value["palm_lift_request_max_m"], .11)
+        self.assertEqual(value["lift_speed_m_s"], .015)
+        self.assertEqual(value["lift_acceleration_m_s2"], .03)
+        self.assertEqual(value["palm_position_gain_per_s"], 8.)
+        self.assertEqual(value["actual_height_limit_m"], .115)
+        self.assertEqual(value["episode_length_s"], 14.)
+        self.assertEqual((value["hold_consecutive_samples"]-1)*value["physics_dt_s"], .5)
+        self.assertEqual((value["local_support_consecutive_samples"]-1)*value["physics_dt_s"], .198)
+        self.assertEqual(validate_full_lift_protocol(json.loads(json.dumps(value))), value)
+        copy = full_lift_protocol_contract(); copy["target_corner_clearance_m"] = .001
+        self.assertEqual(value, full_lift_protocol_contract())
+
+    def test_full_declaration_is_exact_typed_and_has_no_optional_gate_bypass(self):
+        original = full_lift_protocol_contract()
+        for key, wanted in original.items():
+            changed = deepcopy(original); changed.pop(key)
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                validate_full_lift_protocol(changed)
+            bads = ([1, False, "true"] if type(wanted) is bool and wanted else
+                    [0, True, "false"] if type(wanted) is bool else
+                    [True, math.nan, math.inf, str(wanted), wanted+1] if type(wanted) in (int, float) else
+                    ["unversioned", None])
+            for bad in bads:
+                changed = deepcopy(original); changed[key] = bad
+                with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                    validate_full_lift_protocol(changed)
+        for bad in [False, [], "full", {**original, "skip_local_proof": True}]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate_full_lift_protocol(bad)
+
+    def test_full_effort_preserves_all_physical_gates_except_declared_task_height(self):
+        local = effort_grasp_contract()
+        for name, repeats, steps in [("full_lift8_v1", 1, 213), ("full_lift32_v1", 4, 852)]:
+            value = full_lift_effort_grasp_contract(name)
+            self.assertEqual(validate_effort_grasp_contract(value), value)
+            self.assertEqual(value["version"], FULL_LIFT_EFFORT_GRASP_VERSION)
+            self.assertEqual(value["evaluation"]["episodes_per_env"], repeats)
+            self.assertEqual(value["evaluation"]["max_control_steps"], steps)
+            self.assertEqual(steps, math.ceil(14/.066)*repeats)
+            self.assertFalse(value["evaluation"]["training_allowed"])
+            self.assertEqual(value["evaluation"]["optimizer_steps"], 0)
+            expected = deepcopy(local)
+            expected["version"] = value["version"]
+            expected["acceptance"].update(main_lift_authorized=True, actual_height_limit_m=.115)
+            expected["evaluation"].update(protocol=name, nominal_episode_budget_s=14.,
+                episodes_per_env=repeats, max_control_steps=steps)
+            self.assertEqual(value, expected)
+
+    def test_task_version_deadline_height_and_quotas_cannot_be_mixed(self):
+        full = full_lift_effort_grasp_contract()
+        for group, key, bad in [(None, "version", effort_grasp_contract()["version"]),
+            ("evaluation", "protocol", "calibration8_v1"),
+            ("evaluation", "nominal_episode_budget_s", 6.),
+            ("evaluation", "episodes_per_env", 4),
+            ("evaluation", "max_control_steps", 91),
+            ("evaluation", "max_control_steps", 213.),
+            ("evaluation", "randomization_expanded", True),
+            ("evaluation", "training_allowed", True),
+            ("evaluation", "original20_acceptance", True),
+            ("acceptance", "actual_height_limit_m", .0065),
+            ("acceptance", "main_lift_authorized", False),
+            ("acceptance", "group_force_max_n", 2.),
+            ("acceptance", "support_consecutive_samples", 1)]:
+            value = deepcopy(full)
+            (value if group is None else value[group])[key] = bad
+            with self.subTest(group=group, key=key), self.assertRaises(ValueError):
+                validate_effort_grasp_contract(value)
+        for bad in ["acceptance32_v1", "full", None, True]:
+            with self.subTest(protocol=bad), self.assertRaises(ValueError):
+                full_lift_effort_grasp_contract(bad)
+
+    def test_transition_contract_cannot_silently_drop_fields_or_enable_training(self):
+        original = contact_transition_control_contract()
+        self.assertEqual(validate_contact_transition_control(original), original)
+        for key in original:
+            value = deepcopy(original); value.pop(key)
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_contact_transition_control(value)
+        value = deepcopy(original); value["training_allowed"] = True
+        with self.assertRaises(ValueError):
+            validate_contact_transition_control(value)
 
 
 if __name__ == "__main__":

@@ -116,6 +116,8 @@ RL_PROBE_DEFAULTS = {
     "collision_geometry_audit": None,
     "contact_acquisition": None,
     "contact_domain_posture_guard": None,
+    "contact_transition_control": None,
+    "full_lift": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -240,6 +242,24 @@ def validate_probe_settings(value):
             raise ValueError("Contact-domain posture guard requires balanced_effort_v6 and explicit contact acquisition")
         from .rl_effort_protocol import validate_contact_domain_posture_guard
         result["contact_domain_posture_guard"] = validate_contact_domain_posture_guard(guard)
+    transition = result["contact_transition_control"]
+    if transition is not None:
+        if plan != "balanced_effort_v6" or guard is None:
+            raise ValueError("Contact transition requires balanced_effort_v6 and the original-domain posture guard")
+        from .rl_effort_protocol import validate_contact_transition_control
+        result["contact_transition_control"] = validate_contact_transition_control(transition)
+    full_lift = result["full_lift"]
+    if full_lift is not None:
+        if plan != "balanced_effort_v6" or transition is None or guard is None:
+            raise ValueError("Full lift requires balanced effort with contact transition and original-domain posture guard")
+        from .rl_effort_protocol import validate_full_lift_protocol, FULL_LIFT_EFFORT_GRASP_VERSION
+        result["full_lift"] = validate_full_lift_protocol(full_lift)
+        if effort["version"] != FULL_LIFT_EFFORT_GRASP_VERSION:
+            raise ValueError("Full lift requires its separately versioned effort/evaluation contract")
+    elif effort is not None:
+        from .rl_effort_protocol import FULL_LIFT_EFFORT_GRASP_VERSION
+        if effort["version"] == FULL_LIFT_EFFORT_GRASP_VERSION:
+            raise ValueError("Full-lift effort/evaluation requires the explicit full_lift declaration")
     geometry = result["collision_geometry_audit"]
     if geometry is not None:
         expected = {"enabled": True, "env_ids": [0], "body_names": [
@@ -672,6 +692,9 @@ def _verify_effort_probe_reference(config, settings, current_audit):
                 actual.get("contact_generation") != contract["contact_generation"] or
                 current_audit.get("policy_contract_sha256") != _canonical(actual)):
             raise ValueError("Native effort/material/source readback differs from the explicit new model")
+        for key in ("contact_transition_control", "full_lift"):
+            if actual.get(key) != settings.get(key):
+                raise ValueError("Native control/task declaration differs from the selected " + key)
         filters = current_audit.get("fixed_cluster_collision_filter_override", {}).get("current_stage_readback", {})
         n = contract["evaluation"]["num_envs"]
         self_collisions = filters.get("global_self_collision_readback", {})
@@ -691,8 +714,10 @@ def _verify_effort_probe_reference(config, settings, current_audit):
         expected_settings = dict(original["resolved_settings"])
         expected_settings.update(contact_offset_m=contract["contact_generation"]["contact_offset_m"],
                                  rest_offset_m=contract["contact_generation"]["rest_offset_m"])
+        if settings["full_lift"] is not None:
+            expected_settings["episode_length_s"] = settings["full_lift"]["episode_length_s"]
         if actual.get("resolved_settings") != expected_settings:
-            raise ValueError("Only the explicitly versioned contact/rest offsets may differ; original qualification settings must stay fixed")
+            raise ValueError("Only versioned contact/rest offsets and declared full-task duration may differ; original local qualification settings must stay fixed")
         for key in ("asset_sha256", "asset_manifest_sha256", "seed_state_sha256", "physics_dt_s",
                     "control_period_s", "validation_offsets_m", "joint_limit_tolerance_rad", "support_gate_version"):
             if actual.get(key) != original.get(key):
@@ -711,6 +736,8 @@ def _verify_effort_probe_reference(config, settings, current_audit):
         "declared_profile_names": [p["name"] for p in settings["profiles"]],
         "four_way_comparison_complete": False, "four_way_comparison_declared": False,
         "diagnostic_controller_protocol": contract, "diagnostic_controller_protocol_sha256": _canonical(contract),
+        "contact_transition_control": copy.deepcopy(settings["contact_transition_control"]),
+        "full_lift": copy.deepcopy(settings["full_lift"]),
         "current_source_tree_sha256": _current_source_identity(),
         "candidate_reference": {"candidate_id": settings["candidate_id"],
             "candidate_sha256": settings["candidate_sha256"], "physical_qualification": False},

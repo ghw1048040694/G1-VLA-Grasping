@@ -1379,5 +1379,345 @@ class ContactDomainPostureGuardTests(unittest.TestCase):
             BalancedEffortGraspController(self.t, self.seed, self.ids, domain_posture_guard=invalid)
 
 
+@unittest.skipUnless(TORCH, "real torch is required for coordinated native-contact control math")
+class ContactTransitionControlTests(unittest.TestCase):
+    step = BalancedEffortGraspTests.step
+
+    def setUp(self):
+        BalancedEffortGraspTests.setUp(self)
+        from g1_vla.rl_effort_protocol import contact_transition_control_contract
+        self.declaration = contact_transition_control_contract()
+        self.kw["physical_contact_safe"] = self.t.ones(2, dtype=self.t.bool)
+        self.kw["actual_domain_lower_hand_rad"] = self.t.full((2, 7), -.2)
+        self.kw["actual_domain_upper_hand_rad"] = self.t.full((2, 7), .2)
+        self.kw["contact_point_jacobian_world_m"] = self.t.zeros(2, 3, 3, 7)
+        self.reset_controller()
+
+    def reset_controller(self, *, guard=None):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        self.controller = BalancedEffortGraspController(self.t, self.seed, self.ids,
+            domain_posture_guard=guard, contact_transition=self.declaration)
+        self.sample = 0
+        self.step()
+
+    def test_stage20_current_index_unload_retains_both_negative_axes(self):
+        # Exact Stage20 failure geometry: both J entries are positive, but the
+        # candidate's index1 closing axis is negative. The old guard erased it.
+        axis = self.t.tensor([-1., -1., -1., 1., -1., 1., 1.])
+        self.kw["closing_axis_hand7"] = axis
+        self.kw["inward_normal_jacobian"][:, 1, 3:5] = self.t.tensor([.060865, .01621])
+        self.kw["raw_group_force_n"][:, 1] = 2.096934557
+        self.kw["gravity_hand_nm"][:] = .03
+        self.kw["measured_hand_velocity_rad_s"][:] = .2
+        self.kw["nominal_hand_rad"][:] = .5
+        self.kw["object_support_torque_nm"] = self.t.full((2, 7), .02)
+        old = self.controller.__class__(self.t, self.seed, self.ids)
+        old.update(sample_id=0, **self.kw)
+        old_effort, _, _ = old.update(sample_id=1, **self.kw)
+        effort, evidence, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        transition = evidence["contact_transition"]
+        alpha = evidence["non_gravity_common_scale"]
+        expected = -.4*self.kw["inward_normal_jacobian"][:, 1, 3:5]*alpha[:, None]
+        self.assertTrue(self.t.allclose(effort[:, 3:5], expected, atol=1e-8, rtol=0))
+        self.assertEqual(float(old_effort[0, 4]), 0.)
+        self.assertLess(float(effort[0, 4]), 0.)
+        self.assertTrue(transition["fixed_closing_axis_mask_bypassed_by_current_normal_joint"][:, 4].all())
+        for key in ("gravity_command_nm", "posture_torque_after_normal_projection_nm",
+                    "object_support_torque_after_safety_mask_nm"):
+            self.assertTrue(self.t.equal(evidence[key][:, 3:5], self.t.zeros(2, 2)), key)
+
+    def test_mixed_current_jacobian_signs_never_command_inward_overforce_component(self):
+        generator = self.t.Generator().manual_seed(739)
+        self.kw["raw_group_force_n"][:] = 2.
+        self.kw["closing_axis_hand7"] = self.t.tensor([-1., -1., -1., 1., -1., 1., 1.])
+        self.kw["object_support_torque_nm"] = self.t.full((2, 7), .03)
+        self.kw["gravity_hand_nm"][:] = -.03
+        for _ in range(25):
+            a = self.t.zeros(2, 3, 7)
+            a[:, 0, :3] = self.t.randn(2, 3, generator=generator)*.15
+            a[:, 1, 3:5] = self.t.randn(2, 2, generator=generator)*.15
+            a[:, 2, 5:] = self.t.randn(2, 2, generator=generator)*.15
+            self.kw["inward_normal_jacobian"] = a
+            effort, evidence, unsafe = self.step()
+            self.assertFalse(unsafe.any())
+            alpha = evidence["non_gravity_common_scale"]
+            self.assertTrue(self.t.allclose(effort, alpha[:, None]*(-.4*a.sum(1)), atol=1e-8, rtol=0))
+            pairing = a*effort[:, None, :]
+            self.assertTrue((pairing <= 0).all())
+            self.assertTrue((pairing.sum(-1) < 0).all())
+            self.assertTrue(evidence["force_relief_by_group"].all())
+            self.assertTrue((effort.abs() <= self.t.tensor(self.parameters["joint_torque_limits_nm"])+1e-8).all())
+
+    def test_missing_and_degenerate_current_normal_keep_original_axis_fallback(self):
+        self.kw["closing_axis_hand7"] = self.t.tensor([-1., -1., -1., 1., -1., 1., 1.])
+        self.kw["raw_group_force_n"][:] = 2.
+        self.step()  # A formerly known row must not leak into missing-current control.
+        self.kw["group_contact_valid"][:] = False
+        self.kw["inward_normal_jacobian"] *= -1
+        effort, evidence, _ = self.step()
+        expected = (-.02*self.kw["closing_axis_hand7"])[None].expand_as(effort)
+        self.assertTrue(self.t.equal(effort, expected))
+        self.assertFalse(evidence["contact_transition"]["current_normal_unload_by_group"].any())
+        self.assertTrue(evidence["contact_transition"]["missing_current_normal_axis_fallback_by_group"].all())
+        self.kw["group_contact_valid"][:] = True
+        self.kw["inward_normal_jacobian"] *= 0
+        degenerate, evidence, _ = self.step()
+        self.assertTrue(self.t.equal(degenerate, expected))
+        self.assertTrue(evidence["current_normal_degenerate_by_group"].all())
+
+    def test_first_partial_contact_discards_missing_finger_error_and_caps_native_reference(self):
+        self.kw["group_contact_valid"][:] = False
+        self.kw["group_physical_loaded"][:] = False
+        self.kw["raw_group_force_n"][:] = 0
+        self.kw["nominal_hand_rad"][:] = .5
+        self.kw["nominal_velocity_limit_hand_rad_s"][:] = 2.
+        for _ in range(10):
+            _, evidence, _ = self.step()
+        self.assertGreater(float(evidence["reference_hand_rad"][0, 3]), .03)
+        self.kw["group_contact_valid"][:, 0] = True
+        self.kw["group_physical_loaded"][:, 0] = True
+        self.kw["raw_group_force_n"][:, 0] = .2
+        self.kw["measured_hand_rad"][:, 3:] = .01
+        _, evidence, _ = self.step()
+        transition = evidence["contact_transition"]
+        self.assertTrue(transition["first_any_contact_resets_missing_reference"].all())
+        self.assertTrue(transition["reference_reset_to_current_measured_joint"][:, 3:].all())
+        self.assertTrue(self.t.allclose(evidence["reference_hand_rad"][:, 3:], self.t.full((2, 4), .01008), atol=1e-8, rtol=0))
+        for _ in range(15):
+            previous = evidence["reference_hand_rad"].clone()
+            _, evidence, _ = self.step()
+            delta = (evidence["reference_hand_rad"]-previous).abs()
+            self.assertTrue((delta[:, 3:] <= .04*.002+1e-8).all())
+        self.assertTrue((evidence["position_spring_after_contact_mode_mask_nm"][:, :3] == 0).all())
+
+    def test_preload_waits_25_complete_native_samples_then_ramps_100ms(self):
+        preload = self.t.tensor([.2, .1, .1])[None].expand(2, -1)
+        full = self.t.tensor([.8, .4, .4])[None].expand(2, -1)
+        self.kw["raw_group_force_n"][:] = preload
+        for count in range(1, 26):
+            _, evidence, _ = self.step()
+            transition = evidence["contact_transition"]
+            self.assertTrue((transition["full_contact_settle_count"] == count).all())
+            self.assertTrue(self.t.equal(evidence["group_force_target_n"], preload))
+        for ramp_step in range(1, 51):
+            _, evidence, _ = self.step()
+            expected = preload+(ramp_step/50)*(full-preload)
+            self.assertTrue(self.t.allclose(evidence["group_force_target_n"], expected, atol=3e-7, rtol=0))
+        self.assertTrue(self.t.allclose(evidence["group_force_target_n"], full, atol=3e-7, rtol=0))
+
+    def test_partial_contact_reset_outside_reference_box_returns_by_native_slew_not_projection(self):
+        # Both index joints are within the original actual domain but outside
+        # the narrower reference box. A single-sample clamp would jump 10mrad.
+        self.kw["geometry_lower_hand_rad"][:] = -.2
+        self.kw["geometry_upper_hand_rad"][:] = .2
+        self.kw["actual_domain_lower_hand_rad"][:] = -.225
+        self.kw["actual_domain_upper_hand_rad"][:] = .225
+        self.kw["group_contact_valid"][:, 1:] = False
+        self.kw["group_physical_loaded"][:, 1:] = False
+        self.kw["raw_group_force_n"][:] = self.t.tensor([.2, 0., 0.])
+        self.kw["measured_hand_rad"][:, 3:5] = self.t.tensor([.21, -.21])
+        self.kw["nominal_hand_rad"][:, 3:5] = self.t.tensor([-.5, .5])
+        _, evidence, unsafe = self.step()
+        self.assertFalse(unsafe.any())
+        transition = evidence["contact_transition"]
+        self.assertTrue(transition["first_any_contact_resets_missing_reference"].all())
+        self.assertTrue(self.t.equal(transition["reference_integration_origin_hand_rad"][:, 3:5],
+                                     self.kw["measured_hand_rad"][:, 3:5]))
+        self.assertTrue(self.t.allclose(evidence["reference_hand_rad"][:, 3:5],
+            self.t.tensor([[.20992, -.20992]]*2), atol=2e-8, rtol=0))
+        self.assertTrue((transition["reference_integration_delta_hand_rad"][:, 3:5].abs() <= .00008002).all())
+        self.assertTrue(transition["reference_box_excursion_did_not_increase_joint"].all())
+        self.assertGreater(float(transition["temporary_reference_box_upper_excursion_rad"][0, 3]), .009)
+        self.assertGreater(float(transition["temporary_reference_box_lower_excursion_rad"][0, 4]), .009)
+        previous = evidence["reference_hand_rad"].clone()
+        _, evidence, _ = self.step()
+        self.assertTrue(((evidence["reference_hand_rad"]-previous)[:, 3:5].abs() <= .00008002).all())
+        self.assertTrue(evidence["contact_transition"]["reference_box_excursion_did_not_increase_joint"].all())
+        self.assertTrue(self.t.equal(self.kw["actual_domain_lower_hand_rad"], self.t.full((2, 7), -.225)))
+        self.assertTrue(self.t.equal(self.kw["actual_domain_upper_hand_rad"], self.t.full((2, 7), .225)))
+
+    def test_every_settle_condition_loss_immediately_resets_preload_ramp(self):
+        preload = self.t.tensor([.2, .1, .1])[None].expand(2, -1)
+        cases = (("group_physical_loaded", (0, 1), False), ("group_contact_valid", (0, 2), False),
+                 ("physical_contact_safe", (0,), False), ("tracking", (0,), False),
+                 ("raw_group_force_n", (0, 1), 1.6))
+        for key, index, value in cases:
+            self.reset_controller()
+            for _ in range(35):
+                self.step()
+            original = self.kw[key].clone()
+            self.kw[key][index] = value
+            _, evidence, _ = self.step()
+            transition = evidence["contact_transition"]
+            with self.subTest(key=key):
+                self.assertFalse(bool(transition["full_contact_settling_gate"][0]))
+                self.assertEqual(int(transition["full_contact_settle_count"][0]), 0)
+                self.assertEqual(float(transition["full_force_ramp_elapsed_s"][0]), 0.)
+                self.assertTrue(self.t.equal(evidence["group_force_target_n"][0], preload[0]))
+                self.assertGreater(float(transition["full_force_ramp_elapsed_s"][1]), 0.)
+            self.kw[key] = original
+
+    def test_free_thumb2_domain_recovery_has_no_projection_claim_and_shares_cap(self):
+        self.kw["group_contact_valid"][:, 0] = False
+        self.kw["group_physical_loaded"][:, 0] = False
+        self.kw["raw_group_force_n"][:, 0] = 0
+        self.kw["measured_hand_rad"][0, 2] = -.198
+        self.kw["measured_hand_rad"][1, 2] = .198
+        self.kw["gravity_hand_nm"][:, 2] = .0399
+        effort, evidence, _ = self.step()
+        recovery = evidence["contact_transition"]["thumb_domain_recovery"]
+        torque = recovery["guard_torque_before_total_alpha_nm"]
+        self.assertTrue(recovery["free_thumb2_gate"].all())
+        self.assertFalse(recovery["partial_contact_projection_gate"].any())
+        self.assertGreater(float(torque[0, 2]), 0)
+        self.assertLess(float(torque[1, 2]), 0)
+        self.assertTrue(self.t.equal(torque[:, [0, 1, 3, 4, 5, 6]], self.t.zeros(2, 6)))
+        self.assertTrue((torque.abs() <= .004000001).all())
+        self.assertLess(float(evidence["non_gravity_common_scale"][0]), 1.)
+        self.assertTrue((effort.abs() <= self.t.tensor(self.parameters["joint_torque_limits_nm"])+1e-8).all())
+        self.assertTrue(recovery["free_thumb2_has_no_nullspace_claim"])
+
+    def partial_fixture(self):
+        self.reset_controller(guard=ContactDomainPostureGuardTests.DECLARATION)
+        self.kw["inward_normal_jacobian"][:, 0, :3] = self.t.tensor(
+            [-.022998522967100143, -.056815437972545624, -.02566390484571457])
+        self.kw["contact_point_jacobian_world_m"][:, 0, 2, :3] = self.t.tensor(
+            [-.01418279018253088, .0018831974593922496, -.027741195634007454])
+        self.kw["group_physical_loaded"][:, 1:] = False
+        self.kw["group_contact_valid"][:, 1:] = False
+        self.kw["raw_group_force_n"][:] = self.t.tensor([.2, 0., 0.])
+        self.kw["physical_contact_safe"][:] = False
+        self.kw["measured_hand_rad"][:, 2] = -.198
+
+    def test_physically_loaded_thumb_without_current_normal_never_gets_free_boundary_torque(self):
+        self.kw["group_contact_valid"][:, 0] = False
+        self.kw["group_physical_loaded"][:, 0] = self.t.tensor([True, False])
+        self.kw["raw_group_force_n"][:, 0] = self.t.tensor([.2, 0.])
+        self.kw["measured_hand_rad"][:, 2] = -.198
+        _, evidence, unsafe = self.step()
+        recovery = evidence["contact_transition"]["thumb_domain_recovery"]
+        self.assertFalse(unsafe.any())
+        self.assertFalse(bool(recovery["thumb_current_normal"][0]))
+        self.assertTrue(bool(recovery["thumb_physically_loaded"][0]))
+        self.assertFalse(bool(recovery["free_thumb2_gate"][0]))
+        self.assertFalse(bool(recovery["partial_contact_projection_gate"][0]))
+        self.assertTrue(self.t.equal(recovery["guard_torque_before_total_alpha_nm"][0], self.t.zeros(7)))
+        self.assertTrue(bool(recovery["free_thumb2_gate"][1]))
+        self.assertGreater(float(recovery["guard_torque_before_total_alpha_nm"][1, 2]), 0.)
+
+    def test_partial_loaded_thumb_uses_current_normal_and_z_nullspace_without_acceptance_claim(self):
+        self.partial_fixture()
+        _, evidence, unsafe = self.step()
+        recovery = evidence["contact_transition"]["thumb_domain_recovery"]
+        self.assertFalse(unsafe.any())
+        self.assertTrue(recovery["partial_contact_projection_gate"].all())
+        self.assertFalse(recovery["free_thumb2_gate"].any())
+        self.assertFalse(evidence["contact_domain_posture_guard"]["gate"].any())
+        self.assertLess(float(recovery["partial_normal_projection_residual_m_nm"].abs().max()), 1e-9)
+        self.assertLess(float(recovery["partial_world_z_projection_residual_m_nm"].abs().max()), 1e-9)
+        self.assertGreater(float(recovery["guard_torque_before_total_alpha_nm"][0, 2]), 0.)
+        self.assertTrue(self.t.equal(evidence["position_spring_after_contact_mode_mask_nm"][:, :3], self.t.zeros(2, 3)))
+        self.assertTrue(recovery["partial_contact_guard_is_not_physical_acceptance"])
+
+    def test_partial_recovery_requires_current_point_rank_loaded_and_tracking(self):
+        self.partial_fixture()
+        cases = (("group_physical_loaded", (0, 0), False), ("tracking", (0,), False),
+                 ("raw_group_force_n", (0, 0), 1.6), ("unsafe_latched", (0,), True))
+        for key, index, value in cases:
+            original = self.kw[key].clone()
+            self.kw[key][index] = value
+            _, evidence, _ = self.step()
+            recovery = evidence["contact_transition"]["thumb_domain_recovery"]
+            with self.subTest(key=key):
+                self.assertFalse(bool(recovery["partial_contact_projection_gate"][0]))
+                self.assertTrue(self.t.equal(recovery["guard_torque_before_total_alpha_nm"][0], self.t.zeros(7)))
+            self.kw[key] = original
+        self.kw["contact_point_jacobian_world_m"] = None
+        _, evidence, _ = self.step()
+        self.assertFalse(evidence["contact_transition"]["thumb_domain_recovery"]["partial_contact_projection_gate"].any())
+        self.kw["contact_point_jacobian_world_m"] = self.t.zeros(2, 3, 3, 7)
+        self.kw["contact_point_jacobian_world_m"][:, 0, 2, :3] = self.kw["inward_normal_jacobian"][:, 0, :3]
+        _, evidence, _ = self.step()
+        self.assertFalse(evidence["contact_transition"]["thumb_domain_recovery"]["partial_contact_projection_gate"].any())
+
+    def test_full_original_guard_does_not_receive_a_second_thumb_recovery(self):
+        self.partial_fixture()
+        self.kw["group_contact_valid"][:] = True
+        self.kw["group_physical_loaded"][:] = True
+        self.kw["physical_contact_safe"][:] = True
+        _, evidence, _ = self.step()
+        self.assertTrue(evidence["contact_domain_posture_guard"]["gate"].all())
+        recovery = evidence["contact_transition"]["thumb_domain_recovery"]
+        self.assertFalse(recovery["free_thumb2_gate"].any())
+        self.assertFalse(recovery["partial_contact_projection_gate"].any())
+        self.assertTrue(self.t.equal(recovery["guard_torque_before_total_alpha_nm"], self.t.zeros(2, 7)))
+
+    def test_duplicate_reset_and_unsafe_do_not_advance_settle_or_reuse_recovery(self):
+        for _ in range(32):
+            previous, evidence, _ = self.step()
+        count = self.controller.preload_settle_count.clone()
+        ramp = self.controller.preload_ramp_elapsed_s.clone()
+        self.kw["inward_normal_jacobian"] *= -1
+        duplicate, evidence, _ = self.controller.update(sample_id=self.sample-1, **self.kw)
+        self.assertTrue(self.t.equal(duplicate, previous))
+        self.assertTrue(self.t.equal(count, self.controller.preload_settle_count))
+        self.assertTrue(self.t.equal(ramp, self.controller.preload_ramp_elapsed_s))
+        self.assertTrue(evidence["contact_transition"]["duplicate_holds_prior_complete_effort_without_new_transition"])
+        self.kw["episode_id"] = self.ids+1
+        _, evidence, _ = self.step()
+        self.assertTrue((self.controller.preload_settle_count == 0).all())
+        self.assertTrue((self.controller.preload_ramp_elapsed_s == 0).all())
+        self.assertFalse(self.controller.previous_any_contact.any())
+        self.kw["unsafe_latched"][:] = True
+        effort, evidence, unsafe = self.step()
+        self.assertTrue(unsafe.all())
+        self.assertTrue(self.t.equal(effort, self.t.zeros_like(effort)))
+        self.assertTrue((evidence["contact_transition"]["full_contact_settle_count"] == 0).all())
+
+    def test_none_preserves_original_contract_every_tensor_bit_and_reference_state(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        from g1_vla.rl_effort_protocol import balanced_effort_controller_contract
+        omitted = BalancedEffortGraspController(self.t, self.seed, self.ids)
+        explicit = BalancedEffortGraspController(self.t, self.seed, self.ids, contact_transition=None)
+        self.assertEqual(omitted.contract, balanced_effort_controller_contract())
+        self.assertEqual(omitted.contract_sha256, explicit.contract_sha256)
+        for sample in range(9):
+            if sample == 2:
+                self.kw["raw_group_force_n"][:] = 2.
+                self.kw["closing_axis_hand7"] = self.t.tensor([-1., -1., -1., 1., -1., 1., 1.])
+            if sample == 3:
+                self.kw["group_contact_valid"][:] = False
+            if sample == 4:
+                self.kw["measured_hand_rad"][:, 2] = -.198
+            if sample == 5:
+                self.kw["tracking"][:] = False
+            if sample == 6:
+                self.kw["unsafe_latched"][0] = True
+            inputs = dict(self.kw)
+            left = omitted.update(sample_id=sample, **inputs)
+            right = explicit.update(sample_id=sample, **inputs)
+            self.assertTrue(self.t.equal(left[0].view(self.t.int32), right[0].view(self.t.int32)))
+            self.assertTrue(self.t.equal(left[2], right[2]))
+            self.assertNotIn("contact_transition", left[1])
+            self.assertNotIn("contact_transition", right[1])
+            for key in left[1]:
+                if self.t.is_tensor(left[1][key]):
+                    a, b = left[1][key], right[1][key]
+                    self.assertTrue(self.t.equal(a.view(self.t.int32), b.view(self.t.int32)) if a.dtype == self.t.float32 else self.t.equal(a, b), key)
+
+    def test_changed_transition_declaration_is_rejected_and_identity_is_versioned(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        for key, value in (("full_contact_settle_samples", 24), ("full_force_ramp_s", .05),
+                           ("partial_thumb2_normal_world_z_guard", False),
+                           ("missing_group_reference_velocity_limit_rad_s", .5)):
+            invalid = dict(self.declaration, **{key: value})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                BalancedEffortGraspController(self.t, self.seed, self.ids, contact_transition=invalid)
+        old = BalancedEffortGraspController(self.t, self.seed, self.ids)
+        self.assertNotEqual(old.contract_sha256, self.controller.contract_sha256)
+        self.assertIn("+g1_coordinated_contact_transition_v1", self.controller.contract["version"])
+
+
 if __name__ == "__main__":
     unittest.main()

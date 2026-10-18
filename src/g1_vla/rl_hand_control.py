@@ -846,6 +846,105 @@ def _contact_domain_guard_torque(t, declaration, *, q, a, point_jacobian, lower,
     return torque, evidence
 
 
+def _transition_thumb_domain_recovery(t, declaration, projection_declaration, *, q, a,
+                                      point_jacobian, lower, upper, safe, tracking,
+                                      normal_available, physical_loaded, overforce,
+                                      full_guard_gate):
+    """Restore the original thumb domain during free/partial contact only.
+
+    A free thumb receives a thumb2-only torque. A loaded partial-contact thumb
+    instead uses the separately declared normal/Z nullspace construction. This
+    is a control intervention, never a physical-contact acceptance certificate.
+    """
+    n = q.shape[0]
+    supplied = lower is not None and upper is not None
+    if supplied:
+        for name, value in (("actual domain lower", lower), ("actual domain upper", upper)):
+            if (not t.is_tensor(value) or tuple(value.shape) != (n, 7) or
+                    not value.is_floating_point() or value.dtype != q.dtype or value.device != q.device):
+                raise ValueError(name+" requires matching native N by seven floating tensor")
+        finite = t.isfinite(lower).all(-1) & t.isfinite(upper).all(-1)
+        margin = declaration["free_thumb2_activation_margin_rad"]
+        low, high = lower[:, 2]+margin, upper[:, 2]-margin
+        bounds_valid = finite & (lower <= upper).all(-1) & (low <= high)
+    else:
+        finite = t.zeros(n, dtype=t.bool, device=q.device)
+        bounds_valid = finite.clone()
+        low, high = t.zeros_like(q[:, 2]), t.zeros_like(q[:, 2])
+    target = t.minimum(t.maximum(q[:, 2], low), high)
+    error = t.where(bounds_valid, target-q[:, 2], t.zeros_like(q[:, 2]))
+    scalar = declaration["free_thumb2_restoring_stiffness_nm_rad"]*error
+    base_gate = bounds_valid & safe & tracking & ~overforce.any(-1) & ~full_guard_gate
+    # A physically loaded thumb with an unavailable/degenerate current normal
+    # is not free space. Do not inject an unprojected boundary torque there.
+    free_gate = base_gate & ~normal_available[:, 0] & ~physical_loaded[:, 0]
+    before_cap = t.zeros_like(q)
+    before_cap[:, 2] = t.where(free_gate, scalar, t.zeros_like(scalar))
+
+    # Reuse the original guard's explicitly declared rank/component tolerances;
+    # without that declaration or a current point there is no projected guard.
+    point_supplied = point_jacobian is not None
+    if point_supplied and (not t.is_tensor(point_jacobian) or
+            tuple(point_jacobian.shape) != (n, 3, 3, 7) or
+            not point_jacobian.is_floating_point() or point_jacobian.dtype != q.dtype or
+            point_jacobian.device != q.device):
+        raise ValueError("contact point Jacobian requires matching native N by three by three by seven tensor")
+    projection_supplied = point_supplied and projection_declaration is not None
+    if projection_supplied:
+        matrix = t.stack((a[:, 0, :3], point_jacobian[:, 0, 2, :3]), dim=1)
+        matrix_finite = t.isfinite(matrix).all(dim=(-1, -2))
+        matrix = t.where(matrix_finite[:, None, None], matrix, t.zeros_like(matrix))
+    else:
+        matrix = t.zeros(n, 2, 3, device=q.device, dtype=q.dtype)
+        matrix_finite = t.zeros(n, dtype=t.bool, device=q.device)
+    _, singular, vh = t.linalg.svd(matrix, full_matrices=True)
+    tolerance = projection_declaration["svd_tolerance_m"] if projection_declaration else .0001
+    minimum_component = projection_declaration["minimum_nullspace_joint_component"] if projection_declaration else .05
+    rank = (singular >= tolerance).sum(-1)
+    null = vh[:, 2, :]
+    projector = null[:, :, None]*null[:, None, :]
+    component = projector[:, 2, 2]
+    partial_gate = (base_gate & matrix_finite & normal_available[:, 0] &
+                    physical_loaded[:, 0] & ~physical_loaded.all(-1) &
+                    (rank == 2) & (component >= minimum_component))
+    partial = projector[:, :, 2]*scalar[:, None]
+    before_cap[:, :3] += t.where(partial_gate[:, None], partial, t.zeros_like(partial))
+    peak = before_cap.abs().amax(-1)
+    scale = (declaration["free_thumb2_maximum_guard_torque_nm"]/peak.clamp_min(1e-12)).clamp(max=1.)
+    torque = before_cap*scale[:, None]
+    partial_torque = t.where(partial_gate[:, None], torque[:, :3], t.zeros_like(torque[:, :3]))
+    residual = t.einsum("nri,ni->nr", matrix, partial_torque)
+    evidence = {"original_actual_domain_inputs_supplied": supplied,
+        "original_actual_domain_bounds_valid": bounds_valid,
+        "original_actual_domain_lower_margin_all7_rad": q-lower if supplied else None,
+        "original_actual_domain_upper_margin_all7_rad": upper-q if supplied else None,
+        "safe_fresh_sample": safe, "palm_tracking": tracking,
+        "any_group_overforce": overforce.any(-1), "original_full_guard_active": full_guard_gate,
+        "thumb_current_normal": normal_available[:, 0],
+        "thumb_physically_loaded": physical_loaded[:, 0],
+        "all_groups_physically_loaded": physical_loaded.all(-1),
+        "free_thumb2_gate": free_gate, "partial_contact_projection_gate": partial_gate,
+        "current_point_jacobian_supplied": point_supplied,
+        "original_projection_declaration_supplied": projection_declaration is not None,
+        "current_normal_world_z_jacobian_m": matrix,
+        "projection_current_input_finite": matrix_finite,
+        "projection_singular_values_m": singular, "projection_rank": rank,
+        "projection_thumb2_component": component, "projection_thumb_nullspace_projector": projector,
+        "interior_lower_thumb2_rad": low, "interior_upper_thumb2_rad": high,
+        "boundary_error_rad": error, "restoring_scalar_nm": scalar,
+        "requested_guard_before_own_cap_nm": before_cap, "guard_common_scale": scale,
+        "guard_torque_before_total_alpha_nm": torque,
+        "partial_normal_projection_residual_m_nm": residual[:, 0],
+        "partial_world_z_projection_residual_m_nm": residual[:, 1],
+        "free_thumb2_has_no_nullspace_claim": True,
+        "partial_contact_guard_is_not_physical_acceptance": True,
+        "partial_projection_is_not_dynamic_force_isolation": True,
+        "all_current_force_mode_position_springs_remain_zero": True,
+        "fresh_current_geometry_only_no_history": True,
+        "original_actual_domain_not_enlarged": True}
+    return torque, evidence
+
+
 class BalancedEffortGraspController:
     """Joint efforts for the declared hand-only grasp intervention.
 
@@ -862,7 +961,8 @@ class BalancedEffortGraspController:
     distribution is an internal-force reference, not a measured wrench balance.
     """
 
-    def __init__(self, torch, initial_hand_rad, episode_id, *, parameters=None, domain_posture_guard=None):
+    def __init__(self, torch, initial_hand_rad, episode_id, *, parameters=None, domain_posture_guard=None,
+                 contact_transition=None):
         self.contract, self.parameters = _balanced_effort_contract_and_parameters(parameters)
         self.domain_posture_guard = None
         if domain_posture_guard is not None:
@@ -870,6 +970,12 @@ class BalancedEffortGraspController:
             self.domain_posture_guard = validate_contact_domain_posture_guard(domain_posture_guard)
             self.contract["version"] += "+"+self.domain_posture_guard["version"]
             self.contract["domain_posture_guard"] = copy.deepcopy(self.domain_posture_guard)
+        self.contact_transition = None
+        if contact_transition is not None:
+            from .rl_effort_protocol import validate_contact_transition_control
+            self.contact_transition = validate_contact_transition_control(contact_transition)
+            self.contract["version"] += "+"+self.contact_transition["version"]
+            self.contract["contact_transition"] = copy.deepcopy(self.contact_transition)
         self.torch = torch
         if (not torch.is_tensor(initial_hand_rad) or not initial_hand_rad.is_floating_point() or initial_hand_rad.ndim != 2 or
                 initial_hand_rad.shape[1] != 7 or not bool(torch.isfinite(initial_hand_rad).all())):
@@ -883,6 +989,11 @@ class BalancedEffortGraspController:
         self.reference = self.seed.clone()
         self.contact_latched = torch.zeros(self.num_envs, 3, dtype=torch.bool, device=self.seed.device)
         self.previous_normal_available = torch.zeros_like(self.contact_latched)
+        if self.contact_transition is not None:
+            self.previous_any_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.seed.device)
+            self.preload_settle_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.seed.device)
+            self.preload_ramp_sample_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.seed.device)
+            self.preload_ramp_elapsed_s = torch.zeros(self.num_envs, dtype=self.seed.dtype, device=self.seed.device)
         self.seen_valid_feedback = torch.zeros(self.num_envs, dtype=torch.bool, device=self.seed.device)
         self.last_effort = torch.zeros_like(self.seed)
         self.sample_id = None
@@ -970,6 +1081,11 @@ class BalancedEffortGraspController:
             self.contact_latched[changed] = False
             self.previous_normal_available[changed] = False
             self.seen_valid_feedback[changed] = False
+            if self.contact_transition is not None:
+                self.previous_any_contact[changed] = False
+                self.preload_settle_count[changed] = 0
+                self.preload_ramp_sample_count[changed] = 0
+                self.preload_ramp_elapsed_s[changed] = 0
         self.seen_valid_feedback |= contact_measurement_valid & finite & ~unsafe & ~changed & (not duplicate)
         # Replace invalid data before linear algebra. Its environment is still
         # marked unsafe and receives zero effort; NaNs never enter SVD.
@@ -996,15 +1112,35 @@ class BalancedEffortGraspController:
         # Drop old free-space position error when a current normal disappears.
         # Subsequent reacquisition starts from measured q with a declared rate.
         reset_reference = (lost_current_normal | (reacquire & ~latched_before))[:, self.group_ids]
+        transition_any_contact = None
+        transition_first_contact = None
+        if self.contact_transition is not None:
+            transition_any_contact = safe & (normal_available.any(-1) | group_physical_loaded.any(-1))
+            transition_first_contact = transition_any_contact & ~self.previous_any_contact
+            reset_reference |= (transition_first_contact[:, None] &
+                                ~normal_available[:, self.group_ids])
         reference = t.where(reset_reference, q, self.reference)
         velocity_limit = nominal_velocity_limit_hand_rad_s.clone()
         velocity_limit = t.where(reacquire[:, self.group_ids],
                                  t.minimum(velocity_limit, t.full_like(velocity_limit,
                                            p["reacquisition_velocity_limit_rad_s"])), velocity_limit)
+        if self.contact_transition is not None:
+            partial_missing = transition_any_contact[:, None] & ~normal_available[:, self.group_ids]
+            velocity_limit = t.where(partial_missing,
+                t.minimum(velocity_limit, t.full_like(velocity_limit,
+                    self.contact_transition["missing_group_reference_velocity_limit_rad_s"])), velocity_limit)
         nominal = t.minimum(t.maximum(nominal_hand_rad, lower), upper)
+        if self.contact_transition is not None:
+            reference_integration_origin = reference.clone()
         increment = (nominal-reference).clamp(min=-velocity_limit*dt, max=velocity_limit*dt)
         reference = reference + t.where((safe & tracking)[:, None], increment, t.zeros_like(increment))
-        reference = t.minimum(t.maximum(reference, lower), upper)
+        if self.contact_transition is None:
+            reference = t.minimum(t.maximum(reference, lower), upper)
+        # A measured-q reset can start just outside the reference box while
+        # remaining within the separate actual-domain tolerance. Projecting it
+        # instantly back into the box defeats the native-sample slew bound.
+        # The unchanged in-box nominal instead draws that reference inward at
+        # the declared velocity. The actual/physical gates stay independent.
         # Palm lag suppresses all positional chasing. Measured force can still
         # request opening, and current gravity remains within the total cap.
         reference_for_impedance = t.where(tracking[:, None], reference, q)
@@ -1022,6 +1158,67 @@ class BalancedEffortGraspController:
         identity = t.eye(7, device=q.device, dtype=q.dtype)[None]
         posture = t.einsum("nij,nj->ni", identity-normal_projection, impedance)
         targets = t.tensor(p["group_force_targets_n"], device=q.device, dtype=q.dtype)[None].expand(n, -1)
+        transition_evidence = None
+        if self.contact_transition is not None:
+            if physical_contact_safe is None:
+                transition_physical_safe = t.zeros(n, dtype=t.bool, device=q.device)
+            else:
+                if (not t.is_tensor(physical_contact_safe) or tuple(physical_contact_safe.shape) != (n,) or
+                        physical_contact_safe.dtype != t.bool or physical_contact_safe.device != q.device):
+                    raise ValueError("physical_contact_safe requires matching native N boolean tensor")
+                transition_physical_safe = physical_contact_safe
+            settling = (safe & tracking & normal_available.all(-1) & group_physical_loaded.all(-1) &
+                        transition_physical_safe & ~(force > p["group_force_limit_n"]).any(-1))
+            count_before = self.preload_settle_count.clone()
+            ramp_before = self.preload_ramp_elapsed_s.clone()
+            ramp_sample_before = self.preload_ramp_sample_count.clone()
+            if not duplicate:
+                self.preload_settle_count = t.where(settling,
+                    (count_before+1).clamp(max=self.contact_transition["full_contact_settle_samples"]),
+                    t.zeros_like(count_before))
+                ready_before = count_before >= self.contact_transition["full_contact_settle_samples"]
+                # Count native samples rather than accumulating float seconds:
+                # the declared 100ms ramp ends exactly after 50 new 2ms samples.
+                ramp_samples = round(self.contact_transition["full_force_ramp_s"]/dt)
+                self.preload_ramp_sample_count = t.where(settling & ready_before,
+                    (ramp_sample_before+1).clamp(max=ramp_samples), t.zeros_like(ramp_sample_before))
+                self.preload_ramp_elapsed_s = self.preload_ramp_sample_count.to(q.dtype)*dt
+            ramp_fraction = (self.preload_ramp_elapsed_s/self.contact_transition["full_force_ramp_s"]).clamp(0, 1)
+            preload = t.tensor(self.contact_transition["preload_group_force_targets_n"],
+                               device=q.device, dtype=q.dtype)[None].expand(n, -1)
+            full_targets = targets
+            targets = preload+ramp_fraction[:, None]*(full_targets-preload)
+            transition_evidence = {"contract": copy.deepcopy(self.contact_transition),
+                "any_current_normal_or_physical_contact": transition_any_contact,
+                "first_any_contact_resets_missing_reference": transition_first_contact,
+                "partial_contact_missing_normal_reference_cap_joint": partial_missing,
+                "missing_group_reference_cap_is_inner_native_sample_bound": True,
+                "reference_reset_to_current_measured_joint": reset_reference,
+                "reference_integration_origin_hand_rad": reference_integration_origin,
+                "reference_integration_delta_hand_rad": reference-reference_integration_origin,
+                "temporary_reference_box_lower_excursion_rad": (lower-reference).clamp_min(0),
+                "temporary_reference_box_upper_excursion_rad": (reference-upper).clamp_min(0),
+                "reference_box_excursion_did_not_increase_joint":
+                    (((lower-reference).clamp_min(0) <= (lower-reference_integration_origin).clamp_min(0)) &
+                     ((reference-upper).clamp_min(0) <= (reference_integration_origin-upper).clamp_min(0))),
+                "reference_box_reentry_is_rate_limited_not_single_sample_projection": True,
+                "nominal_reference_box_and_original_actual_domain_not_enlarged": True,
+                "all_group_current_normals": normal_available.all(-1),
+                "all_groups_physically_loaded": group_physical_loaded.all(-1),
+                "original_physical_contact_safe": transition_physical_safe,
+                "full_contact_settling_gate": settling,
+                "full_contact_settle_count_before": count_before,
+                "full_contact_settle_count": self.preload_settle_count.clone(),
+                "full_force_ramp_elapsed_s_before": ramp_before,
+                "full_force_ramp_elapsed_s": self.preload_ramp_elapsed_s.clone(),
+                "full_force_ramp_sample_count_before": ramp_sample_before,
+                "full_force_ramp_sample_count": self.preload_ramp_sample_count.clone(),
+                "full_force_ramp_fraction": ramp_fraction,
+                "preload_group_force_targets_n": preload,
+                "full_group_force_targets_n": full_targets,
+                "applied_group_force_targets_n": targets,
+                "contact_loss_or_unsafe_clears_settle_and_ramp": True,
+                "force_targets_are_not_measured_force_bounds": True}
         error = targets-force
         inward_velocity = t.einsum("ngi,ni->ng", a, qd)
         command = (targets+p["normal_force_feedback_gain"]*error-
@@ -1049,6 +1246,18 @@ class BalancedEffortGraspController:
                 normal_available=normal_available, physical_loaded=group_physical_loaded,
                 overforce=overforce)
             posture = posture+guard_torque
+        transition_guard_torque = None
+        if self.contact_transition is not None:
+            full_guard_gate = guard_evidence["gate"] if guard_evidence is not None else t.zeros(n, dtype=t.bool, device=q.device)
+            transition_guard_torque, transition_guard_evidence = _transition_thumb_domain_recovery(
+                t, self.contact_transition, self.domain_posture_guard, q=q, a=a,
+                point_jacobian=contact_point_jacobian_world_m,
+                lower=actual_domain_lower_hand_rad, upper=actual_domain_upper_hand_rad,
+                safe=safe, tracking=tracking, normal_available=normal_available,
+                physical_loaded=group_physical_loaded, overforce=overforce,
+                full_guard_gate=full_guard_gate)
+            posture = posture+transition_guard_torque
+            transition_evidence["thumb_domain_recovery"] = transition_guard_evidence
         opening_fallback = t.where(overforce_joint & ~normal_available[:, self.group_ids] & force_axis[None],
                                    -axis[None]*p["overforce_opening_torque_nm"], t.zeros_like(g))
         non_gravity = posture+force_torque+opening_fallback
@@ -1074,12 +1283,21 @@ class BalancedEffortGraspController:
             # Keep the historical None path bit-identical. This diagnostic is
             # before the total cap but includes the optional projected guard.
             unclipped_total = unclipped_total+guard_torque
+        if transition_guard_torque is not None:
+            unclipped_total = unclipped_total+transition_guard_torque
         requested_total = gravity_command+non_gravity
         effort_before_emergency_axis_guard = gravity_command+alpha[:, None]*non_gravity
         # A current normal may have an unexpected per-joint sign. An overload
         # never keeps a positive known-closing-axis torque on a squeeze joint.
         remove_closing = (overforce_joint & force_axis[None] &
                           (effort_before_emergency_axis_guard*axis[None] > 0))
+        if self.contact_transition is not None:
+            # The current inward row, not a nominal closing-axis sign, defines
+            # unloading. Overforce already removed every other affected-finger
+            # contribution: tau=alpha*J.T*f_negative, hence each J_j*tau_j<=0.
+            # Keep the original fixed-axis mask only when no current row exists.
+            axis_mask_bypassed = remove_closing & normal_available[:, self.group_ids]
+            remove_closing = remove_closing & ~normal_available[:, self.group_ids]
         effort = t.where(remove_closing, t.zeros_like(g), effort_before_emergency_axis_guard)
         effort = effort.clamp(min=-caps, max=caps)
         # Before the first valid feedback witness, apply only bounded gravity
@@ -1095,10 +1313,34 @@ class BalancedEffortGraspController:
             self.previous_normal_available = t.where(safe[:, None], normal_available,
                                                       self.previous_normal_available)
             self.last_effort = effort.clone()
+            if self.contact_transition is not None:
+                self.previous_any_contact = transition_any_contact.clone()
         projected_residual = t.einsum("ngi,ni->ng", a, posture)
         opening_joint = (effort*axis[None] < 0) & force_axis[None]
         relief = t.stack((opening_joint[:, :3].any(-1), opening_joint[:, 3:5].any(-1),
                           opening_joint[:, 5:].any(-1)), dim=-1) & overforce
+        if self.contact_transition is not None:
+            current_pairing = a*effort[:, None, :]
+            current_relief = (current_pairing < 0).any(-1) & overforce & normal_available
+            relief = t.where(normal_available, current_relief, relief)
+            transition_evidence.update({
+                "current_normal_unload_by_group": overforce & normal_available,
+                "missing_current_normal_axis_fallback_by_group": overforce & ~normal_available,
+                "fixed_closing_axis_mask_bypassed_by_current_normal_joint": axis_mask_bypassed,
+                "effort_before_emergency_direction_guard_nm": effort_before_emergency_axis_guard,
+                "current_normal_actual_joint_pairing_m_nm": current_pairing,
+                "current_normal_actual_group_pairing_m_nm": current_pairing.sum(-1),
+                "current_normal_command_is_not_a_measured_force_or_velocity_guarantee": True,
+                "normal_unload_uses_current_sample_only_no_history": True,
+                "all_increments_share_original_non_gravity_alpha_and_total_caps": True,
+                "duplicate_holds_prior_complete_effort_without_new_transition": duplicate})
+            transition_guard_evidence["guard_torque_after_total_common_scale_nm"] = alpha[:, None]*transition_guard_torque
+            applied_transition_guard = alpha[:, None]*transition_guard_torque
+            applied_transition_guard = t.where(remove_closing, t.zeros_like(applied_transition_guard), applied_transition_guard)
+            applied_transition_guard = t.where(safe[:, None] & ~unsafe[:, None], applied_transition_guard, t.zeros_like(applied_transition_guard))
+            if duplicate:
+                applied_transition_guard = t.zeros_like(applied_transition_guard)
+            transition_guard_evidence["guard_component_for_current_new_command_nm"] = applied_transition_guard
         evidence = {
             "controller_version": self.contract["version"], "controller_contract_sha256": self.contract_sha256,
             "controller_contract": self.contract, "native_sample_id": sample_id,
@@ -1168,4 +1410,6 @@ class BalancedEffortGraspController:
             guard_evidence["guard_component_for_current_new_command_nm"] = applied_guard
             guard_evidence["duplicate_holds_prior_complete_effort_without_new_guard_evaluation"] = duplicate
             evidence["contact_domain_posture_guard"] = guard_evidence
+        if transition_evidence is not None:
+            evidence["contact_transition"] = transition_evidence
         return effort, evidence, unsafe
