@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from g1_vla.rl_environment import (
@@ -779,6 +780,142 @@ class NativeArmTargetScheduleTests(unittest.TestCase):
         terminated,truncated=method(fake)
         self.assertTrue(terminated.all());self.assertFalse(truncated.any())
         self.assertFalse(fake._unsafe.any())
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch") and importlib.util.find_spec("PIL"), "Original camera adapters require Torch and Pillow")
+class DeclaredMultiCameraTests(unittest.TestCase):
+    @contextmanager
+    def fixture(self):
+        import torch
+        from types import MethodType
+        t=torch
+        with tempfile.TemporaryDirectory() as directory:
+            output=Path(directory);declaration={"version":"g1_declared_multienv_native_rgb_v1","env_ids":list(range(8))}
+            tree=ast.parse((ROOT/"src/g1_vla/rl_environment.py").read_text())
+            owner=next(node for node in ast.walk(tree) if isinstance(node,ast.ClassDef) and node.name=="Environment")
+            scope={"torch":t,"tensor":lambda value:value,"json":json,"hashlib":hashlib,"_probe_payload":_probe_payload,
+                "_json_finite":_json_finite,"output":output,"video_recording":declaration,"RLEnvironmentError":RLEnvironmentError}
+            for name in ("_open_declared_video_recording","_write_declared_video_event","_capture_declared_evaluation_frames","_capture_evaluation_frame"):
+                node=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name==name)
+                exec(compile(ast.Module(body=[node],type_ignores=[]),"<actual-declared-camera>","exec"),scope)
+            native=[33];cameras={};statuses=[]
+            for env_id in range(8):
+                frame=t.zeros(1,dtype=t.int64)
+                cameras[env_id]=SimpleNamespace(frame=frame,data=SimpleNamespace(output={"rgb":t.full((1,480,640,4),20+env_id,dtype=t.uint8)}),
+                    update=lambda dt,force_recompute,f=frame:f.add_(1))
+                statuses.append({"camera_env_id":env_id,"enabled":True,"frames":0,"failure":None,
+                    "frame_directory":f"video/env_{env_id}/rgb_frames","frame_ledger":f"video/env_{env_id}/video_frames.jsonl",
+                    "eye_world_m":[env_id+.635,-.262,1.045],"target_world_m":[env_id+.32,.055,.82]})
+            cube_pos=t.zeros(8,3);cube_pos[:,0]=t.arange(8);quat=t.zeros(8,4);quat[:,3]=1
+            fake=SimpleNamespace(device="cpu",_video_recording=declaration,_evaluation_cameras=cameras,_declared_video_streams={},
+                _video_status={"requested":True,"enabled":True,"failure":None,"frames":0,"video_recording":declaration,"cameras":statuses},
+                _last_video_native_step=None,_physics_samples=33,_standalone_video=True,_episode_ids=t.full((8,),2,dtype=t.int64),
+                episode_length_buf=t.ones(8,dtype=t.int64),step_dt=.066,_control_probe_enabled=True,
+                _control_probe_profile={"name":"balanced_effort_pose_hold","action_source":"guided_hand_pose_hold","control_guard_version":"box_halfspace_projected_v2"},
+                cube=SimpleNamespace(data=SimpleNamespace(root_pos_w=cube_pos,root_quat_w=quat)),
+                sim=SimpleNamespace(get_physics_step_count=lambda:native[0],get_physics_dt=lambda:.002))
+            for name,value in scope.items():
+                if name.startswith(("_open_declared","_write_declared","_capture_declared","_capture_evaluation")):
+                    setattr(fake,name,MethodType(value,fake))
+            try:
+                fake._open_declared_video_recording()
+                yield fake,output,native,owner,scope
+            finally:
+                for resources in fake._declared_video_streams.values():resources["manifest"].close()
+
+    def test_eight_original_cameras_map_identity_and_async_episode_resets_to_distinct_ledgers(self):
+        import torch
+        from PIL import Image
+        with self.fixture() as (fake,output,native,owner,scope):
+            fake._capture_evaluation_frame()
+            self.assertEqual(fake._video_status["frames"],1)
+            self.assertEqual([camera["frames"] for camera in fake._video_status["cameras"]],[1]*8)
+            self.assertEqual(fake._video_status["first_frame_memory"]["camera_count"],8)
+            reset=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name=="_reset_idx")
+            branch=next(node for node in reset.body if isinstance(node,ast.If) and
+                isinstance(node.test,ast.BoolOp) and isinstance(node.test.values[0],ast.Compare) and
+                isinstance(node.test.values[0].left,ast.Name) and node.test.values[0].left.id=="video_recording")
+            fake._episode_ids[4]=3;fake.episode_length_buf[4]=0
+            reset_scope={**scope,"self":fake,"env_ids":torch.tensor([4])}
+            exec(compile(ast.Module(body=branch.body,type_ignores=[]),"<actual-declared-camera-reset-ledger>","exec"),reset_scope)
+            native[0]=66;fake._physics_samples=66;fake.episode_length_buf+=1
+            fake._capture_evaluation_frame()
+            self.assertEqual(fake._video_status["frames"],2,"A macro records one set rather than eight frames")
+            for env_id in range(8):
+                ledger=output/f"video/env_{env_id}/video_frames.jsonl"
+                rows=[json.loads(line) for line in ledger.read_text().splitlines()]
+                self.assertEqual(rows[0]["video_recording"],fake._video_recording)
+                frames=[row for row in rows if row["event"]=="camera_frame"]
+                self.assertEqual([r["camera_env_id"] for r in frames],[env_id,env_id])
+                self.assertEqual([r["native_physics_step_count"] for r in frames],[33,66])
+                self.assertEqual([r["episode_id"] for r in frames],[2,3] if env_id==4 else [2,2])
+                self.assertEqual(len([r for r in rows if r["event"]=="episode_reset"]),int(env_id==4))
+                self.assertEqual(frames[-1]["cube_position_world_m"][0],env_id)
+                for row in frames:
+                    path=output/f"video/env_{env_id}/rgb_frames"/row["path"];data=path.read_bytes()
+                    self.assertEqual(hashlib.sha256(data).hexdigest(),row["sha256"])
+                    self.assertEqual(len(data),row["bytes"])
+                    with Image.open(path) as image:self.assertEqual(image.getpixel((0,0)),(20+env_id,)*3)
+
+    def test_camera_stall_or_duplicate_native_sample_is_explicit_incomplete_evidence(self):
+        with self.fixture() as (fake,output,native,_,__):
+            fake._capture_evaluation_frame();fake._capture_evaluation_frame()
+            self.assertIn("duplicate native",fake._video_status["failure"])
+            self.assertEqual(fake._video_status["frames"],1)
+            self.assertTrue((output/"evaluation_video_failure.json").is_file())
+        with self.fixture() as (fake,output,native,_,__):
+            fake._capture_evaluation_frame();native[0]=66
+            fake._evaluation_cameras[4].update=lambda **kwargs:None
+            fake._capture_evaluation_frame()
+            self.assertIn("counter did not advance",fake._video_status["failure"])
+            self.assertIsNotNone(fake._video_status["cameras"][4]["failure"])
+            self.assertEqual(fake._video_status["frames"],1)
+            self.assertEqual(len(list((output/"video/env_0/rgb_frames").glob("*.png"))),1)
+
+    def test_close_requires_all_original_camera_counts_and_closes_every_ledger(self):
+        for missing in (False,True):
+            with self.subTest(missing_camera_frame=missing),self.fixture() as (fake,output,native,owner,scope):
+                fake._capture_evaluation_frame()
+                if missing:fake._video_status["cameras"][7]["frames"]=0
+                method=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name=="close")
+                class Base:
+                    def close(self):self.base_closed=True
+                namespace={**scope,"Base":Base}
+                wrapper=ast.ClassDef(name="ActualClose",bases=[ast.Name(id="Base",ctx=ast.Load())],
+                    keywords=[],body=[method],decorator_list=[])
+                exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper],type_ignores=[])),
+                    "<actual-declared-camera-close>","exec"),namespace)
+                closer=namespace["ActualClose"]();closer.__dict__.update(vars(fake))
+                streams=[resources["manifest"] for resources in fake._declared_video_streams.values()]
+                closer.close()
+                self.assertTrue(closer.base_closed)
+                self.assertTrue(all(stream.closed for stream in streams))
+                status=json.loads((output/"evaluation_video_status.json").read_text())
+                self.assertEqual(status["expected_control_frames"],1)
+                self.assertEqual(status["all_control_frames_recorded"],not missing)
+                self.assertEqual(status["cameras"][7]["all_control_frames_recorded"],not missing)
+                self.assertEqual(status["frames"],1)
+
+    def test_render_advancing_physics_invalidates_the_entire_frame_set(self):
+        with self.fixture() as (fake,output,native,_,__):
+            camera=fake._evaluation_cameras[4]
+            def advancing_update(**kwargs):
+                camera.frame.add_(1);native[0]+=1
+            camera.update=advancing_update
+            fake._capture_evaluation_frame()
+            self.assertIn("physics advanced between cameras",fake._video_status["failure"])
+            self.assertEqual(fake._video_status["frames"],0)
+            self.assertTrue(all(c["frames"]==0 for c in fake._video_status["cameras"]))
+            self.assertEqual(len(list(output.glob("video/env_*/rgb_frames/*.png"))),0)
+
+    def test_legacy_capture_body_is_unchanged_when_new_declaration_is_none(self):
+        baseline=ROOT.parent/"g1-stage15/src/g1_vla/rl_environment.py"
+        if not baseline.is_file():self.skipTest("Full04 baseline is available only in the local isolated review")
+        def capture(path):
+            tree=ast.parse(path.read_text());return next(node for node in ast.walk(tree) if isinstance(node,ast.FunctionDef) and node.name=="_capture_evaluation_frame")
+        before=capture(baseline);after=capture(ROOT/"src/g1_vla/rl_environment.py")
+        self.assertEqual(ast.dump(ast.Module(body=after.body[1:],type_ignores=[]),include_attributes=False),
+            ast.dump(ast.Module(body=before.body,type_ignores=[]),include_attributes=False))
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "CPU Torch is required")

@@ -6,9 +6,11 @@ and assets come from this project and are verified before the native process.
 
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path, PureWindowsPath
 import shutil
+import struct
 import subprocess
 import time
 
@@ -146,8 +148,243 @@ def _native_script(stage, config, win_release, win_output, run_id, release_sha25
     ])
 
 
+_DECLARED_VIDEO_VERSION = "g1_declared_multienv_native_rgb_v1"
+
+
+def _declared_video_ids(declaration, num_envs=None):
+    if (not isinstance(declaration, dict) or set(declaration) != {"version", "env_ids"} or
+            declaration["version"] != _DECLARED_VIDEO_VERSION):
+        raise ValueError("unknown declared native video recording contract")
+    ids = declaration["env_ids"]
+    if (not isinstance(ids, list) or not ids or
+            any(type(env) is not int or env < 0 or (num_envs is not None and env >= num_envs) for env in ids) or
+            len(set(ids)) != len(ids)):
+        raise ValueError("declared camera environment identities must be explicit and unique")
+    return ids
+
+
+def _declared_camera_frames(environment, status, camera, declaration):
+    """Verify original PNG bytes and native identities before any video encoding."""
+    env = camera["camera_env_id"]
+    prefix = "video/env_" + str(env)
+    if (camera["frame_directory"] != prefix + "/rgb_frames" or
+            camera["frame_ledger"] != prefix + "/video_frames.jsonl"):
+        raise ValueError("declared camera evidence paths do not match its environment identity")
+    frames, ledger = environment / camera["frame_directory"], environment / camera["frame_ledger"]
+    if (frames.is_symlink() or ledger.is_symlink() or
+            environment.resolve() not in frames.resolve().parents or
+            environment.resolve() not in ledger.resolve().parents):
+        raise ValueError("declared camera evidence must remain inside its native environment directory")
+    entries = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not entries or any(not isinstance(entry, dict) for entry in entries):
+        raise ValueError("declared camera frame ledger is empty or contains an invalid event")
+    header = entries[0]
+    if (header.get("event") != "camera_header" or type(header.get("camera_env_id")) is not int or header.get("camera_env_id") != env or
+            header.get("video_recording") != declaration or
+            [header.get(key) for key in ("width", "height", "fps_numerator", "fps_denominator")] != [640, 480, 500, 33]):
+        raise ValueError("declared camera header identity or fixed RGB contract differs")
+    rows = [entry for entry in entries[1:] if entry.get("event") == "camera_frame"]
+    paths = sorted(frames.glob("frame_*.png"))
+    if (not rows or type(status.get("frames")) is not int or len(rows) != status["frames"] or
+            type(camera.get("frames")) is not int or len(rows) != camera["frames"] or len(paths) != len(rows)):
+        raise ValueError("declared camera PNG/ledger/frame-set counts differ")
+    previous = None
+    for index, (row, path) in enumerate(zip(rows, paths)):
+        filename = "frame_{:06d}.png".format(index)
+        if (type(row.get("camera_env_id")) is not int or row.get("camera_env_id") != env or
+                type(row.get("frame_index")) is not int or row.get("frame_index") != index or
+                row.get("path") != filename or path.name != filename or path.is_symlink()):
+            raise ValueError("declared camera frame identity, index or source path differs")
+        if (row.get("pre_reset") is not True or
+                any(type(row.get(key)) is not int or row[key] < 0 for key in
+                    ("native_physics_step_count", "episode_id", "episode_control_steps", "camera_frame_counter")) or
+                row["episode_control_steps"] < 1):
+            raise ValueError("declared camera frame lacks a real pre-reset native episode identity")
+        dt, sim_time = row.get("actual_physics_dt_s"), row.get("sim_time_s")
+        if (not isinstance(dt, (int, float)) or isinstance(dt, bool) or not math.isfinite(dt) or
+                abs(dt - .002) > 1e-12 or not isinstance(sim_time, (int, float)) or
+                isinstance(sim_time, bool) or not math.isfinite(sim_time) or
+                abs(sim_time - row["native_physics_step_count"] * dt) > 1e-9):
+            raise ValueError("declared camera timing differs from actual 2ms native steps")
+        if previous is not None:
+            if (row["native_physics_step_count"] - previous["native_physics_step_count"] != 33 or
+                    row["camera_frame_counter"] <= previous["camera_frame_counter"]):
+                raise ValueError("declared camera frame cadence is missing, duplicated or reordered")
+            if row.get("profile_name") == previous.get("profile_name"):
+                if row["episode_id"] == previous["episode_id"]:
+                    if row["episode_control_steps"] != previous["episode_control_steps"] + 1:
+                        raise ValueError("declared camera episode control steps are not consecutive")
+                elif row["episode_id"] <= previous["episode_id"] or row["episode_control_steps"] != 1:
+                    raise ValueError("declared camera episode reset identity is not monotonic")
+        payload = path.read_bytes()
+        if (type(row.get("bytes")) is not int or len(payload) != row["bytes"] or file_hash(path) != row.get("sha256") or
+                payload[:8] != b"\x89PNG\r\n\x1a\n" or payload[12:16] != b"IHDR" or len(payload) < 24 or
+                struct.unpack(">II", payload[16:24]) != (640, 480)):
+            raise ValueError("declared camera original PNG bytes, SHA256 or dimensions differ")
+        previous = row
+    return frames, ledger, header, rows
+
+
+def _encode_declared_video(frames, target, first, last, run_dir):
+    with (Path(run_dir) / "logs/native_video_encoding.log").open("ab") as log:
+        subprocess.run(["ffmpeg", "-nostdin", "-n", "-v", "error", "-framerate", "500/33",
+            "-start_number", str(first), "-i", str(frames / "frame_%06d.png"), "-frames:v", str(last-first),
+            "-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p", str(target)],
+            stdout=log, stderr=subprocess.STDOUT, check=True, timeout=60)
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+        "-show_entries", "stream=nb_read_frames,r_frame_rate,width,height", "-of", "json", str(target)],
+        capture_output=True, text=True, check=True, timeout=15)
+    stream = json.loads(probe.stdout)["streams"][0]
+    if (int(stream["nb_read_frames"]) != last-first or stream["r_frame_rate"] != "500/33" or
+            [stream["width"], stream["height"]] != [640, 480]):
+        raise ValueError("declared camera encoded frame count, dimensions or frame rate differs")
+    return {"path": str(target), "sha256": file_hash(target), "bytes": target.stat().st_size,
+            "decoded_frames": int(stream["nb_read_frames"]), "encoded_fps": stream["r_frame_rate"]}
+
+
+def _declared_profile_segments(rows, profile, env):
+    """Use (environment, episode) quota identities; never infer scoring from a clip."""
+    first, last = profile["first_video_frame"], profile["last_video_frame_exclusive"]
+    scored, excluded = [], []
+    for key, destination in (("scored_episode_ids", scored), ("excluded_episode_ids", excluded)):
+        values = profile.get(key)
+        if not isinstance(values, list):
+            raise ValueError("declared camera profile is missing its explicit episode quota identities")
+        for identity in values:
+            if (not isinstance(identity, list) or len(identity) != 2 or
+                    any(type(value) is not int or value < 0 for value in identity) or tuple(identity) in destination):
+                raise ValueError("declared camera profile contains invalid or duplicate episode quota identities")
+            destination.append(tuple(identity))
+    if set(scored) & set(excluded):
+        raise ValueError("an episode cannot be both scored and quota-excluded")
+    segments = []
+    for index in range(first, last):
+        row = rows[index]
+        if row.get("profile_name") != profile["profile"]["name"]:
+            raise ValueError("declared camera frame profile differs from its native report range")
+        identity = (env, row["episode_id"])
+        membership = "scored" if identity in scored else "quota_excluded" if identity in excluded else "unscored_or_incomplete"
+        if not segments or segments[-1]["episode_id"] != identity[1]:
+            segments.append({"camera_env_id": env, "episode_id": identity[1], "quota_membership": membership,
+                "scored_for_profile": membership == "scored", "first_source_frame": index,
+                "first_native_physics_step": row["native_physics_step_count"],
+                "first_episode_control_step": row["episode_control_steps"],
+                "scoring_identity_source": "native_report.profiles.scored_episode_ids/excluded_episode_ids"})
+        segment = segments[-1]
+        segment.update(last_source_frame_exclusive=index+1,
+            last_native_physics_step=row["native_physics_step_count"],
+            last_episode_control_step=row["episode_control_steps"])
+    expected_scored = {identity for identity in scored if identity[0] == env}
+    if expected_scored != {(env, segment["episode_id"]) for segment in segments if segment["scored_for_profile"]}:
+        raise ValueError("declared camera clip omits a scored episode for its environment")
+    return segments
+
+
+def _package_declared_eval_videos(output, run_dir, status_paths):
+    videos = []
+    report_path = Path(output) / "native_report.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict):
+            raise ValueError("native camera report must be a JSON object")
+    except (OSError, ValueError) as exc:
+        report = {"video_recording_report_error": str(exc)}
+    for status_path in status_paths:
+        environment = status_path.parent
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            if not isinstance(status, dict):
+                raise ValueError("native camera status must be a JSON object")
+            declaration = status["video_recording"]
+            ids = _declared_video_ids(declaration, int(environment.name.removeprefix("environment_")))
+            if report.get("video_recording") != declaration:
+                raise ValueError("native report and camera status recording declarations differ")
+            cameras = status["cameras"]
+            if (not isinstance(cameras, list) or
+                    any(not isinstance(camera, dict) or type(camera.get("camera_env_id")) is not int for camera in cameras) or
+                    [camera.get("camera_env_id") for camera in cameras] != ids):
+                raise ValueError("camera status identities/order differ from the explicit recording declaration")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            videos.append({"encoded": False, "video_recording": report.get("video_recording"),
+                           "status_path": str(status_path), "error": str(exc)})
+            continue
+        native_steps = None
+        for camera in cameras:
+            env = camera["camera_env_id"]
+            row = {"camera_env_id": env, "video_recording": declaration,
+                   "source": "actual native Camera RGB", "simulation_fps": "500/33", "encoded": False,
+                   "complete": False, "capture_failure": camera.get("failure"), "profile_clips": [],
+                   "status_path": str(status_path), "status_sha256": file_hash(status_path)}
+            try:
+                frames, ledger, header, entries = _declared_camera_frames(environment, status, camera, declaration)
+                steps = [entry["native_physics_step_count"] for entry in entries]
+                if native_steps is not None and steps != native_steps:
+                    raise ValueError("declared cameras do not share the same native frame-set times")
+                native_steps = steps
+                row.update(frames=len(entries), frame_directory=str(frames), frame_ledger=str(ledger),
+                    frame_ledger_sha256=file_hash(ledger), camera_header=header,
+                    raw_RGB_source_frames_unmodified=True, frame_set_indices=list(range(len(entries))))
+                row.update(_encode_declared_video(frames, frames.parent / ("evaluation_env" + str(env) + ".mp4"),
+                                                 0, len(entries), run_dir), encoded=True)
+                if report.get("stage") != "rl-diagnose":
+                    raise ValueError("declared multi-environment camera packaging requires diagnostic profile quota provenance")
+                previous = 0
+                for profile in report.get("profiles", []):
+                    name = profile["profile"]["name"]
+                    if not name or any(c not in "abcdefghijklmnopqrstuvwxyz_0123456789" for c in name):
+                        raise ValueError("invalid diagnostic video profile name")
+                    first, last = profile["first_video_frame"], profile["last_video_frame_exclusive"]
+                    if (type(first) is not int or type(last) is not int or first != previous or
+                            not 0 <= first < last <= len(entries) or last-first != profile["control_steps"]):
+                        raise ValueError("declared diagnostic frame-set profile range is invalid or incomplete")
+                    segments = _declared_profile_segments(entries, profile, env)
+                    clip = _encode_declared_video(frames, frames.parent / ("evaluation_env" + str(env) + "_" + name + ".mp4"),
+                                                  first, last, run_dir)
+                    row["profile_clips"].append({**clip, "camera_env_id": env, "profile": name,
+                        "first_source_frame": first, "last_source_frame_exclusive": last, "segments": segments,
+                        "raw_RGB_source_frames_unmodified": True,
+                        "encoding": "lossy H.264 CRF20; unmodified camera PNG source, no overlays"})
+                    previous = last
+                if previous != len(entries):
+                    raise ValueError("declared camera profile ranges do not cover the complete native frame sets")
+                if (camera.get("enabled") is not True or camera.get("failure") is not None or
+                        camera.get("all_control_frames_recorded") is not True or
+                        camera.get("expected_control_frames") != len(entries) or
+                        status.get("all_control_frames_recorded") is not True or status.get("failure") is not None):
+                    raise ValueError("declared camera capture is partial or failed; original evidence is retained")
+                row["complete"] = True
+            except (OSError, ValueError, KeyError, TypeError, IndexError, struct.error, subprocess.SubprocessError) as exc:
+                row["error"] = str(exc)
+            videos.append(row)
+    write_new_json(Path(run_dir) / "reports/native_eval_videos.json", {"videos": videos,
+        "scope": "explicitly declared native camera environments at shared frame-set times; per-environment episode quota provenance remains in original ledgers and clip segments"})
+    return videos
+
+
 def _package_eval_videos(output, run_dir):
     """Encode actual native RGB frames, preserving their original frame ledger."""
+    statuses = sorted(Path(output).glob("environment_*/evaluation_video_status.json"))
+    declared = []
+    for path in statuses:
+        try:
+            status = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(status, dict):
+                raise ValueError("native camera status must be a JSON object")
+            if status.get("video_recording") is not None:
+                declared.append(path)
+        except (OSError, ValueError, TypeError):
+            if (path.parent / "video").exists():
+                declared.append(path)
+    if declared:
+        return _package_declared_eval_videos(output, run_dir, declared)
+    report_path = Path(output) / "native_report.json"
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if isinstance(report, dict) and report.get("video_recording") is not None:
+                return _package_declared_eval_videos(output, run_dir, statuses)
+        except (OSError, ValueError, TypeError):
+            pass
     videos = []
     for frames in sorted(Path(output).glob("environment_*/rgb_frames")):
         paths = sorted(frames.glob("frame_*.png"))
@@ -218,6 +455,46 @@ def _diagnostic_video_delivery(videos, native, expected_profiles=None):
     if expected_profiles is None:
         from .rl_probe_protocol import RL_PROBE_DEFAULTS
         expected_profiles = RL_PROBE_DEFAULTS["profiles"]
+    if native.get("video_recording") is not None:
+        try:
+            declaration = native["video_recording"]
+            ids = _declared_video_ids(declaration)
+            if (native.get("video_evidence_complete") is not True or
+                    [video.get("camera_env_id") for video in videos] != ids):
+                return False
+            legacy_native = {**native, "video_recording": None}
+            for env, video in zip(ids, videos):
+                if (video.get("video_recording") != declaration or video.get("complete") is not True or
+                        "error" in video or video.get("raw_RGB_source_frames_unmodified") is not True or
+                        video.get("camera_header", {}).get("camera_env_id") != env or
+                        video.get("frame_set_indices") != list(range(video["decoded_frames"])) or
+                        not _diagnostic_video_delivery([video], legacy_native, expected_profiles)):
+                    return False
+                for clip, profile in zip(video["profile_clips"], native["profiles"]):
+                    if clip.get("camera_env_id") != env or not clip.get("segments"):
+                        return False
+                    identities = {(env, episode) for camera, episode in profile["scored_episode_ids"] if camera == env}
+                    excluded = {(env, episode) for camera, episode in profile["excluded_episode_ids"] if camera == env}
+                    actual = set()
+                    previous = clip["first_source_frame"]
+                    for segment in clip["segments"]:
+                        if (segment.get("camera_env_id") != env or segment["first_source_frame"] != previous or
+                                segment["last_source_frame_exclusive"] <= previous or
+                                segment["quota_membership"] not in ("scored", "quota_excluded", "unscored_or_incomplete")):
+                            return False
+                        identity = (env, segment["episode_id"])
+                        membership = "scored" if identity in identities else "quota_excluded" if identity in excluded else "unscored_or_incomplete"
+                        if (segment["quota_membership"] != membership or
+                                segment["scored_for_profile"] is not (membership == "scored")):
+                            return False
+                        if membership == "scored":
+                            actual.add(identity)
+                        previous = segment["last_source_frame_exclusive"]
+                    if previous != clip["last_source_frame_exclusive"] or actual != identities:
+                        return False
+            return True
+        except (ValueError, KeyError, TypeError):
+            return False
     if native.get("video_evidence_complete") is not True or len(videos) != 1:
         return False
     video = videos[0]

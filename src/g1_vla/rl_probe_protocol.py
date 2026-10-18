@@ -118,6 +118,7 @@ RL_PROBE_DEFAULTS = {
     "contact_domain_posture_guard": None,
     "contact_transition_control": None,
     "full_lift": None,
+    "video_recording": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -196,6 +197,21 @@ def _file_hash(path):
 
 def _is_sha(value):
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def validate_video_recording(value, num_envs):
+    """An explicit camera selection; it cannot select or reorder scored envs."""
+    if value is None:
+        return None
+    if (not isinstance(value,dict) or set(value)!={"version","env_ids"} or
+            value.get("version")!="g1_declared_multienv_native_rgb_v1" or
+            type(num_envs) is not int or not 1<=num_envs<=8):
+        raise ValueError("Native video recording requires the exact versioned camera declaration")
+    ids=value["env_ids"]
+    if (not isinstance(ids,list) or not ids or len(ids)>8 or
+            any(type(i) is not int or not 0<=i<num_envs for i in ids) or len(set(ids))!=len(ids)):
+        raise ValueError("Native video env_ids must be distinct original environment IDs in range")
+    return copy.deepcopy(value)
 
 
 def validate_probe_settings(value):
@@ -296,6 +312,12 @@ def validate_probe_settings(value):
             raise ValueError("Diagnostic protocol pins " + key)
     if result["profiles"] != profiles:
         raise ValueError("Diagnostics require exactly the declared profile_plan action/guard profiles in order")
+    recording=validate_video_recording(result.get("video_recording"),result["num_envs"])
+    if recording is None:
+        # Existing resolved settings and output fields remain byte-compatible.
+        result.pop("video_recording",None)
+    else:
+        result["video_recording"]=recording
     lead = result["guided_target_lead_max_rad"]
     if ((plan in ("four_way_v1", "compliant_pinch_v4", "physics_pinch_v5", "balanced_effort_v6") and lead is not None) or
             (plan in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3") and (type(lead) not in (int, float) or lead != .006))):
@@ -765,6 +787,8 @@ def verify_probe_reference(config, checkpoint_infos=None, current_audit=None):
     passing both actual checkpoint infos and its current source-tagged audit.
     """
     settings = validate_probe_settings(config.get("rl_diagnostics", {}))
+    if current_audit is not None and current_audit.get("video_recording")!=settings.get("video_recording"):
+        raise ValueError("Native camera recording differs from the declared original environment IDs")
     if settings["profile_plan"] == "balanced_effort_v6":
         return _verify_effort_probe_reference(config, settings, current_audit)
     manifest_path, manifest = _read_pinned(config, settings, "reference_manifest_path", "reference_manifest_sha256")

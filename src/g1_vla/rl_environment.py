@@ -1460,6 +1460,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     separation and normal data must all be available for independent success.
     """
     probe_profile = control_probe_profile(control_probe)
+    from .rl_probe_protocol import validate_video_recording
+    video_recording=validate_video_recording(config.get("rl_diagnostics",{}).get("video_recording"),num_envs)
+    if video_recording is not None and (probe_profile is None or not eval_mode or output_dir is None):
+        raise RLEnvironmentError("Declared multi-environment RGB is a standalone diagnostic recording only")
     if probe_profile is not None and (not eval_mode or output_dir is None or num_envs > 8):
         raise RLEnvironmentError("control diagnostics require standalone evaluation, output and at most eight environments")
     settings = resolve_settings(config)
@@ -1625,8 +1629,15 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._table_contact_channel = TableContactChannel()
             self._standalone_video = bool(eval_mode)
             self._evaluation_camera = None
+            self._video_recording = video_recording
+            if video_recording is not None:
+                self._evaluation_cameras = {}
+                self._declared_video_streams = {}
             self._video_status = {"requested": bool(eval_mode), "enabled": False,
                                   "frames": 0, "failure": None, "camera_scope": "fixed external env0 audit view"}
+            if video_recording is not None:
+                self._video_status.update(video_recording=video_recording,cameras=[],
+                    camera_scope="fixed_external_views_of_declared_original_environment_ids")
             self._video_manifest = None
             self._last_video_native_step = None
             self._last_camera_frame = None
@@ -1707,6 +1718,21 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                           target_world_m=target.detach().cpu().tolist(),
                                           camera_scope="fixed external env0 pinch closeup" if pinch_closeup else "fixed external env0 audit view",
                                           camera_view_protocol="g1_pinch_closeup_env0_v1" if pinch_closeup else "g1_overview_env0_v1")
+            if video_recording is not None:
+                pinch_closeup=self._control_probe_profile["name"] in (
+                    "compliant_pinch_pose_hold","physics_pinch_pose_hold","balanced_effort_pose_hold")
+                eye_offset=[.635,-.262,1.045] if pinch_closeup else [1.05,-.65,1.30]
+                target_offset=[.32,.055,.82] if pinch_closeup else [.35,.055,.80]
+                for env_id in video_recording["env_ids"]:
+                    eye=self.scene.env_origins[env_id]+torch.tensor(eye_offset,device=self.device)
+                    target=self.scene.env_origins[env_id]+torch.tensor(target_offset,device=self.device)
+                    self._evaluation_cameras[env_id].set_world_poses_from_view(eye[None],target[None])
+                    self._video_status["cameras"].append({"camera_env_id":env_id,"enabled":True,"frames":0,"failure":None,
+                        "frame_directory":"video/env_"+str(env_id)+"/rgb_frames",
+                        "frame_ledger":"video/env_"+str(env_id)+"/video_frames.jsonl",
+                        "eye_world_m":eye.detach().cpu().tolist(),"target_world_m":target.detach().cpu().tolist(),
+                        "camera_view_protocol":"g1_pinch_closeup_declared_env_v1" if pinch_closeup else "g1_overview_declared_env_v1"})
+                self._video_status["enabled"]=True
             self._action_ids = [self.robot.joint_names.index(name) for name in ACTION_JOINT_NAMES]
             if len(self.robot.joint_names) != 43 or set(self.robot.joint_names) != set(initial["joint_positions_rad"]):
                 raise RLEnvironmentError("converted asset does not contain the exact 43 robot joints")
@@ -1816,10 +1842,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     self._control_probe_stream = (output / "control_commands.jsonl").open("x", encoding="utf-8")
                 if eval_mode:
                     self._open_evaluation_recording()
-                    self._video_frame_dir = output / "rgb_frames"
-                    self._video_frame_dir.mkdir(exist_ok=False)
-                    self._video_manifest = (output / "video_frames.jsonl").open("x", encoding="utf-8")
-                    self._video_manifest.write(json.dumps({"event": "camera_header", "width": 640, "height": 480,
+                    if video_recording is not None:
+                        self._open_declared_video_recording()
+                    else:
+                        self._video_frame_dir = output / "rgb_frames"
+                        self._video_frame_dir.mkdir(exist_ok=False)
+                        self._video_manifest = (output / "video_frames.jsonl").open("x", encoding="utf-8")
+                        self._video_manifest.write(json.dumps({"event": "camera_header", "width": 640, "height": 480,
                                                           "fps_numerator": 500, "fps_denominator": 33,
                                                           "scope": "actual env0 pre-reset post-physics external camera; no policy image input",
                                                           "eye_world_m": self._video_status.get("eye_world_m"),
@@ -2001,12 +2030,20 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if self._standalone_video:
                 from isaaclab.sensors import Camera, CameraCfg
                 from isaaclab_physx.renderers.isaac_rtx_renderer_cfg import IsaacRtxRendererCfg
-                self._evaluation_camera = Camera(CameraCfg(
-                    prim_path="/World/RLEvaluationCamera", update_period=0.066,
-                    width=640, height=480, data_types=["rgb"],
-                    renderer_cfg=IsaacRtxRendererCfg(),
-                    spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, horizontal_aperture=32.0,
-                                                     clipping_range=(0.01, 20.0))))
+                if video_recording is None:
+                    self._evaluation_camera = Camera(CameraCfg(
+                        prim_path="/World/RLEvaluationCamera", update_period=0.066,
+                        width=640, height=480, data_types=["rgb"],
+                        renderer_cfg=IsaacRtxRendererCfg(),
+                        spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, horizontal_aperture=32.0,
+                                                         clipping_range=(0.01, 20.0))))
+                else:
+                    for env_id in video_recording["env_ids"]:
+                        self._evaluation_cameras[env_id]=Camera(CameraCfg(
+                            prim_path="/World/RLEvaluationCamera_env_"+str(env_id),update_period=.066,
+                            width=640,height=480,data_types=["rgb"],renderer_cfg=IsaacRtxRendererCfg(),
+                            spawn=sim_utils.PinholeCameraCfg(focal_length=24.,horizontal_aperture=32.,
+                                clipping_range=(.01,20.))))
                 # One global camera is updated explicitly. Registering it in
                 # the N-env scene would pass partial reset IDs > 0 to a camera
                 # with only one instance and corrupt its reset bookkeeping.
@@ -3914,6 +3951,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                                        "sim_time_s": int(self.sim.get_physics_step_count())*float(self.sim.get_physics_dt()),
                                                        **({"profile_name": self._control_probe_profile["name"]} if self._control_probe_enabled else {})}) + "\n")
                 self._video_manifest.flush()
+            if video_recording is not None and self._declared_video_streams:
+                reset_ids=set(env_ids.detach().cpu().tolist())
+                for camera_env_id in video_recording["env_ids"]:
+                    if camera_env_id in reset_ids:
+                        self._write_declared_video_event({"event":"episode_reset","env_id":camera_env_id,
+                            "episode_id":int(self._episode_ids[camera_env_id].item()),
+                            "next_frame_index":self._video_status["frames"],
+                            "native_physics_step_count":int(self.sim.get_physics_step_count()),
+                            "sim_time_s":int(self.sim.get_physics_step_count())*float(self.sim.get_physics_dt()),
+                            "profile_name":self._control_probe_profile["name"]},env_ids=[camera_env_id])
 
         def pop_episode_outcomes(self):
             result, self._outcomes = self._outcomes, []
@@ -4034,6 +4081,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                    "native_self_pair_readback": self._native_self_pair_diagnostic.summary()}
             self._write_control_probe(row)
             self._write_evaluation_row(row)
+            if video_recording is not None:
+                self._write_declared_video_event({**row,"profile_name":selected["name"]})
             if self._video_manifest:
                 self._video_manifest.write(json.dumps(_json_finite(_probe_payload(torch,
                     {**row, "profile_name": selected["name"]})), allow_nan=False)+"\n")
@@ -4133,7 +4182,105 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._next_action_origin = "measured_state_hold_request_through_shared_limits"
             return raw.clamp(-1.0, 1.0)
 
+        def _open_declared_video_recording(self):
+            """Create separate original-image ledgers; no physics identities change."""
+            for camera in self._video_status["cameras"]:
+                env_id=camera["camera_env_id"]
+                frame_dir=output/camera["frame_directory"]
+                frame_dir.mkdir(parents=True,exist_ok=False)
+                manifest=(output/camera["frame_ledger"]).open("x",encoding="utf-8")
+                self._declared_video_streams[env_id]={"frame_dir":frame_dir,"manifest":manifest,"last_camera_frame":None}
+                self._write_declared_video_event({"event":"camera_header","width":640,"height":480,
+                    "fps_numerator":500,"fps_denominator":33,"video_recording":video_recording,
+                    "scope":"actual_original_env_pre_reset_post_physics_external_RGB_no_policy_input",
+                    "eye_world_m":camera["eye_world_m"],"target_world_m":camera["target_world_m"],
+                    "control_probe":dict(self._control_probe_profile)},env_ids=[env_id])
+
+        def _write_declared_video_event(self,row,env_ids=None):
+            selected=self._video_recording["env_ids"] if env_ids is None else env_ids
+            for env_id in selected:
+                stream=self._declared_video_streams[env_id]["manifest"]
+                stream.write(json.dumps(_json_finite(_probe_payload(torch,{**row,"camera_env_id":env_id})),
+                    ensure_ascii=False,allow_nan=False)+"\n")
+                stream.flush()
+
+        def _capture_declared_evaluation_frames(self):
+            """Capture one synchronized frame set at a completed native boundary."""
+            if self._video_status["failure"]:
+                return
+            failed_env=None
+            try:
+                from PIL import Image
+                native_step=int(self.sim.get_physics_step_count())
+                if native_step==self._last_video_native_step:
+                    raise RLEnvironmentError("duplicate native physics step in declared camera frame set")
+                frame=int(self._video_status["frames"])
+                captured=[]
+                for camera_status in self._video_status["cameras"]:
+                    env_id=camera_status["camera_env_id"];failed_env=env_id
+                    if camera_status["frames"]!=frame:
+                        raise RLEnvironmentError("declared camera frame counters diverged")
+                    camera=self._evaluation_cameras[env_id]
+                    camera.update(dt=self.step_dt,force_recompute=True)
+                    rgb=tensor(camera.data.output["rgb"])
+                    if rgb.dtype!=torch.uint8 or tuple(rgb.shape[:3])!=(1,480,640) or rgb.shape[-1] not in (3,4):
+                        raise RLEnvironmentError("declared camera requires real640x480uint8RGB(A)")
+                    camera_frame=int(tensor(camera.frame)[0].item())
+                    previous=self._declared_video_streams[env_id]["last_camera_frame"]
+                    if previous is not None and camera_frame<=previous:
+                        raise RLEnvironmentError("declared camera measurement counter did not advance")
+                    captured.append((env_id,camera_status,camera_frame,rgb[0,:,:,:3].detach().cpu().numpy()))
+                if int(self.sim.get_physics_step_count())!=native_step:
+                    raise RLEnvironmentError("native physics advanced between cameras in a frame set")
+                if frame==0:
+                    memory={"scope":"after_all_declared_first_camera_RGB_readbacks_not_Torch_only_RTX_memory",
+                        "camera_count":len(captured),"camera_env_ids":list(self._video_recording["env_ids"]),
+                        "native_physics_step_count":native_step,"actual_memory_admission_not_inferred_from_pixel_size":True}
+                    if str(self.device).startswith("cuda") and torch.cuda.is_available():
+                        free,total=torch.cuda.mem_get_info(self.device)
+                        memory.update(device_free_bytes=int(free),device_total_bytes=int(total),
+                            torch_allocated_bytes=int(torch.cuda.memory_allocated(self.device)),
+                            torch_reserved_bytes=int(torch.cuda.memory_reserved(self.device)),
+                            torch_peak_allocated_bytes=int(torch.cuda.max_memory_allocated(self.device)),
+                            torch_peak_reserved_bytes=int(torch.cuda.max_memory_reserved(self.device)))
+                    else:
+                        memory["device_memory_unavailable_reason"]="CUDA_unavailable"
+                    self._video_status["first_frame_memory"]=memory
+                for env_id,camera_status,camera_frame,pixels in captured:
+                    failed_env=env_id;resources=self._declared_video_streams[env_id]
+                    path=resources["frame_dir"]/("frame_{:06d}.png".format(frame))
+                    Image.fromarray(pixels,mode="RGB").save(path)
+                    payload=path.read_bytes()
+                    self._write_declared_video_event({"event":"camera_frame","frame_index":frame,"path":path.name,
+                        "bytes":len(payload),"sha256":hashlib.sha256(payload).hexdigest(),
+                        "native_physics_step_count":native_step,"physics_samples":self._physics_samples,
+                        "actual_physics_dt_s":float(self.sim.get_physics_dt()),
+                        "sim_time_s":native_step*float(self.sim.get_physics_dt()),
+                        "episode_id":int(self._episode_ids[env_id].item()),
+                        "episode_control_steps":int(self.episode_length_buf[env_id].item()),
+                        "camera_frame_counter":camera_frame,"pre_reset":True,
+                        "cube_position_world_m":tensor(self.cube.data.root_pos_w)[env_id],
+                        "cube_quaternion_xyzw":tensor(self.cube.data.root_quat_w)[env_id],
+                        "profile_name":self._control_probe_profile["name"]},env_ids=[env_id])
+                    resources["last_camera_frame"]=camera_frame
+                    camera_status["frames"]=frame+1
+                self._video_status["frames"]=frame+1
+                self._last_video_native_step=native_step
+            except Exception as exc:
+                failure=type(exc).__name__+": "+str(exc)
+                self._video_status["failure"]=failure
+                for camera in self._video_status["cameras"]:
+                    if camera["camera_env_id"]==failed_env:camera["failure"]=failure
+                self._write_declared_video_event({"event":"camera_failure","failure":failure,
+                    "failed_camera_env_id":failed_env,"next_frame_index":self._video_status["frames"]})
+                if output:
+                    with (output/"evaluation_video_failure.json").open("x",encoding="utf-8") as stream:
+                        json.dump(self._video_status,stream,ensure_ascii=False,allow_nan=False)
+
         def _capture_evaluation_frame(self):
+            if getattr(self,"_video_recording",None) is not None:
+                self._capture_declared_evaluation_frames()
+                return
             if self._video_status["failure"] or not self._video_manifest:
                 return
             try:
@@ -4352,6 +4499,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             damping_status=self._relative_damping_small_status()
             if damping_status is not None:
                 audit["relative_damping_native_status"]=damping_status
+            if video_recording is not None:
+                audit["video_recording"]=video_recording
             return _json_finite(_probe_payload(torch, audit))
 
         def step_audit(self):
@@ -4431,16 +4580,29 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if getattr(self, "_video_manifest", None):
                 self._video_manifest.close()
                 self._video_manifest = None
+            if video_recording is not None:
+                for resources in self._declared_video_streams.values():
+                    resources["manifest"].close()
+                expected=self._physics_samples//33
+                for camera in self._video_status["cameras"]:
+                    camera["expected_control_frames"]=expected
+                    camera["all_control_frames_recorded"]=(camera["enabled"] and camera["failure"] is None and
+                        camera["frames"]==expected and expected>0)
             if output and hasattr(self, "_video_status"):
                 self._video_status["expected_control_frames"] = self._physics_samples // 33
                 self._video_status["all_control_frames_recorded"] = (
                     self._standalone_video and self._video_status["failure"] is None and
                     self._video_status["frames"] == self._physics_samples // 33 and self._video_status["frames"] > 0)
+                if video_recording is not None:
+                    self._video_status["all_control_frames_recorded"] &= all(
+                        camera["all_control_frames_recorded"] for camera in self._video_status["cameras"])
                 path = output / "evaluation_video_status.json"
                 if not path.exists():
                     with path.open("x", encoding="utf-8") as stream:
                         json.dump(self._video_status, stream, indent=2)
             self._evaluation_camera = None
+            if video_recording is not None:
+                self._evaluation_cameras.clear()
             super().close()
 
     return Environment()

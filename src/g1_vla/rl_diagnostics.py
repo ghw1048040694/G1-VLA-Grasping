@@ -464,6 +464,18 @@ class GuidedClosure:
         return result, evidence
 
 
+def _declared_video_complete_at_step(video,first_frame,steps,declaration):
+    """All selected cameras share one macro frame-set counter, not a sum."""
+    if (video.get("video_recording")!=declaration or video.get("failure") is not None or
+            video.get("enabled") is not True or video.get("frames")!=first_frame+steps):
+        return False
+    cameras=video.get("cameras")
+    if not isinstance(cameras,list) or [c.get("camera_env_id") for c in cameras]!=declaration["env_ids"]:
+        return False
+    return all(c.get("enabled") is True and c.get("failure") is None and
+        c.get("frames")==first_frame+steps for c in cameras)
+
+
 def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline, profile, saved_infos):
     from .rl_environment import RIGHT_HAND
     from .rl_ppo import (EvaluationQuota, _assert_finite, _environment_audit, _json_safe,
@@ -564,6 +576,13 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
         video = native.step_audit()["evaluation_video"]
         if video["failure"] is not None or not video["enabled"] or video["frames"] - first_frame != steps:
             raise RuntimeError("Diagnostic camera evidence is incomplete; physical results remain partial")
+        recording=settings.get("video_recording")
+        if recording is not None:
+            if not _declared_video_complete_at_step(video,first_frame,steps,recording):
+                raise RuntimeError("Declared original-environment camera frame set is incomplete; original outcomes remain partial")
+            if first_frame==0 and steps==1:
+                streams["memory"].write({"num_envs":settings["num_envs"],"phase":"after_first_declared_camera_frame_set",
+                    "recorded_camera_env_ids":recording["env_ids"],"memory":video.get("first_frame_memory")})
     after = module_state_sha256(actor, torch) if actor is not None else "not_loaded_controller_only"
     if before != after:
         raise RuntimeError("Diagnostic inference changed actor weights or normalization")
@@ -598,6 +617,8 @@ def run_native_diagnostics(config, run_dir):
               "four_way_comparison_complete": False,
               "reward_used_as_success": False, "original_focus_or_20_acceptance": False,
               "started_utc": datetime.now(timezone.utc).isoformat(), "settings": settings}
+    if settings.get("video_recording") is not None:
+        result["video_recording"]=copy.deepcopy(settings["video_recording"])
     streams = _new_streams(run_dir)
     streams["intent"] = EvidenceStream(run_dir / "control_intent.jsonl")
     app, environment, torch = None, None, None

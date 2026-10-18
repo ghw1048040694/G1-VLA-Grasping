@@ -776,7 +776,8 @@ def _common_thumb_domain_interval(t, q, lower, upper, null, maximum_margin):
     ratios = t.where(denominator > 0, ratios, t.full_like(ratios, float("inf")))
     raw_margin = ratios.amin(dim=(-1, -2))
     base_feasible = valid & t.isfinite(raw_margin) & (raw_margin >= 0)
-    maximum = t.full_like(raw_margin, maximum_margin)
+    maximum = (maximum_margin.to(dtype=raw_margin.dtype, device=raw_margin.device)
+               if t.is_tensor(maximum_margin) else t.full_like(raw_margin, maximum_margin))
     ideal_margin = t.minimum(raw_margin, maximum)
     ideal_margin = t.where(base_feasible, ideal_margin, t.zeros_like(ideal_margin))
     numerical_inset = 32*t.finfo(t.float64).eps*t.maximum(
@@ -819,7 +820,7 @@ def _common_thumb_domain_interval(t, q, lower, upper, null, maximum_margin):
 
 def _common_thumb_domain_guard_torque(t, declaration, *, q, a, point_jacobian, lower, upper,
                                      physical_safe, safe, tracking, normal_available,
-                                     physical_loaded, overforce):
+                                     physical_loaded, overforce, interior_preservation=None):
     n = q.shape[0]
     missing = [name for name, value in (("contact_point_jacobian_world_m", point_jacobian),
         ("actual_domain_lower_hand_rad", lower), ("actual_domain_upper_hand_rad", upper),
@@ -850,8 +851,58 @@ def _common_thumb_domain_guard_torque(t, declaration, *, q, a, point_jacobian, l
     rank = (singular >= declaration["svd_tolerance_m"]).sum(-1)
     null = vh[:, 2, :]
     projector = null[:, :, None]*null[:, None, :]
+    maximum_margin = declaration["activation_margin_rad"]
+    preservation_evidence = None
+    if "interior_reserve_capture" in declaration:
+        if interior_preservation is None:
+            raise ValueError("Interior preservation requires explicit current controller state")
+        state = interior_preservation
+        # This stores a scalar posture reference, never a contact Jacobian.
+        # Tracking can pause effort without replacing an existing reserve.
+        current_contact_safe = (finite & bounds_valid & safe & normal_available.all(-1) &
+            physical_loaded.all(-1) & physical_safe & ~overforce.any(-1))
+        clear = state["episode_changed"] | state["unsafe"] | ~current_contact_safe
+        capture_gate = current_contact_safe & tracking & (rank == 2)
+        raw_minimum_margin = t.minimum(q[:, :3].to(t.float64)-lower[:, :3].to(t.float64),
+            upper[:, :3].to(t.float64)-q[:, :3].to(t.float64)).amin(-1)
+        # Invalid observations never enter the reference/evidence as NaNs.
+        raw_minimum_margin = t.where(finite & bounds_valid, raw_minimum_margin,
+                                     t.zeros_like(raw_minimum_margin))
+        captured = state["captured"].clone()
+        reserve = state["reserve_rad"].clone()
+        capture_sample = state["capture_native_sample"].clone()
+        capture_episode = state["capture_episode"].clone()
+        capture = t.zeros_like(captured)
+        applied_clear = t.zeros_like(clear)
+        if not state["duplicate"]:
+            applied_clear = clear
+            captured &= ~clear
+            reserve = t.where(clear, t.full_like(reserve, declaration["interior_reserve_floor_rad"]), reserve)
+            capture_sample = t.where(clear, t.full_like(capture_sample, -1), capture_sample)
+            capture_episode = t.where(clear, t.full_like(capture_episode, -1), capture_episode)
+            capture = capture_gate & ~captured
+            reserve = t.where(capture, raw_minimum_margin.clamp_min(declaration["interior_reserve_floor_rad"]), reserve)
+            captured |= capture
+            capture_sample = t.where(capture, t.full_like(capture_sample, state["sample_id"]), capture_sample)
+            capture_episode = t.where(capture, state["episode_id"], capture_episode)
+        maximum_margin = t.where(captured, reserve,
+            t.full_like(reserve, declaration["activation_margin_rad"]))
+        preservation_evidence = {
+            "current_contact_safety_complete": current_contact_safe,
+            "capture_gate": capture_gate, "capture_applied_by_environment": capture,
+            "clear_requested_by_environment": clear, "clear_applied_by_environment": applied_clear,
+            "captured_before": state["captured"].clone(), "captured": captured,
+            "reserve_before_rad": state["reserve_rad"].clone(), "captured_reserve_rad": reserve,
+            "capture_native_sample": capture_sample, "capture_episode_id": capture_episode,
+            "current_original_thumb3_minimum_margin_rad": raw_minimum_margin,
+            "requested_common_interior_margin_rad": maximum_margin,
+            "duplicate_does_not_mutate_reference": state["duplicate"],
+            "tracking_pause_does_not_recapture_lower_reserve": True,
+            "stored_scalar_posture_reference_not_contact_geometry": True,
+            "captured_reserve_is_control_target_not_physical_acceptance": True,
+            "original_domain_and_all_acceptance_gates_unchanged": True}
     scalar, interval = _common_thumb_domain_interval(t, q[:, :3], lower[:, :3], upper[:, :3],
-        null, declaration["activation_margin_rad"])
+        null, maximum_margin)
     gate = (finite & bounds_valid & (rank == 2) & safe & tracking & normal_available.all(-1) &
         physical_loaded.all(-1) & physical_safe & ~overforce.any(-1) & interval["common_interval_feasible"])
     restoring = declaration["restoring_stiffness_nm_rad"]*scalar.to(q.dtype)
@@ -884,12 +935,14 @@ def _common_thumb_domain_guard_torque(t, declaration, *, q, a, point_jacobian, l
         "geometric_projection_is_not_dynamic_force_isolation": True,
         "common_geometric_target_not_guaranteed_actual_motion_or_domain_invariance": True,
         "all_original_acceptance_gates_unchanged": True}
+    if preservation_evidence is not None:
+        evidence["interior_preservation"] = preservation_evidence
     return torque, evidence
 
 
 def _contact_domain_guard_torque(t, declaration, *, q, a, point_jacobian, lower, upper,
                                 physical_safe, safe, tracking, normal_available,
-                                physical_loaded, overforce):
+                                physical_loaded, overforce, interior_preservation=None):
     """Bounded thumb-only posture torque in the current normal-and-Z nullspace.
 
     This geometric projection does not prove dynamic force decoupling or keep
@@ -900,7 +953,8 @@ def _contact_domain_guard_torque(t, declaration, *, q, a, point_jacobian, lower,
         return _common_thumb_domain_guard_torque(t, declaration, q=q, a=a,
             point_jacobian=point_jacobian, lower=lower, upper=upper, physical_safe=physical_safe,
             safe=safe, tracking=tracking, normal_available=normal_available,
-            physical_loaded=physical_loaded, overforce=overforce)
+            physical_loaded=physical_loaded, overforce=overforce,
+            interior_preservation=interior_preservation)
     n = q.shape[0]
     missing = [name for name, value in (("contact_point_jacobian_world_m", point_jacobian),
         ("actual_domain_lower_hand_rad", lower), ("actual_domain_upper_hand_rad", upper),
@@ -1352,6 +1406,16 @@ class BalancedEffortGraspController:
                 episode_id.dtype not in (torch.int32, torch.int64)):
             raise ValueError("Balanced effort requires integer episode identities")
         self.ids = episode_id.clone()
+        if self.domain_posture_guard is not None and "interior_reserve_capture" in self.domain_posture_guard:
+            self.guard_interior_captured = torch.zeros(self.num_envs, dtype=torch.bool, device=self.seed.device)
+            self.guard_interior_reserve_rad = torch.full((self.num_envs,),
+                self.domain_posture_guard["interior_reserve_floor_rad"], dtype=torch.float64, device=self.seed.device)
+            self.guard_interior_capture_sample = torch.full_like(episode_id, -1)
+            self.guard_interior_capture_episode = torch.full_like(episode_id, -1)
+            self.guard_previous_position_rad = self.seed.clone()
+            self.guard_previous_position_valid = torch.zeros_like(self.guard_interior_captured)
+            self.guard_previous_position_sample_id = None
+            self.guard_previous_position_episode = episode_id.clone()
         self.reference = self.seed.clone()
         self.contact_latched = torch.zeros(self.num_envs, 3, dtype=torch.bool, device=self.seed.device)
         self.previous_normal_available = torch.zeros_like(self.contact_latched)
@@ -1658,12 +1722,53 @@ class BalancedEffortGraspController:
         posture = t.where(overforce_joint, t.zeros_like(posture), posture)
         guard_evidence = None
         if self.domain_posture_guard is not None:
+            preservation_state = None
+            if "interior_reserve_capture" in self.domain_posture_guard:
+                preservation_state = {"captured": self.guard_interior_captured,
+                    "reserve_rad": self.guard_interior_reserve_rad,
+                    "capture_native_sample": self.guard_interior_capture_sample,
+                    "capture_episode": self.guard_interior_capture_episode,
+                    "episode_changed": changed, "unsafe": unsafe, "duplicate": duplicate,
+                    "sample_id": sample_id, "episode_id": episode_id}
             guard_torque, guard_evidence = _contact_domain_guard_torque(t, self.domain_posture_guard,
                 q=q, a=a, point_jacobian=contact_point_jacobian_world_m,
                 lower=actual_domain_lower_hand_rad, upper=actual_domain_upper_hand_rad,
                 physical_safe=physical_contact_safe, safe=safe, tracking=tracking,
                 normal_available=normal_available, physical_loaded=group_physical_loaded,
-                overforce=overforce)
+                overforce=overforce, interior_preservation=preservation_state)
+            if preservation_state is not None:
+                reserve_evidence = guard_evidence["interior_preservation"]
+                position_pair_current = (fresh & finite & ~unsafe & self.guard_previous_position_valid &
+                    (self.guard_previous_position_episode == episode_id) &
+                    (self.guard_previous_position_sample_id == sample_id-1))
+                position_difference = t.where(position_pair_current[:, None],
+                    (q-self.guard_previous_position_rad)/dt, t.zeros_like(q))
+                guard_evidence["position_difference_observation"] = {
+                    "same_episode_consecutive_native_sample": position_pair_current,
+                    "current_native_sample": sample_id,
+                    "previous_native_sample": self.guard_previous_position_sample_id,
+                    "previous_position_episode_id": self.guard_previous_position_episode.clone(),
+                    "episode_id": episode_id.clone(), "physics_dt_s": dt,
+                    "current_native_state_finite": finite.clone(),
+                    "invalid_native_state_values_are_sanitized_and_not_a_current_pair": True,
+                    "previous_position_hand_rad": self.guard_previous_position_rad.clone(),
+                    "current_position_hand_rad": q.clone(),
+                    "position_difference_velocity_hand_rad_s": position_difference,
+                    "sdk_joint_velocity_hand_rad_s": qd.clone(),
+                    "position_difference_minus_sdk_velocity_hand_rad_s":
+                        t.where(position_pair_current[:, None], position_difference-qd, t.zeros_like(q)),
+                    "position_difference_is_telemetry_only_no_control_or_acceptance_substitution": True,
+                    "duplicate_does_not_advance_previous_position": duplicate,
+                    "position_difference_and_sdk_velocity_may_differ_under_native_constraints": True}
+                if not duplicate:
+                    self.guard_interior_captured = reserve_evidence["captured"].clone()
+                    self.guard_interior_reserve_rad = reserve_evidence["captured_reserve_rad"].clone()
+                    self.guard_interior_capture_sample = reserve_evidence["capture_native_sample"].clone()
+                    self.guard_interior_capture_episode = reserve_evidence["capture_episode_id"].clone()
+                    self.guard_previous_position_rad = q.detach().clone()
+                    self.guard_previous_position_valid = finite & ~unsafe
+                    self.guard_previous_position_sample_id = sample_id
+                    self.guard_previous_position_episode = episode_id.clone()
             posture = posture+guard_torque
         transition_guard_torque = None
         if self.contact_transition is not None:

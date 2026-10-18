@@ -84,6 +84,16 @@ _CONTACT_DOMAIN_POSTURE_GUARD_V2.update({
     "interval_solver": "analytic_pairwise_margin_float64_v1",
     "minimum_component_gate_scope": "unchanged_legacy_partial_thumb2_recovery_only",
 })
+_CONTACT_DOMAIN_POSTURE_GUARD_V3 = deepcopy(_CONTACT_DOMAIN_POSTURE_GUARD_V2)
+_CONTACT_DOMAIN_POSTURE_GUARD_V3.update({
+    "version": "g1_contact_domain_nullspace_posture_guard_v3_all_loaded_interior_preservation",
+    "control_target": "captured_first_safe_all_loaded_margin_capped_by_current_common_feasibility",
+    "interior_reserve_capture": "first_fresh_safe_all_groups_physically_loaded_original_thumb3_minimum_margin",
+    "interior_reserve_floor_rad": .006,
+    "interior_reserve_reset": "episode_or_current_contact_safety_loss_or_unsafe_discontinuity",
+    "guard_position_difference_telemetry": "same_epoch_consecutive_native_2ms_not_control_feedback",
+    "interior_reference_is_not_acceptance_or_cached_geometry": True,
+})
 _BALANCED_DEFAULTS = {
     "version": "g1_balanced_normal_and_object_support_effort_grasp_v2",
     "kind": "explicit_joint_effort_from_current_contact_normal_jacobian",
@@ -393,9 +403,10 @@ def validate_contact_domain_posture_guard(value):
     """
     if value is None:
         return None
-    expected = (_CONTACT_DOMAIN_POSTURE_GUARD_V2 if isinstance(value, dict) and
-                value.get("version") == _CONTACT_DOMAIN_POSTURE_GUARD_V2["version"]
-                else _CONTACT_DOMAIN_POSTURE_GUARD)
+    versions = {v["version"]: v for v in (_CONTACT_DOMAIN_POSTURE_GUARD,
+        _CONTACT_DOMAIN_POSTURE_GUARD_V2, _CONTACT_DOMAIN_POSTURE_GUARD_V3)}
+    version = value.get("version") if isinstance(value, dict) else None
+    expected = versions.get(version, _CONTACT_DOMAIN_POSTURE_GUARD) if type(version) is str else _CONTACT_DOMAIN_POSTURE_GUARD
     _exact(value, expected, "contact_domain_posture_guard")
     return deepcopy(value)
 
@@ -406,6 +417,8 @@ def contact_domain_posture_guard_contract(version=None):
         return deepcopy(_CONTACT_DOMAIN_POSTURE_GUARD)
     if version == _CONTACT_DOMAIN_POSTURE_GUARD_V2["version"]:
         return deepcopy(_CONTACT_DOMAIN_POSTURE_GUARD_V2)
+    if version == _CONTACT_DOMAIN_POSTURE_GUARD_V3["version"]:
+        return deepcopy(_CONTACT_DOMAIN_POSTURE_GUARD_V3)
     raise ValueError("Unknown explicitly selected contact-domain guard version")
 
 

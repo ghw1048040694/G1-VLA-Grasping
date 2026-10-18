@@ -12,6 +12,19 @@ RSL = TORCH and importlib.util.find_spec("rsl_rl") is not None and importlib.uti
 
 
 class DiagnosticVideoDeliveryTests(unittest.TestCase):
+    def test_multicamera_step_counter_is_frame_sets_with_all_declared_envs_complete(self):
+        from g1_vla.rl_diagnostics import _declared_video_complete_at_step
+        declaration={"version":"g1_declared_multienv_native_rgb_v1","env_ids":list(range(8))}
+        video={"video_recording":declaration,"enabled":True,"failure":None,"frames":3,
+            "cameras":[{"camera_env_id":i,"enabled":True,"failure":None,"frames":3} for i in range(8)]}
+        self.assertTrue(_declared_video_complete_at_step(video,0,3,declaration))
+        summed=copy.deepcopy(video);summed["frames"]=24
+        self.assertFalse(_declared_video_complete_at_step(summed,0,3,declaration))
+        for field,value in (("frames",2),("failure","readback_failed"),("enabled",False),("camera_env_id",0)):
+            broken=copy.deepcopy(video);broken["cameras"][4][field]=value
+            self.assertFalse(_declared_video_complete_at_step(broken,0,3,declaration),field)
+        self.assertFalse(_declared_video_complete_at_step({**video,"cameras":video["cameras"][:-1]},0,3,declaration))
+
     def test_missing_or_partial_profile_clips_cannot_pass_delivery(self):
         from g1_vla.rl_teacher import _diagnostic_video_delivery
         profiles = [{"profile": profile, "control_steps": 91,

@@ -74,6 +74,28 @@ def fixture():
 
 
 class ProbeSettingsTests(unittest.TestCase):
+    def test_declared_recording_selects_camera_ids_without_changing_evaluation_budget(self):
+        declaration={"version":"g1_declared_multienv_native_rgb_v1","env_ids":list(range(8))}
+        legacy=probe.validate_probe_settings({})
+        self.assertNotIn("video_recording",legacy)
+        self.assertEqual(probe.validate_probe_settings({"video_recording":None}),legacy)
+        selected=probe.validate_probe_settings({"video_recording":declaration})
+        self.assertEqual(selected.pop("video_recording"),declaration)
+        self.assertEqual(selected,legacy)
+        got=probe.validate_video_recording(declaration,8);got["env_ids"][0]=7
+        self.assertEqual(declaration["env_ids"],list(range(8)))
+        for ids in ([],[0,0],[8],[-1],[True],[1.0],"all",list(range(9))):
+            with self.subTest(ids=ids),self.assertRaises(ValueError):
+                probe.validate_video_recording({**declaration,"env_ids":ids},8)
+        for value in ({**declaration,"width":640},{**declaration,"version":"unversioned"}):
+            with self.assertRaises(ValueError):probe.validate_video_recording(value,8)
+
+    def test_current_native_recording_must_match_explicit_camera_selection(self):
+        declaration={"version":"g1_declared_multienv_native_rgb_v1","env_ids":list(range(8))}
+        with self.assertRaisesRegex(ValueError,"camera recording"):
+            probe.verify_probe_reference({"rl_diagnostics":{"video_recording":declaration}},
+                current_audit={"video_recording":{**declaration,"env_ids":[0]}})
+
     def test_import_does_not_import_tensor_or_simulator_packages(self):
         code = ("import sys; import g1_vla.rl_probe_protocol; "
                 "assert not any(x.split('.')[0] in ('torch','isaaclab','isaacsim') for x in sys.modules)")
@@ -161,6 +183,36 @@ class FullLiftProbeSettingsTests(unittest.TestCase):
         self.assertIsNone(settings["full_lift"])
         self.assertIsNone(settings["contact_transition_control"])
         self.assertEqual(settings["max_control_steps"], 91)
+
+    def test_interior_preservation_guard_is_an_explicit_compatible_controller_version(self):
+        from g1_vla.rl_effort_protocol import (contact_domain_posture_guard_contract,
+            contact_transition_control_contract, full_lift_protocol_contract)
+        value = self.settings()
+        original = copy.deepcopy(value)
+        version = "g1_contact_domain_nullspace_posture_guard_v3_all_loaded_interior_preservation"
+        value["contact_domain_posture_guard"] = contact_domain_posture_guard_contract(version)
+        validated = probe.validate_probe_settings(value)
+        self.assertEqual(validated["contact_domain_posture_guard"]["version"], version)
+        for field in ("contact_transition_control", "effort_grasp_controller", "episodes_per_env", "max_control_steps"):
+            self.assertEqual(validated[field], original[field])
+        for field, changed in (("restoring_stiffness_nm_rad", 3.), ("maximum_guard_joint_torque_nm", .008),
+                               ("interior_reserve_floor_rad", .012)):
+            candidate = copy.deepcopy(value)
+            candidate["contact_domain_posture_guard"][field] = changed
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                probe.validate_probe_settings(candidate)
+        full = self.settings(True, "full_lift8_v2")
+        full["contact_domain_posture_guard"] = contact_domain_posture_guard_contract(version)
+        full["contact_transition_control"] = contact_transition_control_contract(
+            "g1_coordinated_contact_transition_v3_relative_viscous_preload")
+        full["full_lift"] = full_lift_protocol_contract("g1_contact_qualified_full_lift_v4_native_arm_16s")
+        full["effort_grasp_controller"]["material"].update(variant="finger_compliant_v5",
+            compliant_contact_stiffness_n_m=1000., compliant_contact_damping_ns_m=.8)
+        validated = probe.validate_probe_settings(full)
+        self.assertEqual(validated["contact_domain_posture_guard"], full["contact_domain_posture_guard"])
+        self.assertEqual(validated["full_lift"]["episode_length_s"], 16.)
+        self.assertFalse(validated["training_allowed"])
+        self.assertEqual(validated["optimizer_steps"], 0)
 
     def test_relative_damping_requires_original_compliant_pads_and_material_values(self):
         from g1_vla.rl_effort_protocol import contact_transition_control_contract

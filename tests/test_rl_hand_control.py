@@ -2329,5 +2329,220 @@ class CommonThumbIntervalGuardTests(unittest.TestCase):
         self.assertEqual(contact_domain_posture_guard_contract(self.VERSION)["hand_joint_indices"], [0, 1, 2])
 
 
+@unittest.skipUnless(TORCH, "real torch is required for all-loaded interior preservation")
+class AllLoadedInteriorPreservationGuardTests(unittest.TestCase):
+    step = BalancedEffortGraspTests.step
+    set_null = CommonThumbIntervalGuardTests.set_null
+    make_controller = CommonThumbIntervalGuardTests.make_controller
+    guard = CommonThumbIntervalGuardTests.guard
+    VERSION = "g1_contact_domain_nullspace_posture_guard_v3_all_loaded_interior_preservation"
+
+    def setUp(self):
+        CommonThumbIntervalGuardTests.setUp(self)
+        self.lower[0, :3] = self.t.tensor([-.030, -.024, -.028])
+        self.lower[1, :3] = self.t.tensor([-.040, -.028, -.035])
+        self.make_controller()
+
+    def test_first_fresh_all_loaded_captures_independent_reserve_before_preload_drift(self):
+        self.assertFalse(self.controller.guard_interior_captured.any(), "Initial sample is not fresh")
+        _, g, _, unsafe = self.guard()
+        p = g["interior_preservation"]
+        self.assertFalse(unsafe.any())
+        self.assertTrue(p["capture_applied_by_environment"].all())
+        self.assertTrue(self.t.allclose(p["captured_reserve_rad"],
+            self.t.tensor([.024, .028], dtype=self.t.float64), atol=1e-8, rtol=0))
+        self.assertTrue((p["capture_native_sample"] == 1).all())
+        self.assertTrue(self.t.equal(p["capture_episode_id"], self.ids))
+        self.assertFalse(g["guard_component_for_current_new_command_nm"].any())
+        captured = p["captured_reserve_rad"].clone()
+        self.kw["measured_hand_rad"][:, 1] = -.002
+        _, g, _, _ = self.guard()
+        p = g["interior_preservation"]
+        self.assertTrue(self.t.equal(p["captured_reserve_rad"], captured))
+        self.assertFalse(p["capture_applied_by_environment"].any())
+        self.assertTrue(g["actual_torque_nonzero_by_environment"].all())
+        self.assertTrue((g["common_domain"]["original_lower_margin_thumb3_rad"] > .006).all(),
+            "Preservation acts while the historical6mrad control target would still request zero")
+        self.assertTrue((g["guard_component_for_current_new_command_nm"][:, 1] > 0).all())
+        self.assertTrue((g["common_domain"]["maximum_common_interior_margin_rad"] <= captured).all())
+
+    def test_contact_loss_clears_only_affected_environment_then_fresh_recapture(self):
+        self.guard()
+        self.kw["group_physical_loaded"][0, 2] = False
+        _, g, _, _ = self.guard()
+        p = g["interior_preservation"]
+        self.assertEqual(p["captured"].tolist(), [False, True])
+        self.assertEqual(p["capture_native_sample"].tolist(), [-1, 1])
+        self.kw["measured_hand_rad"][0, 1] = -.004
+        self.kw["group_physical_loaded"][0, 2] = True
+        _, g, _, _ = self.guard()
+        p = g["interior_preservation"]
+        self.assertEqual(p["capture_applied_by_environment"].tolist(), [True, False])
+        self.assertAlmostEqual(float(p["captured_reserve_rad"][0]), .020, places=7)
+        self.assertEqual(int(p["capture_native_sample"][0]), 3)
+
+    def test_tracking_pause_does_not_silently_recapture_a_lower_reserve(self):
+        self.guard(); reserve = self.controller.guard_interior_reserve_rad.clone()
+        self.kw["tracking"][:] = False
+        self.kw["measured_hand_rad"][:, 1] = -.005
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["gate"].any())
+        self.assertTrue(self.t.equal(g["interior_preservation"]["captured_reserve_rad"], reserve))
+        self.kw["tracking"][:] = True
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["interior_preservation"]["capture_applied_by_environment"].any())
+        self.assertTrue(self.t.equal(g["interior_preservation"]["captured_reserve_rad"], reserve))
+
+    def test_duplicate_is_idempotent_for_reserve_and_position_difference(self):
+        effort, _, _, _ = self.guard()
+        reserve = self.controller.guard_interior_reserve_rad.clone()
+        previous = self.controller.guard_previous_position_rad.clone()
+        self.kw["measured_hand_rad"][:, 1] = -.003
+        self.kw["group_physical_loaded"][:] = False
+        self.sample -= 1
+        duplicate, g, _, _ = self.guard()
+        self.assertTrue(self.t.equal(duplicate, effort))
+        self.assertTrue(self.t.equal(self.controller.guard_interior_reserve_rad, reserve))
+        self.assertTrue(self.t.equal(self.controller.guard_previous_position_rad, previous))
+        self.assertFalse(g["interior_preservation"]["capture_applied_by_environment"].any())
+        self.assertFalse(g["interior_preservation"]["clear_applied_by_environment"].any())
+        self.assertFalse(g["position_difference_observation"]["same_episode_consecutive_native_sample"].any())
+        self.assertEqual(g["position_difference_observation"]["previous_native_sample"], 1,
+            "A duplicate must report the actual stored position sample, not label it sample_id-1")
+        self.kw["group_physical_loaded"][:] = True
+        _, g, _, _ = self.guard()
+        d = g["position_difference_observation"]
+        self.assertTrue(d["same_episode_consecutive_native_sample"].all())
+        self.assertTrue(self.t.allclose(d["position_difference_velocity_hand_rad_s"][:, 1],
+            self.t.full((2,), -1.5), atol=1e-6, rtol=0))
+
+    def test_epoch_change_discontinuity_and_duplicate_conflict_never_reuse_capture(self):
+        self.guard()
+        self.kw["episode_id"][0] += 1
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["interior_preservation"]["captured"][0])
+        self.assertFalse(g["position_difference_observation"]["same_episode_consecutive_native_sample"][0])
+        _, g, _, _ = self.guard()
+        self.assertTrue(g["interior_preservation"]["capture_applied_by_environment"][0])
+        self.assertEqual(int(g["interior_preservation"]["capture_episode_id"][0]), int(self.kw["episode_id"][0]))
+        self.sample += 1
+        effort, g, _, unsafe = self.guard()
+        self.assertTrue(unsafe.all()); self.assertFalse(effort.any())
+        self.assertFalse(g["interior_preservation"]["captured"].any())
+        self.assertFalse(g["position_difference_observation"]["same_episode_consecutive_native_sample"].any())
+        self.guard()
+        self.kw["episode_id"][0] += 1; self.sample -= 1
+        effort, _, _, unsafe = self.guard()
+        self.assertTrue(unsafe[0]); self.assertFalse(effort[0].any())
+
+    def test_current_geometry_changes_target_without_changing_stored_scalar_reference(self):
+        self.guard(); reserve = self.controller.guard_interior_reserve_rad.clone()
+        self.kw["measured_hand_rad"][:, 1] = -.002
+        _, first, _, _ = self.guard()
+        old_n = first["thumb_unit_null_vector"].clone()
+        changed_n = self.t.tensor([-.6, .5, .4]); changed_n /= self.t.linalg.vector_norm(changed_n)
+        self.set_null(changed_n)
+        _, second, _, _ = self.guard()
+        self.assertFalse(self.t.allclose(old_n.abs(), second["thumb_unit_null_vector"].abs()))
+        self.assertTrue(self.t.equal(second["interior_preservation"]["captured_reserve_rad"], reserve))
+        residual = self.t.einsum("nri,ni->nr", second["current_normal_world_z_jacobian_m"],
+            second["guard_component_for_current_new_command_nm"][:, :3])
+        self.assertLess(float(residual.abs().max()), 1e-9)
+
+    def test_overforce_original_safe_rank_missing_inputs_and_finite_gates(self):
+        for name in ("physical_contact_safe", "group_physical_loaded", "group_contact_valid"):
+            self.make_controller(); self.guard(); original = self.kw[name].clone()
+            self.kw[name][0] = False
+            _, g, _, _ = self.guard()
+            self.assertFalse(g["gate"][0], name)
+            self.assertFalse(g["interior_preservation"]["captured"][0], name)
+            self.kw[name] = original
+        self.make_controller(); self.guard()
+        self.kw["raw_group_force_n"][0, 0] = 2.
+        _, g, e, _ = self.guard()
+        self.assertFalse(g["interior_preservation"]["captured"][0])
+        self.assertFalse(g["guard_component_for_current_new_command_nm"][0].any())
+        self.assertAlmostEqual(float(e["group_force_command_n"][0, 0]), -.4, places=6)
+        self.kw["raw_group_force_n"][0, 0] = .8
+        self.make_controller(); self.point[0, 0, 2, 0] = float("nan")
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["interior_preservation"]["captured"][0])
+        self.assertTrue(self.t.isfinite(g["interior_preservation"]["current_original_thumb3_minimum_margin_rad"]).all())
+        self.point[0, 0, 2, 0] = 0
+        self.make_controller(); self.kw["actual_domain_lower_hand_rad"] = None
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["interior_preservation"]["captured"].any())
+
+    def test_captured_floor_common_infeasibility_and_total_caps_remain_strict(self):
+        self.lower[:, :3] = self.t.tensor([-.018, .000006, -.0097])
+        self.make_controller()
+        _, g, _, _ = self.guard()
+        self.assertTrue(self.t.equal(g["interior_preservation"]["captured_reserve_rad"],
+            self.t.full((2,), .006, dtype=self.t.float64)))
+        self.lower[:, 0] = 0; self.lower[:, 1] = .001
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["common_domain"]["base_original_domain_intersection_feasible"].any())
+        self.assertFalse(g["guard_component_for_current_new_command_nm"].any())
+        self.lower[:, :3] = self.t.tensor([-.030, -.024, -.028])
+        self.make_controller(); self.guard()
+        self.kw["measured_hand_rad"][:, 1] = -.002
+        self.kw["gravity_hand_nm"][:] = .035
+        self.kw["object_support_torque_nm"] = self.t.full((2, 7), .02)
+        effort, g, e, _ = self.guard()
+        self.assertTrue((g["guard_torque_before_total_alpha_nm"].abs() <= .004+1e-9).all())
+        self.assertTrue((effort.abs() <= e["total_torque_caps_nm"]).all())
+        self.assertTrue((e["non_gravity_common_scale"] < 1).all())
+
+    def test_position_difference_reports_sdk_sign_conflict_but_never_changes_force_feedback(self):
+        self.guard()
+        self.kw["measured_hand_rad"][:, 1] = -.00005
+        self.kw["measured_hand_velocity_rad_s"][:, 1] = .03
+        _, g, _, _ = self.guard()
+        d = g["position_difference_observation"]
+        self.assertTrue((d["position_difference_velocity_hand_rad_s"][:, 1] < 0).all())
+        self.assertTrue((d["sdk_joint_velocity_hand_rad_s"][:, 1] > 0).all())
+        import copy
+        other = copy.copy(self.controller)
+        for name, value in vars(self.controller).items():
+            if self.t.is_tensor(value):
+                setattr(other, name, value.clone())
+        other.guard_previous_position_rad[:, 1] -= .001
+        a = self.controller.update(sample_id=self.sample, **self.kw)
+        b = other.update(sample_id=self.sample, **self.kw)
+        self.assertTrue(self.t.equal(a[0], b[0]))
+        self.assertTrue(self.t.equal(a[1]["group_force_command_n"], b[1]["group_force_command_n"]))
+        da = a[1]["contact_domain_posture_guard"]["position_difference_observation"]
+        db = b[1]["contact_domain_posture_guard"]["position_difference_observation"]
+        self.assertFalse(self.t.equal(da["position_difference_velocity_hand_rad_s"], db["position_difference_velocity_hand_rad_s"]))
+
+    def test_nonfinite_state_clears_reserve_and_never_forges_a_current_position_pair(self):
+        self.guard()
+        self.kw["measured_hand_rad"][0, 1] = float("nan")
+        effort, g, _, unsafe = self.guard()
+        self.assertTrue(unsafe[0]); self.assertFalse(effort[0].any())
+        self.assertFalse(g["interior_preservation"]["captured"][0])
+        d = g["position_difference_observation"]
+        self.assertFalse(d["same_episode_consecutive_native_sample"][0])
+        self.assertTrue(self.t.isfinite(d["position_difference_velocity_hand_rad_s"]).all())
+        self.kw["measured_hand_rad"][0, 1] = 0.
+        _, g, _, _ = self.guard()
+        self.assertFalse(g["position_difference_observation"]["same_episode_consecutive_native_sample"][0])
+        _, g, _, _ = self.guard()
+        self.assertTrue(g["position_difference_observation"]["same_episode_consecutive_native_sample"].all())
+
+    def test_exact_version_factory_and_deepcopy_preserve_all_older_declarations(self):
+        from g1_vla.rl_effort_protocol import contact_domain_posture_guard_contract, validate_contact_domain_posture_guard
+        self.assertEqual(contact_domain_posture_guard_contract(), ContactDomainPostureGuardTests.DECLARATION)
+        self.assertEqual(validate_contact_domain_posture_guard(self.declaration), self.declaration)
+        for key, value in (("interior_reserve_floor_rad", .012), ("maximum_guard_joint_torque_nm", .008),
+                           ("guard_position_difference_telemetry", "replace_sdk_velocity"),
+                           ("interior_reference_is_not_acceptance_or_cached_geometry", 1)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_contact_domain_posture_guard(dict(self.declaration, **{key: value}))
+        result = contact_domain_posture_guard_contract(self.VERSION)
+        result["hand_joint_indices"][0] = 6
+        self.assertEqual(contact_domain_posture_guard_contract(self.VERSION)["hand_joint_indices"], [0, 1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()
