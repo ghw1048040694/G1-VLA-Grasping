@@ -47,7 +47,7 @@ class NativeEffortAdapterTests(unittest.TestCase):
                       "math": math, "json": json,
                       "settings": {"contact_offset_m": .001, "max_abs_normal_z": .6}}
 
-    def guide_fixture(self):
+    def guide_fixture(self, *, acquisition=None, axis=None):
         t = self.t
         tree = ast.parse((ROOT/"src/g1_vla/rl_diagnostics.py").read_text())
         nodes = [node for node in tree.body if
@@ -58,6 +58,8 @@ class NativeEffortAdapterTests(unittest.TestCase):
         scope = {}
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "<actual-bootstrap-effort-guide>", "exec"), scope)
         candidate = json.loads((ROOT/"resources/rl_geometry_candidates/opposed_face_effort_pinch_v1.json").read_text())
+        if axis is not None:
+            candidate["closing_axis_hand7"] = axis
         seed = candidate["source_hand_rad"]
         q = t.zeros(2, 14)
         q[:, 7:] = t.tensor(seed)
@@ -71,6 +73,7 @@ class NativeEffortAdapterTests(unittest.TestCase):
             "per_step_action_rad": t.full((2, 14), .0198), "metrics": {}}
         settings = {"guided_preload_controls": 3, "guided_probe_speed_m_s": .001,
                     "guided_probe_height_m": .0025}
+        settings["contact_acquisition"] = acquisition
         guide = scope["EffortGraspGuide"](t, settings, seed, state, candidate)
         return guide, state
 
@@ -121,6 +124,124 @@ class NativeEffortAdapterTests(unittest.TestCase):
                 self.assertFalse(e["stage_advance_after_this_request"].any())
                 self.assertFalse(e["stage_contact_geometry_is_control_signal_not_acceptance"].any())
                 self.assertTrue((e["stage0_precontact_raw_force_controls"] == 0).all())
+
+    def test_touch_search_constructor_rejects_invalid_closing_axis(self):
+        for axis in ([1.]*6, [float("nan")]*7, [2.]*7, [.5]*7, [0.]*7,
+                     [0.,0.,0.,1.,-1.,1.,1.]):
+            with self.subTest(axis=axis), self.assertRaises(ValueError):
+                self.guide_fixture(acquisition={"version": "test"}, axis=axis)
+
+    def touch_search_fixture(self):
+        guide, state = self.guide_fixture()
+        guide.acquisition = {"reference_closing_rate_rad_s": .02,
+            "maximum_extra_closure_rad": .02, "raw_force_stop_n": .02}
+        guide.stage[:] = len(guide.names)-1
+        guide.elapsed[:] = guide.durations[-1]
+        guide.start[:] = guide.goals[-2]
+        state["q_action_rad"][:, 7:] = guide.goals[-1]
+        t = self.t
+        state["contact_metrics_current_episode"] = t.ones(2, dtype=t.bool)
+        state["metrics"] = {"contact_safe": t.zeros(2, dtype=t.bool),
+            "group_physical_loaded_contact_count": t.zeros(2, 3, dtype=t.long),
+            "opposition_dot": t.ones(2), "maximum_abs_normal_z": t.zeros(2),
+            "maximum_penetration_m": t.zeros(2), "finite": t.ones(2, dtype=t.bool),
+            "joint_safe": t.ones(2, dtype=t.bool),
+            "table_pair_measurement_supported": t.ones(2, dtype=t.bool)}
+        return guide, state
+
+    def touch_step(self, guide, state):
+        return guide.actions(self.t.zeros(2, 14), state, "guided_hand_pose_hold", .066, 1.5)[1]
+
+    def test_touch_search_only_missing_unloaded_group_moves_bounded_reference(self):
+        g, s = self.touch_search_fixture()
+        s["metrics"]["group_physical_loaded_contact_count"][:, 1] = 1
+        s["group_normal_force_n"][:, 2] = .02
+        e = self.touch_step(g, s)
+        expected = self.t.tensor([[.00132, 0, 0]]*2)
+        self.assertTrue(self.t.allclose(e["contact_search_offset_by_group_rad"], expected))
+        self.assertTrue(self.t.equal(e["contact_search_active_by_group"], expected > 0))
+        self.assertTrue(self.t.allclose(e["guided_target_hand_rad"], g.goals[-1]+expected[:, [0,0,0,1,1,2,2]]*g.axis))
+        self.assertFalse(e["closure_path_complete"].any())
+        self.assertFalse(e["probe_advance_permitted"].any())
+        self.assertTrue((e["probe_offset_m"] == 0).all())
+
+    def test_touch_search_stops_accumulation_on_physical_touch_or_raw_force(self):
+        g, s = self.touch_search_fixture()
+        self.touch_step(g, s)
+        previous = g.search_offset.clone()
+        s["metrics"]["group_physical_loaded_contact_count"][:, 0] = 1
+        s["group_normal_force_n"][:, 1:] = .02
+        e = self.touch_step(g, s)
+        self.assertTrue(self.t.equal(g.search_offset, previous))
+        self.assertFalse(e["contact_search_active_by_group"].any())
+
+    def test_touch_search_saturates_inside_original_actual_domain_and_mechanical_limits(self):
+        g, s = self.touch_search_fixture()
+        # One mechanical upper limit is closer than the search reference budget.
+        g.mechanical_high[:, 3] = g.high[:, 3]+.005
+        for _ in range(30):
+            e = self.touch_step(g, s)
+        self.assertTrue(self.t.equal(g.search_offset, self.t.full((2, 3), .02)))
+        self.assertTrue((e["geometry_lower_hand_rad"] >= g.low-.025).all())
+        self.assertTrue((e["geometry_upper_hand_rad"] <= g.high+.025).all())
+        self.assertTrue((e["guided_target_hand_rad"] <= g.mechanical_high).all())
+        self.assertTrue((e["guided_target_hand_rad"] >= g.mechanical_low).all())
+        self.assertTrue(self.t.allclose(e["geometry_upper_hand_rad"][:, 3], g.high[:, 3]+.005))
+
+    def test_touch_search_no_early_boundary_expansion_and_episode_reset_is_individual(self):
+        g, s = self.touch_search_fixture()
+        g.stage[:] = 0
+        e = self.touch_step(g, s)
+        self.assertTrue(self.t.equal(e["geometry_lower_hand_rad"], g.low))
+        self.assertTrue(self.t.equal(e["geometry_upper_hand_rad"], g.high))
+        self.assertTrue((g.search_offset == 0).all())
+        g.stage[:] = len(g.names)-1
+        g.elapsed[:] = g.durations[-1]
+        self.touch_step(g, s)
+        previous = g.search_offset[1].clone()
+        s["episode_id"][0] += 1
+        e = self.touch_step(g, s)
+        self.assertTrue((g.search_offset[0] == 0).all())
+        self.assertTrue(self.t.all(g.search_offset[1] > previous))
+        self.assertTrue(self.t.equal(e["geometry_lower_hand_rad"][0], g.low[0]))
+
+    def test_touch_search_requires_safe_current_complete_measurements_and_final_duration(self):
+        changes = ["missing_metrics", "stale", "invalid", "joint", "table", "tracking", "unsafe",
+                   "overforce", "nan_force", "negative_force", "nan_count", "negative_count",
+                   "nan_depth", "negative_depth", "depth_limit", "duration"]
+        for change in changes:
+            with self.subTest(change=change):
+                g, s = self.touch_search_fixture()
+                m = s["metrics"]
+                if change == "missing_metrics": m.pop("maximum_abs_normal_z")
+                elif change == "stale": s["contact_metrics_current_episode"][:] = False
+                elif change == "invalid": m["finite"][:] = False
+                elif change == "joint": m["joint_safe"][:] = False
+                elif change == "table": m["table_pair_measurement_supported"][:] = False
+                elif change == "tracking": s["palm_position_world_m"][:, 0] = .004
+                elif change == "unsafe": s["unsafe_latched"][:] = True
+                elif change == "overforce": s["group_normal_force_n"][:, 2] = 1.5001
+                elif change == "nan_force": s["group_normal_force_n"][:, 2] = float("nan")
+                elif change == "negative_force": s["group_normal_force_n"][:, 2] = -.01
+                elif change == "nan_count": m["group_physical_loaded_contact_count"] = self.t.full((2,3), float("nan"))
+                elif change == "negative_count": m["group_physical_loaded_contact_count"][:, 1] = -1
+                elif change == "nan_depth": m["maximum_penetration_m"][:] = float("nan")
+                elif change == "negative_depth": m["maximum_penetration_m"][:] = -.001
+                elif change == "depth_limit": m["maximum_penetration_m"][:] = .00301
+                elif change == "duration": g.elapsed[:] = 0
+                e = self.touch_step(g, s)
+                self.assertFalse(e["contact_search_active_by_group"].any())
+                self.assertTrue((g.search_offset == 0).all())
+                self.assertFalse(e["probe_advance_permitted"].any())
+
+    def test_touch_search_none_retains_original_reference_domain(self):
+        g, s = self.touch_search_fixture()
+        g.acquisition = None
+        e = self.touch_step(g, s)
+        self.assertTrue(self.t.equal(e["guided_target_hand_rad"], g.goals[-1][None].expand(2, -1)))
+        self.assertTrue(self.t.equal(e["geometry_lower_hand_rad"], g.low))
+        self.assertTrue(self.t.equal(e["geometry_upper_hand_rad"], g.high))
+        self.assertTrue((g.search_offset == 0).all())
 
     def geometry_fixture(self):
         t = self.t

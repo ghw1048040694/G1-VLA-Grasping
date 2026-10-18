@@ -22,6 +22,29 @@ class EffortGraspProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_effort_grasp_contract(candidate)
 
+    def test_touch_acquisition_requires_exact_versioned_declaration(self):
+        from pathlib import Path
+        from g1_vla.rl_probe_protocol import validate_probe_settings
+        config = json.loads((Path(__file__).resolve().parents[1]/"configs/experiment.json").read_text())
+        value = config["rl_diagnostics"]
+        declaration = value["contact_acquisition"]
+        self.assertEqual(validate_probe_settings(value)["contact_acquisition"], declaration)
+        previous = deepcopy(value)
+        previous.pop("contact_acquisition")
+        self.assertIsNone(validate_probe_settings(previous)["contact_acquisition"])
+        for key in declaration:
+            changed = deepcopy(value)
+            changed["contact_acquisition"].pop(key)
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                validate_probe_settings(changed)
+        for key, bad in [("maximum_extra_closure_rad", .025), ("reference_closing_rate_rad_s", .04),
+                         ("raw_force_stop_n", 1.5), ("requires_no_physical_loaded_point", 1),
+                         ("version", "unversioned"), ("start_phase", "bootstrap")]:
+            changed = deepcopy(value)
+            changed["contact_acquisition"][key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_probe_settings(changed)
+
     def test_default_is_fresh_and_json_roundtrips(self):
         original = effort_grasp_contract()
         result = validate_effort_grasp_contract(json.loads(json.dumps(original)))

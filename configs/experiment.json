@@ -1234,19 +1234,16 @@
         "native_q_velocity_written_target_and_total_effort_required": true
       }
     },
-    "collision_geometry_audit": {
-      "enabled": true,
-      "env_ids": [
-        0
-      ],
-      "body_names": [
-        "right_hand_thumb_2_link",
-        "right_hand_index_1_link",
-        "right_hand_middle_1_link"
-      ],
-      "require_complete": true,
-      "route": "live_surface_queries_v2",
-      "enable_scene_query_support": true
+    "collision_geometry_audit": null,
+    "contact_acquisition": {
+      "version": "g1_bounded_measured_touch_search_v1",
+      "reference_closing_rate_rad_s": 0.02,
+      "maximum_extra_closure_rad": 0.02,
+      "raw_force_stop_n": 0.02,
+      "start_phase": "final_stage_duration_complete",
+      "original_actual_geometry_tolerance_rad": 0.025,
+      "requires_no_physical_loaded_point": true,
+      "all_original_acceptance_gates_unchanged": true
     }
   }
 }

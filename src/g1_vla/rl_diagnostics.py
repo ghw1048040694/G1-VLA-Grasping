@@ -123,6 +123,13 @@ class EffortGraspGuide:
         self.low = torch.minimum(self.seed, self.goals.amin(0)[None])
         self.high = torch.maximum(self.seed, self.goals.amax(0)[None])
         self.axis = torch.as_tensor(candidate.get("closing_axis_hand7", [-1., 0., 0., 1., 1., 1., 1.]), device=q.device, dtype=q.dtype)
+        self.acquisition = settings.get("contact_acquisition")
+        if self.acquisition is not None and (tuple(self.axis.shape) != (7,) or
+                not bool(torch.isfinite(self.axis).all() and ((self.axis == -1) | (self.axis == 0) | (self.axis == 1)).all()) or
+                not all(bool((self.axis[first:last] != 0).any()) for first, last in ((0, 3), (3, 5), (5, 7)))):
+            raise ValueError("Measured touch search requires seven finite closing axes bounded by one")
+        self.search_offset = torch.zeros(q.shape[0], 3, dtype=q.dtype, device=q.device)
+        self.mechanical_low, self.mechanical_high = limits[..., 0].clone(), limits[..., 1].clone()
 
     def actions(self, actor_actions, state, action_source, dt, force_limit):
         t = self.torch
@@ -136,6 +143,7 @@ class EffortGraspGuide:
         self.ready_count[changed] = 0
         self.probe[changed] = 0
         self.precontact_count[changed] = 0
+        self.search_offset[changed] = 0
         delta = self.palm-state["palm_position_world_m"]
         angle = _orientation_error(t, self.rotation, state["palm_quaternion_xyzw"])
         tracking = (t.linalg.vector_norm(delta, dim=-1) <= .003) & (t.linalg.vector_norm(angle, dim=-1) <= .05)
@@ -180,6 +188,32 @@ class EffortGraspGuide:
         in_domain = ((actual_hand >= self.low-.025) & (actual_hand <= self.high+.025)).all(-1)
         orientation_arrived = (actual_hand[:, 1:3]-self.goals[-1, 1:3]).abs().amax(-1) <= .025
         complete = final & (fraction >= 1) & physical & tracking & in_domain
+        search_active = t.zeros_like(state["group_normal_force_n"], dtype=t.bool)
+        reference_low, reference_high = self.low, self.high
+        if self.acquisition is not None:
+            # This moves a bounded reference only. Current native force mode
+            # still owns every motor effort and removes the group spring at
+            # contact; all support/force/depth gates above remain unchanged.
+            acquisition = self.acquisition
+            force = state["group_normal_force_n"]
+            observation_valid = (metrics.get("finite", t.zeros_like(progress)) &
+                metrics.get("joint_safe", t.zeros_like(progress)) &
+                metrics.get("table_pair_measurement_supported", t.zeros_like(progress)) &
+                state.get("contact_metrics_current_episode", t.zeros_like(progress)))
+            permitted = (final & (fraction >= 1) & progress & contact_available & observation_valid &
+                t.isfinite(force).all(-1) & (force >= 0).all(-1) &
+                t.isfinite(group_loaded).all(-1) & (group_loaded >= 0).all(-1) &
+                t.isfinite(penetration) & (penetration >= 0) & (penetration <= .003))
+            search_active = (permitted[:, None] & (group_loaded == 0) &
+                (force >= 0) & (force < acquisition["raw_force_stop_n"]))
+            self.search_offset = (self.search_offset + search_active.to(force.dtype)*
+                (acquisition["reference_closing_rate_rad_s"]*dt)).clamp(max=acquisition["maximum_extra_closure_rad"])
+            group_ids = t.tensor([0, 0, 0, 1, 1, 2, 2], device=nominal.device)
+            extension = self.search_offset[:, group_ids]*self.axis
+            reference_low = t.maximum(self.mechanical_low, self.low+extension.clamp(max=0))
+            reference_high = t.minimum(self.mechanical_high, self.high+extension.clamp(min=0))
+            nominal = t.minimum(t.maximum(nominal+extension,
+                                          reference_low), reference_high)
         ready = state["preload_contact_ready"] & complete
         self.ready_count = t.where(ready, self.ready_count+1, t.zeros_like(self.ready_count))
         permit = self.ready_count >= self.settings["guided_preload_controls"]
@@ -198,7 +232,12 @@ class EffortGraspGuide:
         desired_arm = state["target_action_rad"][:, :7]+velocity*dt
         result[:, :7] = ((desired_arm-state["target_action_rad"][:, :7])/state["per_step_action_rad"][..., :7]).clamp(-1, 1)
         return result, {"action_source": action_source, "guided_target_hand_rad": nominal,
-            "geometry_lower_hand_rad": self.low, "geometry_upper_hand_rad": self.high,
+            "geometry_lower_hand_rad": reference_low, "geometry_upper_hand_rad": reference_high,
+            "base_geometry_lower_hand_rad": self.low, "base_geometry_upper_hand_rad": self.high,
+            "contact_acquisition_declaration": self.acquisition,
+            "contact_search_active_by_group": search_active,
+            "contact_search_offset_by_group_rad": self.search_offset.clone(),
+            "contact_search_reference_is_not_a_force_or_penetration_bound": True,
             "force_admittance_closing_axis_hand7": self.axis,
             "closure_stage_index": index, "closure_stage_fraction": fraction, "closure_stage_names": self.names,
             "stage_measured_error_max_rad": measured_error, "stage_advance_after_this_request": advance,
