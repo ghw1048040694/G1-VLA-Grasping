@@ -201,6 +201,8 @@ The optional `rl_diagnostics.control_preshape` declaration (`g1_pinned_precontac
 
 A same-episode observer latches the first valid physically loaded hand point at the original 2ms cadence. The next macro request freezes the last palm offset reference; it does not claim an instantaneous motor stop. Contact-mode hand position springs remain zero, and the original force, manifold, joint, drift and lift criteria remain independent. An absent/None declaration preserves historical control behavior. This option permits a physical diagnostic retest only, with no training or automatic promotion to a qualified teacher.
 
+The named `full_lift32_v3_wall7200` evaluation keeps eight environments, four scored episodes per environment, the same 16s physical episode and 972-control maximum. It explicitly permits a 7200s diagnostic wall resource ceiling, with matching outer and inner declarations and the existing launcher timeout of wall plus 180s. Older evaluation protocols and training retain the 3600s ceiling. This resource declaration changes no motion, force, contact, reset, score or optimizer budget; it can be selected after the corresponding eight-offset physical and original-video qualification.
+
 ## Historical code
 
 The original source is preserved by Git tag `codex/g1-before-rebuild-20261014` and under `legacy/`. The 154 experiment scripts and former script-forwarding lifecycle are no longer active package entry points. Historical checkpoint 672 remains a research baseline, explicitly separate from a new-contract deployment checkpoint.

@@ -18,7 +18,7 @@ import os
 import random
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -114,10 +114,16 @@ class EvidenceStream:
 class Deadline:
     seconds: float
     clock: Any = time.monotonic
+    maximum_seconds: float = field(default=3600.0, kw_only=True)
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.seconds) or not 0 < self.seconds <= 3600:
-            raise ValueError("Native wall-clock budget must be in (0, 3600] seconds")
+        if (type(self.maximum_seconds) not in (int, float) or
+                not math.isfinite(self.maximum_seconds) or self.maximum_seconds not in (3600., 7200.)):
+            raise ValueError("Native deadline requires an explicit3600 or7200 resource ceiling")
+        if (self.maximum_seconds != 3600. and type(self.seconds) not in (int, float)):
+            raise ValueError("Extended diagnostic wall budget must be a finite number")
+        if not math.isfinite(self.seconds) or not 0 < self.seconds <= self.maximum_seconds:
+            raise ValueError(f"Native wall-clock budget must be in (0, {self.maximum_seconds:g}] seconds")
         self.started = self.clock()
 
     @property

@@ -321,7 +321,23 @@ _FULL_LIFT_PROTOCOL_V4 = {
 _FULL_LIFT_EVALUATION_QUOTAS = {
     "full_lift8_v1": (1, 213, 14.0), "full_lift32_v1": (4, 852, 14.0),
     "full_lift8_v2": (1, 243, 16.0), "full_lift32_v2": (4, 972, 16.0),
+    "full_lift32_v3_wall7200": (4, 972, 16.0),
 }
+FULL_LIFT32_WALL7200_PROTOCOL = "full_lift32_v3_wall7200"
+
+
+def effort_evaluation_wall_time_limit_s(value):
+    """Resource ceiling only; callers still validate the whole declaration.
+
+    This one named full32 protocol opts into7200 wall seconds. The physical
+    episode, original8-offset quota and training limits remain independent.
+    All historical effort declarations retain their3600-second ceiling.
+    """
+    if (type(value) is dict and value.get("version") == FULL_LIFT_EFFORT_GRASP_VERSION and
+            type(value.get("evaluation")) is dict and
+            value["evaluation"].get("protocol") == FULL_LIFT32_WALL7200_PROTOCOL):
+        return 7200.0
+    return 3600.0
 
 
 def full_lift_protocol_contract(version=None):
@@ -353,6 +369,8 @@ def full_lift_effort_grasp_contract(protocol="full_lift8_v1"):
     value["acceptance"].update(main_lift_authorized=True, actual_height_limit_m=.115)
     value["evaluation"].update(protocol=protocol, episodes_per_env=episodes,
         max_control_steps=steps, nominal_episode_budget_s=duration)
+    if protocol == FULL_LIFT32_WALL7200_PROTOCOL:
+        value["evaluation"]["max_wall_time_s"] = effort_evaluation_wall_time_limit_s(value)
     return value
 
 
@@ -569,7 +587,7 @@ def validate_effort_grasp_contract(value):
         raise ValueError("evaluation quota does not match its named protocol")
     if type(evaluation["max_control_steps"]) is not int or evaluation["max_control_steps"] != steps:
         raise ValueError("control-step budget does not match named evaluation protocol")
-    _number(evaluation["max_wall_time_s"], 1.0, 3600.0, "max_wall_time_s")
+    _number(evaluation["max_wall_time_s"], 1.0, effort_evaluation_wall_time_limit_s(value), "max_wall_time_s")
 
     logging = value["logging"]
     _keys(logging, _DEFAULTS["logging"], "logging")

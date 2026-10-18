@@ -347,7 +347,11 @@ def validate_probe_settings(value):
             raise ValueError("Geometry diagnostic plan requires explicit candidate path/SHA256/ID")
         if plan in ("geometry_pose_fixed_cluster_v3", "compliant_pinch_v4") and result["candidate_sha256"] != _V3_CANDIDATE_SHA256:
             raise ValueError("Fixed-cluster model comparison must preserve the pinned geometry candidate")
-    for key, limit in (("max_wall_time_s", 3600), ("guided_closure_ramp_s", 6)):
+    from .rl_effort_protocol import effort_evaluation_wall_time_limit_s
+    wall_limit = effort_evaluation_wall_time_limit_s(effort)
+    if wall_limit > 3600 and result["max_wall_time_s"] != effort["evaluation"]["max_wall_time_s"]:
+        raise ValueError("Named extended diagnostic and effort evaluation wall budgets must agree")
+    for key, limit in (("max_wall_time_s", wall_limit), ("guided_closure_ramp_s", 6)):
         number = result[key]
         if type(number) not in (int, float) or not math.isfinite(number) or not 0 < number <= limit:
             raise ValueError(key + " must be finite, positive and within the unchanged horizon/budget")

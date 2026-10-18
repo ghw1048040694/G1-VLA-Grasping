@@ -668,6 +668,23 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     return summary
 
 
+def _diagnostic_deadline(settings, *, clock=None):
+    """Choose an explicit resource ceiling from the validated effort protocol.
+
+    The default call remains the historical Deadline(seconds) path. Only the
+    named full32 resource protocol opts into the larger native wall budget;
+    no physical episode or optimizer budget is changed by this helper.
+    """
+    from .rl_effort_protocol import effort_evaluation_wall_time_limit_s
+    from .rl_ppo import Deadline
+    maximum = effort_evaluation_wall_time_limit_s(settings.get("effort_grasp_controller"))
+    options = {} if clock is None else {"clock": clock}
+    if maximum > 3600:
+        settings = validate_probe_settings(settings)
+        options["maximum_seconds"] = maximum
+    return Deadline(settings["max_wall_time_s"], **options)
+
+
 def run_native_diagnostics(config, run_dir):
     """Execute declared counterfactuals with one native world and zero training."""
     from .rl_ppo import (Deadline, EvidenceStream, _environment_audit, _gpu_memory,
@@ -691,7 +708,7 @@ def run_native_diagnostics(config, run_dir):
     streams = _new_streams(run_dir)
     streams["intent"] = EvidenceStream(run_dir / "control_intent.jsonl")
     app, environment, torch = None, None, None
-    deadline = Deadline(settings["max_wall_time_s"])
+    deadline = _diagnostic_deadline(settings)
     try:
         result["reference_preflight"] = verify_probe_reference(config)
         os.environ["GIT_PYTHON_GIT_EXECUTABLE"] = config["rl_teacher"]["git_executable"]
