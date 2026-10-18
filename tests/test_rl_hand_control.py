@@ -1211,5 +1211,173 @@ class BalancedEffortGraspTests(unittest.TestCase):
             BalancedEffortGraspController(self.t, self.seed, self.ids, parameters=parameters)
 
 
+
+@unittest.skipUnless(TORCH, "real torch is required for current-contact domain guard math")
+class ContactDomainPostureGuardTests(unittest.TestCase):
+    DECLARATION = {
+        "version": "g1_contact_domain_nullspace_posture_guard_v1",
+        "hand_joint_index": 2, "activation_margin_rad": .006,
+        "restoring_stiffness_nm_rad": 2., "maximum_guard_joint_torque_nm": .004,
+        "minimum_nullspace_joint_component": .05, "svd_tolerance_m": .0001,
+        "original_actual_geometry_tolerance_rad": .025,
+        "protect_current_normal_and_world_z": True,
+        "requires_all_groups_physically_loaded": True,
+        "requires_original_contact_safe": True,
+        "all_original_acceptance_gates_unchanged": True,
+    }
+
+    def setUp(self):
+        BalancedEffortGraspTests.setUp(self)
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        self.kw["inward_normal_jacobian"][:, 0, :3] = self.t.tensor(
+            [-.022998522967100143, -.056815437972545624, -.02566390484571457])
+        self.point_jacobian = self.t.zeros(2, 3, 3, 7)
+        self.point_jacobian[:, 0, 2, :3] = self.t.tensor(
+            [-.01418279018253088, .0018831974593922496, -.027741195634007454])
+        self.lower = self.t.full((2, 7), -.2)
+        self.upper = self.t.full((2, 7), .2)
+        self.kw.update(contact_point_jacobian_world_m=self.point_jacobian,
+            actual_domain_lower_hand_rad=self.lower, actual_domain_upper_hand_rad=self.upper,
+            physical_contact_safe=self.t.ones(2, dtype=self.t.bool))
+        self.controller = BalancedEffortGraspController(self.t, self.seed, self.ids,
+                                                       domain_posture_guard=self.DECLARATION)
+        self.sample = 0
+        self.step()
+        self.kw["measured_hand_rad"][:, 2] = -.198
+
+    step = BalancedEffortGraspTests.step
+
+    def guard(self):
+        effort, evidence, unsafe = self.step()
+        return effort, evidence["contact_domain_posture_guard"], evidence, unsafe
+
+    def test_real_crossing_geometry_retains_thumb2_authority_and_two_constraints(self):
+        _, guard, evidence, unsafe = self.guard()
+        self.assertFalse(unsafe.any())
+        self.assertTrue(guard["gate"].all())
+        self.assertTrue((guard["retained_rank"] == 2).all())
+        self.assertTrue(self.t.allclose(guard["nullspace_thumb2_component"],
+                                       self.t.full((2,), .209899066), atol=1e-6, rtol=0))
+        self.assertTrue((guard["guard_torque_before_total_alpha_nm"][:, 2] > 0).all())
+        self.assertTrue(self.t.equal(guard["guard_torque_before_total_alpha_nm"][:, 3:], self.t.zeros(2, 4)))
+        self.assertLess(float(guard["normal_projection_residual_m_nm"].abs().max()), 1e-9)
+        self.assertLess(float(guard["world_z_projection_residual_m_nm"].abs().max()), 1e-9)
+        self.assertTrue(self.t.equal(evidence["position_spring_after_contact_mode_mask_nm"], self.t.zeros(2, 7)))
+        self.assertTrue(guard["geometric_projection_is_not_dynamic_force_isolation"])
+
+    def test_upper_boundary_is_restored_inward_and_interior_has_no_spring(self):
+        self.kw["measured_hand_rad"][0, 2] = .198
+        self.kw["measured_hand_rad"][1, 2] = 0.
+        _, guard, _, _ = self.guard()
+        self.assertLess(float(guard["guard_torque_before_total_alpha_nm"][0, 2]), 0.)
+        self.assertTrue(self.t.equal(guard["guard_torque_before_total_alpha_nm"][1], self.t.zeros(7)))
+        self.assertAlmostEqual(float(guard["interior_lower_thumb2_rad"][0]), -.194, places=6)
+        self.assertAlmostEqual(float(guard["interior_upper_thumb2_rad"][0]), .194, places=6)
+
+    def test_pre_cap_total_telemetry_includes_the_optional_guard_component(self):
+        _, guard, evidence, _ = self.guard()
+        expected = (evidence["gravity_input_nm"]+evidence["joint_impedance_before_normal_projection_nm"]+
+            evidence["normal_force_torque_nm"]+evidence["opening_fallback_torque_nm"]+
+            guard["guard_torque_before_total_alpha_nm"])
+        self.assertTrue(self.t.allclose(evidence["unprojected_total_torque_nm"], expected, atol=1e-8, rtol=0))
+        self.assertTrue(guard["unprojected_total_diagnostic_includes_projected_guard"])
+        self.assertTrue(self.t.equal(self.lower, self.t.full((2, 7), -.2)))
+        self.assertTrue(self.t.equal(self.upper, self.t.full((2, 7), .2)))
+
+    def test_guard_common_cap_preserves_normal_and_z_before_existing_total_caps(self):
+        self.kw["measured_hand_rad"][:, 2] = -.8
+        self.kw["gravity_hand_nm"][:, 1] = -.039
+        effort, guard, evidence, _ = self.guard()
+        self.assertTrue((guard["guard_common_scale"] < 1).all())
+        self.assertTrue((guard["guard_torque_before_total_alpha_nm"].abs().amax(-1) <= .004000001).all())
+        self.assertLess(float(guard["normal_projection_residual_m_nm"].abs().max()), 1e-9)
+        self.assertLess(float(guard["world_z_projection_residual_m_nm"].abs().max()), 1e-9)
+        self.assertTrue((evidence["non_gravity_common_scale"] < 1).all())
+        self.assertTrue(self.t.allclose(guard["guard_torque_after_total_common_scale_nm"],
+            evidence["non_gravity_common_scale"][:, None]*guard["guard_torque_before_total_alpha_nm"]))
+        caps = self.t.tensor(self.parameters["joint_torque_limits_nm"])
+        self.assertTrue((effort.abs() <= caps+1e-7).all())
+
+    def test_every_current_physical_gate_is_required_and_overforce_disables_whole_guard(self):
+        cases = (("physical_contact_safe", (0,), False), ("tracking", (0,), False),
+                 ("group_contact_valid", (0, 2), False), ("group_physical_loaded", (0, 1), False),
+                 ("raw_group_force_n", (0, 1), 1.6), ("unsafe_latched", (0,), True))
+        for key, index, value in cases:
+            old = self.kw[key].clone()
+            self.kw[key][index] = value
+            _, guard, _, _ = self.guard()
+            with self.subTest(key=key):
+                self.assertFalse(bool(guard["gate"][0]))
+                self.assertTrue(self.t.equal(guard["guard_torque_before_total_alpha_nm"][0], self.t.zeros(7)))
+            self.kw[key] = old
+
+    def test_rank_loss_and_eliminated_thumb2_direction_disable_guard(self):
+        self.kw["contact_point_jacobian_world_m"][:, 0, 2, :3] = self.kw["inward_normal_jacobian"][:, 0, :3]
+        _, guard, _, _ = self.guard()
+        self.assertFalse(guard["rank_supported"].any())
+        self.assertFalse(guard["gate"].any())
+        self.kw["inward_normal_jacobian"][:, 0, :3] = self.t.tensor([0., 0., .03])
+        self.kw["contact_point_jacobian_world_m"][:, 0, 2, :3] = self.t.tensor([.03, 0., 0.])
+        _, guard, _, _ = self.guard()
+        self.assertTrue(guard["rank_supported"].all())
+        self.assertFalse(guard["thumb2_component_supported"].any())
+        self.assertTrue(self.t.equal(guard["guard_torque_before_total_alpha_nm"], self.t.zeros(2, 7)))
+
+    def test_missing_or_nonfinite_current_geometry_never_reuses_previous_guard(self):
+        _, guard, _, _ = self.guard()
+        self.assertTrue(guard["gate"].all())
+        self.kw["contact_point_jacobian_world_m"] = None
+        _, guard, _, _ = self.guard()
+        self.assertFalse(guard["inputs_supplied"])
+        self.assertIn("contact_point_jacobian_world_m", guard["missing_inputs"])
+        self.assertTrue(self.t.equal(guard["guard_torque_before_total_alpha_nm"], self.t.zeros(2, 7)))
+        self.kw["contact_point_jacobian_world_m"] = self.point_jacobian.clone()
+        self.kw["contact_point_jacobian_world_m"][0, 0, 2, 0] = float("nan")
+        _, guard, _, _ = self.guard()
+        self.assertFalse(bool(guard["current_input_finite"][0]))
+        self.assertTrue(self.t.isfinite(guard["guard_torque_before_total_alpha_nm"]).all())
+        self.assertFalse(bool(guard["gate"][0]))
+
+    def test_reset_and_duplicate_never_apply_a_new_guard_from_history(self):
+        self.guard()
+        # A duplicate holds the previous complete effort, not a new addition.
+        effort, evidence, _ = self.controller.update(sample_id=self.sample-1, **self.kw)
+        self.assertTrue(evidence["contact_domain_posture_guard"]["duplicate_holds_prior_complete_effort_without_new_guard_evaluation"])
+        self.assertTrue(self.t.equal(evidence["contact_domain_posture_guard"]["guard_component_for_current_new_command_nm"], self.t.zeros(2, 7)))
+        self.ids[0] += 1
+        self.kw["measured_hand_rad"][0] = self.seed[0]
+        _, guard, _, _ = self.guard()
+        self.assertFalse(bool(guard["safe_fresh_sample"][0]))
+        self.assertFalse(bool(guard["gate"][0]))
+        self.kw["contact_point_jacobian_world_m"] = None
+        _, guard, _, _ = self.guard()
+        self.assertFalse(guard["gate"].any())
+
+    def test_explicit_none_preserves_original_identity_and_all_effort_bits(self):
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        from g1_vla.rl_effort_protocol import balanced_effort_controller_contract
+        omitted = BalancedEffortGraspController(self.t, self.seed, self.ids)
+        explicit = BalancedEffortGraspController(self.t, self.seed, self.ids, domain_posture_guard=None)
+        self.assertEqual(omitted.contract, balanced_effort_controller_contract())
+        self.assertEqual(omitted.contract_sha256, explicit.contract_sha256)
+        for sample in range(4):
+            left = omitted.update(sample_id=sample, **self.kw)
+            right = explicit.update(sample_id=sample, **self.kw)
+            self.assertTrue(self.t.equal(left[0].view(self.t.int32), right[0].view(self.t.int32)))
+            self.assertNotIn("contact_domain_posture_guard", left[1])
+            self.assertNotIn("contact_domain_posture_guard", right[1])
+        self.assertIn("+g1_contact_domain_nullspace_posture_guard_v1", self.controller.contract["version"])
+        self.assertNotEqual(self.controller.contract_sha256, omitted.contract_sha256)
+
+    def test_invalid_new_tensor_shapes_types_and_declarations_are_rejected(self):
+        self.kw["contact_point_jacobian_world_m"] = self.t.zeros(2, 3, 3, 6)
+        with self.assertRaises(ValueError):
+            self.guard()
+        from g1_vla.rl_hand_control import BalancedEffortGraspController
+        invalid = dict(self.DECLARATION, activation_margin_rad=.007)
+        with self.assertRaises(ValueError):
+            BalancedEffortGraspController(self.t, self.seed, self.ids, domain_posture_guard=invalid)
+
+
 if __name__ == "__main__":
     unittest.main()

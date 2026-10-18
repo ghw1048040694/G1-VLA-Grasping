@@ -2054,20 +2054,35 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._last_written_full_effort[env_ids] = 0
             self._last_written_hand_effort[env_ids] = 0
 
-        def configure_effort_grasp(self, contract):
-            from .rl_effort_protocol import validate_effort_grasp_contract
+        def configure_effort_grasp(self, contract, *, domain_posture_guard=None):
+            from .rl_effort_protocol import validate_effort_grasp_contract, validate_contact_domain_posture_guard
             from .rl_hand_control import BalancedEffortGraspController
             if not effort_model or validate_effort_grasp_contract(contract) != effort_contract:
                 raise RLEnvironmentError("effort controller cannot silently change its physical contract")
             if self._effort_grasp is not None:
                 raise RLEnvironmentError("effort controller cannot be replaced during a run")
+            self._effort_domain_posture_guard = validate_contact_domain_posture_guard(domain_posture_guard)
+            guard_arguments = {}
+            if self._effort_domain_posture_guard is not None:
+                frames = effort_candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+                trajectory = torch.as_tensor([f.get("hand_target_rad", f.get("target_rad")) for f in frames],
+                    device=self.device, dtype=tensor(self.robot.data.joint_pos).dtype)
+                if tuple(trajectory.shape) != (6, 7) or not bool(torch.isfinite(trajectory).all()):
+                    raise RLEnvironmentError("domain posture guard requires the pinned original six keyframes")
+                tolerance = self._effort_domain_posture_guard["original_actual_geometry_tolerance_rad"]
+                self._effort_actual_domain_lower = (trajectory.amin(0)-tolerance)[None].expand(self.num_envs, -1).clone()
+                self._effort_actual_domain_upper = (trajectory.amax(0)+tolerance)[None].expand(self.num_envs, -1).clone()
+                guard_arguments["domain_posture_guard"] = self._effort_domain_posture_guard
             self._effort_grasp = BalancedEffortGraspController(torch,
                 tensor(self.robot.data.joint_pos)[:, self._action_ids[7:]], self._episode_ids,
-                parameters=contract["controller"]["parameters"])
+                parameters=contract["controller"]["parameters"], **guard_arguments)
             self._object_support_scale = torch.zeros(self.num_envs, device=self.device)
             self._object_support_episode_ids = self._episode_ids.clone()
             self._object_support_last_sample = None
             self._write_control_probe({"event": "effort_grasp_controller_installed", "contract": contract,
+                "contact_domain_posture_guard": self._effort_domain_posture_guard,
+                "actual_domain_lower_hand_rad": getattr(self, "_effort_actual_domain_lower", None),
+                "actual_domain_upper_hand_rad": getattr(self, "_effort_actual_domain_upper", None),
                 "native_physics_step_count": int(self.sim.get_physics_step_count()),
                 "episode_id": self._episode_ids, "drive_readback": self._effort_drive_readback,
                 "material_readback": self._effort_material_readback, "optimizer_steps": 0})
@@ -2194,6 +2209,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             gravity = tensor(self.robot.data.gravity_compensation_forces)[:, ids]
             support_torque, support_evidence = self._object_weight_support_torque(
                 valid=valid, tracking=tracking, geometry=geometry, current=current)
+            guard_feedback = {}
+            if getattr(self, "_effort_domain_posture_guard", None) is not None:
+                guard_feedback = {"contact_point_jacobian_world_m": geometry["point_jacobian_world_m"]
+                    if geometry is not None else torch.zeros(self.num_envs, 3, 3, 7, device=self.device),
+                    "actual_domain_lower_hand_rad": self._effort_actual_domain_lower,
+                    "actual_domain_upper_hand_rad": self._effort_actual_domain_upper,
+                    "physical_contact_safe": metrics.get("contact_safe", torch.zeros_like(valid))}
             effort, evidence, unsafe = self._effort_grasp.update(sample_id=native_step,
                 episode_id=self._episode_ids, dt=self.physics_dt, measured_hand_rad=q,
                 measured_hand_velocity_rad_s=tensor(self.robot.data.joint_vel)[:, ids],
@@ -2206,7 +2228,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 geometry_lower_hand_rad=ref["geometry_lower_hand_rad"], geometry_upper_hand_rad=ref["geometry_upper_hand_rad"],
                 nominal_velocity_limit_hand_rad_s=self._velocity[7:][None].expand_as(q),
                 penetration_m=metrics.get("maximum_penetration_m", torch.zeros(self.num_envs, device=self.device)),
-                closing_axis_hand7=ref["closing_axis_hand7"], object_support_torque_nm=support_torque)
+                closing_axis_hand7=ref["closing_axis_hand7"], object_support_torque_nm=support_torque,
+                **guard_feedback)
             self._unsafe |= unsafe
             self._last_written_hand_effort = effort.clone()
             self._effort_update_count += 1
@@ -3513,6 +3536,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "last_feedback_sample": self._physics_pinch_last_sample,
                         "declared_feedback_period_s": self.physics_dt if self._physics_pinch is not None else None},
                     "effort_grasp_feedback": {"enabled": self._effort_grasp is not None,
+                        "contact_domain_posture_guard": getattr(self, "_effort_domain_posture_guard", None),
+                        "controller_composition_version": getattr(self._effort_grasp, "contract", {}).get("version"),
                         "update_calls": self._effort_update_count, "last_feedback_sample": self._effort_last_sample,
                         "declared_feedback_period_s": self.physics_dt if self._effort_grasp is not None else None,
                         "hand_position_drive_disabled": effort_model,

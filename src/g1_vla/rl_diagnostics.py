@@ -483,7 +483,11 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
     if settings["profile_plan"] == "physics_pinch_v5":
         native.configure_physics_pinch(settings["compliant_pinch_controller"])
     if effort_mode:
-        native.configure_effort_grasp(settings["effort_grasp_controller"])
+        guard = settings.get("contact_domain_posture_guard")
+        if guard is None:
+            native.configure_effort_grasp(settings["effort_grasp_controller"])
+        else:
+            native.configure_effort_grasp(settings["effort_grasp_controller"], domain_posture_guard=guard)
     quota = EvaluationQuota(settings["num_envs"], settings["num_envs"] * settings["episodes_per_env"])
     steps = 0
     environment._g1_last_step_audit = _json_safe(native.step_audit())

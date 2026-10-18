@@ -751,6 +751,101 @@ def _balanced_effort_contract_and_parameters(parameters):
     return copy.deepcopy(contract), copy.deepcopy(contract["parameters"])
 
 
+def _contact_domain_guard_torque(t, declaration, *, q, a, point_jacobian, lower, upper,
+                                physical_safe, safe, tracking, normal_available,
+                                physical_loaded, overforce):
+    """Bounded thumb-only posture torque in the current normal-and-Z nullspace.
+
+    This geometric projection does not prove dynamic force decoupling or keep
+    every manifold point fixed. Independent 2ms physical gates remain decisive.
+    No contact Jacobian or guard effort is retained across samples or resets.
+    """
+    n = q.shape[0]
+    missing = [name for name, value in (("contact_point_jacobian_world_m", point_jacobian),
+        ("actual_domain_lower_hand_rad", lower), ("actual_domain_upper_hand_rad", upper),
+        ("physical_contact_safe", physical_safe)) if value is None]
+    supplied = not missing
+    if supplied:
+        for name, value, shape in (("contact point Jacobian", point_jacobian, (n, 3, 3, 7)),
+                                  ("actual domain lower", lower, (n, 7)),
+                                  ("actual domain upper", upper, (n, 7))):
+            if (not t.is_tensor(value) or tuple(value.shape) != shape or not value.is_floating_point()
+                    or value.dtype != q.dtype or value.device != q.device):
+                raise ValueError(name+" requires matching native floating tensor dimensions")
+        if (not t.is_tensor(physical_safe) or tuple(physical_safe.shape) != (n,)
+                or physical_safe.dtype != t.bool or physical_safe.device != q.device):
+            raise ValueError("physical_contact_safe requires matching native N boolean tensor")
+        finite = (t.isfinite(point_jacobian).all(dim=(-1, -2, -3)) &
+                  t.isfinite(lower).all(-1) & t.isfinite(upper).all(-1))
+        bounds_valid = (lower <= upper).all(-1)
+        margin = declaration["activation_margin_rad"]
+        low = lower[:, 2]+margin
+        high = upper[:, 2]-margin
+        bounds_valid &= low <= high
+        matrix = t.stack((a[:, 0, :3], point_jacobian[:, 0, 2, :3]), dim=1)
+    else:
+        finite = t.zeros(n, dtype=t.bool, device=q.device)
+        bounds_valid = finite.clone()
+        physical_safe = finite.clone()
+        low, high = t.zeros_like(q[:, 2]), t.zeros_like(q[:, 2])
+        matrix = t.zeros(n, 2, 3, device=q.device, dtype=q.dtype)
+    matrix_finite = t.isfinite(matrix).all(dim=(-1, -2))
+    finite &= matrix_finite
+    matrix = t.where(finite[:, None, None], matrix, t.zeros_like(matrix))
+    # full Vh is required: the reduced 2x3 SVD omits the one-dimensional null.
+    _, singular, vh = t.linalg.svd(matrix, full_matrices=True)
+    rank = (singular >= declaration["svd_tolerance_m"]).sum(-1)
+    null = vh[:, 2, :]
+    projector = null[:, :, None]*null[:, None, :]
+    projected_e2 = projector[:, :, 2]
+    component = projector[:, 2, 2]
+    rank_ok = rank == 2
+    component_ok = component >= declaration["minimum_nullspace_joint_component"]
+    usable = finite & bounds_valid & rank_ok & component_ok
+    gate = (usable & safe & tracking & normal_available.all(-1) &
+            physical_loaded.all(-1) & physical_safe & ~overforce.any(-1))
+    # A six-mrad interior target changes control only; original domain and its
+    # original .025-rad tolerance are supplied independently, never enlarged.
+    target = t.minimum(t.maximum(q[:, 2], low), high)
+    error = t.where(finite & bounds_valid, target-q[:, 2], t.zeros_like(q[:, 2]))
+    scalar = declaration["restoring_stiffness_nm_rad"]*error
+    before_cap = t.zeros_like(q)
+    before_cap[:, :3] = projected_e2*scalar[:, None]
+    before_cap = t.where(gate[:, None], before_cap, t.zeros_like(before_cap))
+    peak = before_cap.abs().amax(-1)
+    common_scale = (declaration["maximum_guard_joint_torque_nm"]/peak.clamp_min(1e-12)).clamp(max=1.)
+    torque = before_cap*common_scale[:, None]
+    residual = t.einsum("nri,ni->nr", matrix, torque[:, :3])
+    evidence = {"contract": copy.deepcopy(declaration), "inputs_supplied": supplied,
+        "missing_inputs": missing, "current_input_finite": finite,
+        "actual_domain_bounds_valid": bounds_valid, "safe_fresh_sample": safe,
+        "palm_tracking": tracking, "all_group_current_normals": normal_available.all(-1),
+        "all_groups_physically_loaded": physical_loaded.all(-1),
+        "original_physical_contact_safe": physical_safe,
+        "any_group_overforce": overforce.any(-1), "gate": gate,
+        "current_normal_world_z_jacobian_m": matrix,
+        "singular_values_m": singular, "retained_rank": rank, "required_rank": 2,
+        "thumb_nullspace_projector": projector, "projected_thumb2_axis": projected_e2,
+        "nullspace_thumb2_component": component, "rank_supported": rank_ok,
+        "thumb2_component_supported": component_ok,
+        "interior_lower_thumb2_rad": low, "interior_upper_thumb2_rad": high,
+        "actual_domain_lower_margin_all7_rad": q-lower if supplied else None,
+        "actual_domain_upper_margin_all7_rad": upper-q if supplied else None,
+        "measured_thumb2_rad": q[:, 2], "boundary_error_rad": error,
+        "restoring_scalar_nm": scalar, "requested_guard_before_own_cap_nm": before_cap,
+        "guard_common_scale": common_scale, "guard_torque_before_total_alpha_nm": torque,
+        "normal_projection_residual_m_nm": residual[:, 0],
+        "world_z_projection_residual_m_nm": residual[:, 1],
+        "original_actual_domain_not_enlarged": True,
+        "all_force_mode_position_springs_remain_zero": True,
+        "other_four_hand_joints_guard_torque_zero": True,
+        "fresh_current_geometry_only_no_history": True,
+        "geometric_projection_is_not_dynamic_force_isolation": True,
+        "group_centroid_projection_does_not_fix_every_contact_manifold_point": True,
+        "all_original_acceptance_gates_unchanged": True}
+    return torque, evidence
+
+
 class BalancedEffortGraspController:
     """Joint efforts for the declared hand-only grasp intervention.
 
@@ -767,8 +862,14 @@ class BalancedEffortGraspController:
     distribution is an internal-force reference, not a measured wrench balance.
     """
 
-    def __init__(self, torch, initial_hand_rad, episode_id, *, parameters=None):
+    def __init__(self, torch, initial_hand_rad, episode_id, *, parameters=None, domain_posture_guard=None):
         self.contract, self.parameters = _balanced_effort_contract_and_parameters(parameters)
+        self.domain_posture_guard = None
+        if domain_posture_guard is not None:
+            from .rl_effort_protocol import validate_contact_domain_posture_guard
+            self.domain_posture_guard = validate_contact_domain_posture_guard(domain_posture_guard)
+            self.contract["version"] += "+"+self.domain_posture_guard["version"]
+            self.contract["domain_posture_guard"] = copy.deepcopy(self.domain_posture_guard)
         self.torch = torch
         if (not torch.is_tensor(initial_hand_rad) or not initial_hand_rad.is_floating_point() or initial_hand_rad.ndim != 2 or
                 initial_hand_rad.shape[1] != 7 or not bool(torch.isfinite(initial_hand_rad).all())):
@@ -796,7 +897,9 @@ class BalancedEffortGraspController:
                raw_group_force_n, contact_measurement_valid, tracking, unsafe_latched,
                joint_lower_hand_rad, joint_upper_hand_rad, geometry_lower_hand_rad,
                geometry_upper_hand_rad, nominal_velocity_limit_hand_rad_s,
-               penetration_m, closing_axis_hand7, object_support_torque_nm=None):
+               penetration_m, closing_axis_hand7, object_support_torque_nm=None,
+               contact_point_jacobian_world_m=None, actual_domain_lower_hand_rad=None,
+               actual_domain_upper_hand_rad=None, physical_contact_safe=None):
         """Use completed native sample k to request efforts for k+1 exactly once."""
         t, p, n = self.torch, self.parameters, self.num_envs
         if (type(sample_id) is not int or sample_id < 0 or type(dt) not in (int, float) or
@@ -937,6 +1040,15 @@ class BalancedEffortGraspController:
         # Known closing axes allow opening even if no current normal exists.
         gravity_command = t.where(overforce_joint, t.zeros_like(g), gravity_clipped)
         posture = t.where(overforce_joint, t.zeros_like(posture), posture)
+        guard_evidence = None
+        if self.domain_posture_guard is not None:
+            guard_torque, guard_evidence = _contact_domain_guard_torque(t, self.domain_posture_guard,
+                q=q, a=a, point_jacobian=contact_point_jacobian_world_m,
+                lower=actual_domain_lower_hand_rad, upper=actual_domain_upper_hand_rad,
+                physical_safe=physical_contact_safe, safe=safe, tracking=tracking,
+                normal_available=normal_available, physical_loaded=group_physical_loaded,
+                overforce=overforce)
+            posture = posture+guard_torque
         opening_fallback = t.where(overforce_joint & ~normal_available[:, self.group_ids] & force_axis[None],
                                    -axis[None]*p["overforce_opening_torque_nm"], t.zeros_like(g))
         non_gravity = posture+force_torque+opening_fallback
@@ -958,6 +1070,10 @@ class BalancedEffortGraspController:
         unclipped_total = g+impedance+force_torque+opening_fallback
         unclipped_total = t.where(support_after_mask != 0,
                                  unclipped_total+support_after_mask, unclipped_total)
+        if guard_evidence is not None:
+            # Keep the historical None path bit-identical. This diagnostic is
+            # before the total cap but includes the optional projected guard.
+            unclipped_total = unclipped_total+guard_torque
         requested_total = gravity_command+non_gravity
         effort_before_emergency_axis_guard = gravity_command+alpha[:, None]*non_gravity
         # A current normal may have an unexpected per-joint sign. An overload
@@ -1039,4 +1155,17 @@ class BalancedEffortGraspController:
             "requested_torque_bounds_are_not_measured_force_bounds": True,
             "force_target_distribution_is_not_verified_wrench_balance": True,
         }
+        if guard_evidence is not None:
+            guard_evidence["guard_torque_after_total_common_scale_nm"] = alpha[:, None]*guard_torque
+            guard_evidence["unprojected_total_diagnostic_includes_projected_guard"] = True
+            # This decomposition follows exactly the same final hold, emergency,
+            # duplicate and unsafe selections as the complete effort command.
+            applied_guard = alpha[:, None]*guard_torque
+            applied_guard = t.where(remove_closing, t.zeros_like(applied_guard), applied_guard)
+            applied_guard = t.where(safe[:, None] & ~unsafe[:, None], applied_guard, t.zeros_like(applied_guard))
+            if duplicate:
+                applied_guard = t.zeros_like(applied_guard)
+            guard_evidence["guard_component_for_current_new_command_nm"] = applied_guard
+            guard_evidence["duplicate_holds_prior_complete_effort_without_new_guard_evaluation"] = duplicate
+            evidence["contact_domain_posture_guard"] = guard_evidence
         return effort, evidence, unsafe

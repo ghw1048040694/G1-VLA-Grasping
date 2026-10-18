@@ -115,6 +115,7 @@ RL_PROBE_DEFAULTS = {
     "effort_grasp_controller": None,
     "collision_geometry_audit": None,
     "contact_acquisition": None,
+    "contact_domain_posture_guard": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -228,8 +229,17 @@ def validate_probe_settings(value):
             "raw_force_stop_n": .02, "start_phase": "final_stage_duration_complete",
             "original_actual_geometry_tolerance_rad": .025,
             "requires_no_physical_loaded_point": True, "all_original_acceptance_gates_unchanged": True}
-        if plan != "balanced_effort_v6" or _canonical(acquisition) != _canonical(expected_acquisition):
+        acquisition_v2 = {**expected_acquisition, "version": "g1_bounded_measured_touch_search_v2",
+                          "reference_closing_rate_rad_s": .04}
+        if plan != "balanced_effort_v6" or _canonical(acquisition) not in (
+                _canonical(expected_acquisition), _canonical(acquisition_v2)):
             raise ValueError("Contact acquisition requires the exact bounded measured-touch declaration")
+    guard = result["contact_domain_posture_guard"]
+    if guard is not None:
+        if plan != "balanced_effort_v6" or acquisition is None:
+            raise ValueError("Contact-domain posture guard requires balanced_effort_v6 and explicit contact acquisition")
+        from .rl_effort_protocol import validate_contact_domain_posture_guard
+        result["contact_domain_posture_guard"] = validate_contact_domain_posture_guard(guard)
     geometry = result["collision_geometry_audit"]
     if geometry is not None:
         expected = {"enabled": True, "env_ids": [0], "body_names": [

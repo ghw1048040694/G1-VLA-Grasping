@@ -25,6 +25,20 @@ ALWAYS_RIGID_BODY_NAMES = (
 )
 _NATIVE_EFFORT_UPPER_NM = (2.45, 1.4, 1.4, 1.4, 1.4, 1.4, 1.4)
 _KINDS = "explicit_hand_effort_and_material_calibration"
+_CONTACT_DOMAIN_POSTURE_GUARD = {
+    "version": "g1_contact_domain_nullspace_posture_guard_v1",
+    "hand_joint_index": 2,
+    "activation_margin_rad": .006,
+    "restoring_stiffness_nm_rad": 2.0,
+    "maximum_guard_joint_torque_nm": .004,
+    "minimum_nullspace_joint_component": .05,
+    "svd_tolerance_m": .0001,
+    "original_actual_geometry_tolerance_rad": .025,
+    "protect_current_normal_and_world_z": True,
+    "requires_all_groups_physically_loaded": True,
+    "requires_original_contact_safe": True,
+    "all_original_acceptance_gates_unchanged": True,
+}
 _BALANCED_DEFAULTS = {
     "version": "g1_balanced_normal_and_object_support_effort_grasp_v2",
     "kind": "explicit_joint_effort_from_current_contact_normal_jacobian",
@@ -243,6 +257,19 @@ def _number(value, low, high, name, *, positive=False):
 def _integer(value, low, high, name):
     if type(value) is not int or not low <= value <= high:
         raise ValueError(name + " must be an integer in range")
+
+
+def validate_contact_domain_posture_guard(value):
+    """Validate the optional exact controller guard; never change acceptance.
+
+    ``None`` preserves the prior controller path. A declared guard only adds
+    bounded motor effort through the existing common alpha and total caps;
+    its actual nullspace/current-contact conditions require runtime evidence.
+    """
+    if value is None:
+        return None
+    _exact(value, _CONTACT_DOMAIN_POSTURE_GUARD, "contact_domain_posture_guard")
+    return deepcopy(value)
 
 
 def validate_balanced_effort_controller_contract(value):

@@ -1236,13 +1236,27 @@
     },
     "collision_geometry_audit": null,
     "contact_acquisition": {
-      "version": "g1_bounded_measured_touch_search_v1",
-      "reference_closing_rate_rad_s": 0.02,
+      "version": "g1_bounded_measured_touch_search_v2",
+      "reference_closing_rate_rad_s": 0.04,
       "maximum_extra_closure_rad": 0.02,
       "raw_force_stop_n": 0.02,
       "start_phase": "final_stage_duration_complete",
       "original_actual_geometry_tolerance_rad": 0.025,
       "requires_no_physical_loaded_point": true,
+      "all_original_acceptance_gates_unchanged": true
+    },
+    "contact_domain_posture_guard": {
+      "version": "g1_contact_domain_nullspace_posture_guard_v1",
+      "hand_joint_index": 2,
+      "activation_margin_rad": 0.006,
+      "restoring_stiffness_nm_rad": 2.0,
+      "maximum_guard_joint_torque_nm": 0.004,
+      "minimum_nullspace_joint_component": 0.05,
+      "svd_tolerance_m": 0.0001,
+      "original_actual_geometry_tolerance_rad": 0.025,
+      "protect_current_normal_and_world_z": true,
+      "requires_all_groups_physically_loaded": true,
+      "requires_original_contact_safe": true,
       "all_original_acceptance_gates_unchanged": true
     }
   }

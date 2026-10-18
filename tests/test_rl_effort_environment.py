@@ -33,7 +33,7 @@ def actual_method(name, scope, *, before_assignment=None):
                 break
             selected.append(statement)
         method.body = selected
-    namespace = dict(scope)
+    namespace = {"__name__": "g1_vla.rl_environment", "__package__": "g1_vla", **scope}
     exec(compile(ast.Module(body=[method], type_ignores=[]), "<actual-native-effort-adapter>", "exec"), namespace)
     return namespace[name]
 
@@ -715,6 +715,55 @@ class NativeEffortAdapterTests(unittest.TestCase):
         # This fixture deliberately has identity rotations and zero offset.
         scope = dict(self.scope, quat_apply=lambda q, v: v, quat_mul=lambda q, r: q)
         return env, calls, rows, actual_method("_update_effort_grasp", scope)
+
+    def test_domain_guard_native_install_uses_original_candidate_domain_not_search_box(self):
+        from g1_vla.rl_effort_protocol import effort_grasp_contract
+        t = self.t
+        contract = effort_grasp_contract()
+        candidate = json.loads((ROOT/"resources/rl_geometry_candidates/opposed_face_effort_pinch_v1.json").read_text())
+        declaration = json.loads((ROOT/"configs/experiment.json").read_text())["rl_diagnostics"]["contact_domain_posture_guard"]
+        q = t.zeros(2, 43)
+        q[:, 7:14] = t.tensor(candidate["source_hand_rad"])
+        events = []
+        env = SimpleNamespace(num_envs=2, device="cpu", _effort_grasp=None,
+            _action_ids=list(range(14)), _episode_ids=t.tensor([2,2]),
+            robot=SimpleNamespace(data=SimpleNamespace(joint_pos=q)),
+            sim=SimpleNamespace(get_physics_step_count=lambda: 0),
+            _write_control_probe=events.append, _effort_drive_readback={}, _effort_material_readback={})
+        method = actual_method("configure_effort_grasp", dict(self.scope, effort_model=True,
+            effort_contract=contract, effort_candidate=candidate))
+        method(env, contract, domain_posture_guard=declaration)
+        frames = candidate["geometry_evidence"]["source_detail"]["stage_keyframes"]
+        raw = t.tensor([f.get("hand_target_rad", f.get("target_rad")) for f in frames])
+        self.assertTrue(t.equal(env._effort_actual_domain_lower, (raw.amin(0)-.025)[None].expand(2,-1)))
+        self.assertTrue(t.equal(env._effort_actual_domain_upper, (raw.amax(0)+.025)[None].expand(2,-1)))
+        self.assertEqual(events[-1]["contact_domain_posture_guard"], declaration)
+        self.assertFalse(events[-1]["optimizer_steps"])
+        with self.assertRaisesRegex(RuntimeError, "cannot be replaced"):
+            method(env, contract, domain_posture_guard=declaration)
+
+    def test_domain_guard_adapter_forwards_current_point_geometry_and_original_bounds(self):
+        env, calls, rows, method = self.update_fixture()
+        t = self.t
+        env._effort_domain_posture_guard = {"version": "fixture"}
+        env._effort_actual_domain_lower = t.full((2, 7), -.9)
+        env._effort_actual_domain_upper = t.full((2, 7), .9)
+        jac = t.arange(126).reshape(2,3,3,7).float()
+        env._effort_geometry["point_jacobian_world_m"] = jac
+        env._last_metrics["contact_safe"] = t.tensor([True, False])
+        method(env)
+        self.assertTrue(t.equal(calls[-1]["contact_point_jacobian_world_m"], jac))
+        self.assertTrue(t.equal(calls[-1]["actual_domain_lower_hand_rad"], env._effort_actual_domain_lower))
+        self.assertTrue(t.equal(calls[-1]["actual_domain_upper_hand_rad"], env._effort_actual_domain_upper))
+        self.assertTrue(t.equal(calls[-1]["physical_contact_safe"], t.tensor([True, False])))
+        # A stale geometry cannot be promoted by a physically-safe cached flag.
+        env._effort_geometry["native_step"] = 8
+        method(env)
+        self.assertFalse(calls[-1]["group_contact_valid"].any())
+        del env._effort_domain_posture_guard
+        method(env)
+        self.assertNotIn("contact_point_jacobian_world_m", calls[-1])
+        self.assertNotIn("actual_domain_lower_hand_rad", calls[-1])
 
     def weight_support_fixture(self):
         from g1_vla.rl_effort_protocol import effort_grasp_contract

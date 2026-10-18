@@ -8,6 +8,7 @@ import unittest
 from g1_vla.rl_effort_protocol import (
     balanced_effort_controller_contract, effort_grasp_contract,
     validate_balanced_effort_controller_contract, validate_effort_grasp_contract,
+    validate_contact_domain_posture_guard,
     ALWAYS_RIGID_BODY_NAMES, FINGER_BODY_NAMES,
 )
 
@@ -31,19 +32,130 @@ class EffortGraspProtocolTests(unittest.TestCase):
         self.assertEqual(validate_probe_settings(value)["contact_acquisition"], declaration)
         previous = deepcopy(value)
         previous.pop("contact_acquisition")
+        previous.pop("contact_domain_posture_guard", None)
         self.assertIsNone(validate_probe_settings(previous)["contact_acquisition"])
         for key in declaration:
             changed = deepcopy(value)
             changed["contact_acquisition"].pop(key)
             with self.subTest(missing=key), self.assertRaises(ValueError):
                 validate_probe_settings(changed)
-        for key, bad in [("maximum_extra_closure_rad", .025), ("reference_closing_rate_rad_s", .04),
+        for key, bad in [("maximum_extra_closure_rad", .025), ("reference_closing_rate_rad_s", .03),
                          ("raw_force_stop_n", 1.5), ("requires_no_physical_loaded_point", 1),
                          ("version", "unversioned"), ("start_phase", "bootstrap")]:
             changed = deepcopy(value)
             changed["contact_acquisition"][key] = bad
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_probe_settings(changed)
+
+    def test_touch_acquisition_v1_and_v2_require_matched_exact_rates(self):
+        from pathlib import Path
+        from g1_vla.rl_probe_protocol import validate_probe_settings
+        config = json.loads((Path(__file__).resolve().parents[1]/"configs/experiment.json").read_text())
+        original = config["rl_diagnostics"]
+        for version, rate in [("g1_bounded_measured_touch_search_v1", .02),
+                              ("g1_bounded_measured_touch_search_v2", .04)]:
+            value = deepcopy(original)
+            value["contact_acquisition"].update(version=version, reference_closing_rate_rad_s=rate)
+            declaration = value["contact_acquisition"]
+            self.assertEqual(validate_probe_settings(value)["contact_acquisition"], declaration)
+            for wrong in [.03, .04 if rate == .02 else .02, True, math.nan]:
+                changed = deepcopy(value)
+                changed["contact_acquisition"]["reference_closing_rate_rad_s"] = wrong
+                with self.subTest(version=version, wrong_rate=wrong), self.assertRaises(ValueError):
+                    validate_probe_settings(changed)
+            for key, wrong in [("maximum_extra_closure_rad", .021),
+                               ("raw_force_stop_n", .04),
+                               ("original_actual_geometry_tolerance_rad", .03),
+                               ("all_original_acceptance_gates_unchanged", False)]:
+                changed = deepcopy(value); changed["contact_acquisition"][key] = wrong
+                with self.subTest(version=version, key=key), self.assertRaises(ValueError):
+                    validate_probe_settings(changed)
+
+    @staticmethod
+    def domain_guard():
+        return {"version": "g1_contact_domain_nullspace_posture_guard_v1",
+            "hand_joint_index": 2, "activation_margin_rad": .006,
+            "restoring_stiffness_nm_rad": 2.0, "maximum_guard_joint_torque_nm": .004,
+            "minimum_nullspace_joint_component": .05, "svd_tolerance_m": .0001,
+            "original_actual_geometry_tolerance_rad": .025,
+            "protect_current_normal_and_world_z": True,
+            "requires_all_groups_physically_loaded": True,
+            "requires_original_contact_safe": True,
+            "all_original_acceptance_gates_unchanged": True}
+
+    def test_domain_guard_none_preserves_legacy_and_core_effort_contract(self):
+        from g1_vla.rl_probe_protocol import validate_probe_settings
+        self.assertIsNone(validate_contact_domain_posture_guard(None))
+        self.assertIsNone(validate_probe_settings({})["contact_domain_posture_guard"])
+        self.assertEqual(effort_grasp_contract()["version"], "g1_explicit_effort_grasp_protocol_v4_object_support")
+        self.assertEqual(validate_effort_grasp_contract(self.value), self.value)
+        self.assertNotIn("contact_domain_posture_guard", self.value)
+        changed = deepcopy(self.value)
+        changed["contact_domain_posture_guard"] = self.domain_guard()
+        with self.assertRaises(ValueError):
+            validate_effort_grasp_contract(changed)
+
+    def test_domain_guard_exact_json_roundtrip_and_independent_copy(self):
+        value = self.domain_guard()
+        result = validate_contact_domain_posture_guard(json.loads(json.dumps(value)))
+        self.assertEqual(result, value)
+        result["activation_margin_rad"] = .1
+        self.assertEqual(value, self.domain_guard())
+
+    def test_domain_guard_requires_all_and_only_declared_fields(self):
+        for key in self.domain_guard():
+            value = self.domain_guard(); value.pop(key)
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                validate_contact_domain_posture_guard(value)
+        value = self.domain_guard(); value["hidden_override"] = True
+        for bad in [value, [], False, "guard", 1]:
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                validate_contact_domain_posture_guard(bad)
+
+    def test_domain_guard_numerics_are_exact_typed_finite_and_not_booleans(self):
+        for key, original in self.domain_guard().items():
+            if type(original) not in (int, float):
+                continue
+            for bad in [True, False, math.nan, math.inf, str(original), original*1.01, -original]:
+                value = self.domain_guard(); value[key] = bad
+                with self.subTest(key=key, value=bad), self.assertRaises(ValueError):
+                    validate_contact_domain_posture_guard(value)
+        value = self.domain_guard(); value["hand_joint_index"] = 2.0
+        with self.assertRaises(ValueError):
+            validate_contact_domain_posture_guard(value)
+
+    def test_domain_guard_declarations_cannot_disable_original_contact_or_expand_domain(self):
+        for key, original in self.domain_guard().items():
+            if type(original) is not bool:
+                continue
+            for bad in [False, 1, "true"]:
+                value = self.domain_guard(); value[key] = bad
+                with self.subTest(key=key, value=bad), self.assertRaises(ValueError):
+                    validate_contact_domain_posture_guard(value)
+        for key, bad in [("version", "unversioned"), ("original_actual_geometry_tolerance_rad", .03),
+                         ("maximum_guard_joint_torque_nm", .04)]:
+            value = self.domain_guard(); value[key] = bad
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_contact_domain_posture_guard(value)
+
+    def test_domain_guard_probe_requires_balanced_effort_and_contact_acquisition(self):
+        from pathlib import Path
+        from g1_vla.rl_probe_protocol import validate_probe_settings
+        config = json.loads((Path(__file__).resolve().parents[1]/"configs/experiment.json").read_text())
+        value = config["rl_diagnostics"]
+        value["contact_domain_posture_guard"] = self.domain_guard()
+        self.assertEqual(validate_probe_settings(value)["contact_domain_posture_guard"], self.domain_guard())
+        for acquisition in (None,):
+            changed = deepcopy(value); changed["contact_acquisition"] = acquisition
+            with self.assertRaises(ValueError):
+                validate_probe_settings(changed)
+        with self.assertRaises(ValueError):
+            validate_probe_settings({"contact_domain_posture_guard": self.domain_guard()})
+        previous = deepcopy(value); previous.pop("contact_domain_posture_guard")
+        self.assertIsNone(validate_probe_settings(previous)["contact_domain_posture_guard"])
+        value["contact_domain_posture_guard"]["requires_original_contact_safe"] = 1
+        with self.assertRaises(ValueError):
+            validate_probe_settings(value)
 
     def test_default_is_fresh_and_json_roundtrips(self):
         original = effort_grasp_contract()
