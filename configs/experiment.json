@@ -958,7 +958,7 @@
     "backend": "g1_control_physics_diagnostics_v6",
     "num_envs": 8,
     "episodes_per_env": 1,
-    "max_control_steps": 91,
+    "max_control_steps": 213,
     "max_wall_time_s": 3600,
     "optimizer_steps": 0,
     "training_allowed": false,
@@ -1000,7 +1000,7 @@
     "guided_target_lead_max_rad": null,
     "compliant_pinch_controller": null,
     "effort_grasp_controller": {
-      "version": "g1_explicit_effort_grasp_protocol_v4_object_support",
+      "version": "g1_explicit_effort_grasp_protocol_v5_full_lift",
       "kind": "explicit_hand_effort_and_material_calibration",
       "joint_order": [
         "right_hand_thumb_0_joint",
@@ -1176,11 +1176,11 @@
         "native_binding_readback_required": true
       },
       "evaluation": {
-        "protocol": "calibration8_v1",
+        "protocol": "full_lift8_v1",
         "num_envs": 8,
         "episodes_per_env": 1,
-        "max_control_steps": 91,
-        "nominal_episode_budget_s": 6.0,
+        "max_control_steps": 213,
+        "nominal_episode_budget_s": 14.0,
         "physics_dt_s": 0.002,
         "control_period_s": 0.066,
         "max_wall_time_s": 3600.0,
@@ -1214,8 +1214,8 @@
         "hand_upward_force_weight_fraction_min": 0.8,
         "hand_upward_force_weight_fraction_max": 1.2,
         "joint_limit_tolerance_rad": 0.003,
-        "actual_height_limit_m": 0.0065,
-        "main_lift_authorized": false,
+        "actual_height_limit_m": 0.115,
+        "main_lift_authorized": true,
         "reward_used_as_success": false
       },
       "logging": {
@@ -1277,6 +1277,30 @@
       "partial_thumb2_normal_world_z_guard": true,
       "all_original_acceptance_gates_unchanged": true
     },
-    "full_lift": null
+    "full_lift": {
+      "version": "g1_contact_qualified_full_lift_v2_servo_headroom",
+      "target_corner_clearance_m": 0.1,
+      "palm_total_lift_request_m": 0.105,
+      "palm_lift_request_max_m": 0.11,
+      "lift_speed_m_s": 0.015,
+      "lift_acceleration_m_s2": 0.03,
+      "palm_position_gain_per_s": 8.0,
+      "hold_duration_s": 0.5,
+      "hold_consecutive_samples": 251,
+      "actual_height_limit_m": 0.115,
+      "episode_length_s": 14.0,
+      "physics_dt_s": 0.002,
+      "local_support_consecutive_samples": 100,
+      "local_support_first_to_last_s": 0.198,
+      "requires_local_support_before_lift": true,
+      "requires_whole_episode_force_clean_before_lift": true,
+      "requires_whole_episode_original_hand_domain_clean_before_lift": true,
+      "original_hand_domain_tolerance_rad": 0.025,
+      "fixed_pre_transfer_grip_reference_required": true,
+      "all_other_original_physical_gates_unchanged": true,
+      "training_allowed": false,
+      "optimizer_steps": 0,
+      "palm_servo_speed_limit_m_s": 0.018
+    }
   }
 }
