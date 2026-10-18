@@ -1246,7 +1246,7 @@
       "all_original_acceptance_gates_unchanged": true
     },
     "contact_domain_posture_guard": {
-      "version": "g1_contact_domain_nullspace_posture_guard_v3_all_loaded_interior_preservation",
+      "version": "g1_contact_domain_nullspace_posture_guard_v2_common_thumb_interval",
       "activation_margin_rad": 0.006,
       "restoring_stiffness_nm_rad": 2.0,
       "maximum_guard_joint_torque_nm": 0.004,
@@ -1263,14 +1263,9 @@
         2
       ],
       "spring_coordinate": "unit_current_thumb_normal_world_z_nullspace_displacement_rad",
-      "control_target": "captured_first_safe_all_loaded_margin_capped_by_current_common_feasibility",
+      "control_target": "maximum_common_interior_margin_up_to_activation_margin",
       "interval_solver": "analytic_pairwise_margin_float64_v1",
-      "minimum_component_gate_scope": "unchanged_legacy_partial_thumb2_recovery_only",
-      "interior_reserve_capture": "first_fresh_safe_all_groups_physically_loaded_original_thumb3_minimum_margin",
-      "interior_reserve_floor_rad": 0.006,
-      "interior_reserve_reset": "episode_or_current_contact_safety_loss_or_unsafe_discontinuity",
-      "guard_position_difference_telemetry": "same_epoch_consecutive_native_2ms_not_control_feedback",
-      "interior_reference_is_not_acceptance_or_cached_geometry": true
+      "minimum_component_gate_scope": "unchanged_legacy_partial_thumb2_recovery_only"
     },
     "contact_transition_control": {
       "version": "g1_coordinated_contact_transition_v3_relative_viscous_preload",
