@@ -34,7 +34,7 @@ class EffortGraspProtocolTests(unittest.TestCase):
         value = config["rl_diagnostics"]
         contract = effort_grasp_contract()
         contract["evaluation"].update(protocol="acceptance32_v1", episodes_per_env=4, max_control_steps=364)
-        value.update(full_lift=None, contact_transition_control=None, control_preshape=None,
+        value.update(full_lift=None, contact_transition_control=None, control_preshape=None, approach_course=None,
             max_wall_time_s=contract["evaluation"]["max_wall_time_s"],
             effort_grasp_controller=contract, num_envs=8, episodes_per_env=4, max_control_steps=364)
         return value

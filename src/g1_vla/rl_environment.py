@@ -1475,6 +1475,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
     effort_model = physics_protocol == RL_PHYSICS_EFFORT_GRASP
     fixed_palm_model = physics_protocol in (RL_PHYSICS_FIXED_PALM_ADJACENCY, RL_PHYSICS_EFFORT_GRASP)
     effort_contract, effort_candidate = None, None
+    approach_course=config.get("rl_diagnostics",{}).get("approach_course")
+    approach_resource, approach_home_fk = None, None
     control_preshape=config.get("rl_diagnostics",{}).get("control_preshape")
     preshape_resolution=None
     if control_preshape is not None and not effort_model:
@@ -1511,6 +1513,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             raise RLEnvironmentError("new joint reset requires independently computed native FK reference")
         initial["official_native_fk_reference"] = reference
         initial["root_pose_xyzw"] = list(effort_candidate.get("reset_root_pose_xyzw", initial["root_pose_xyzw"]))
+    if approach_course is not None:
+        from .rl_approach import validate_approach_declaration
+        from .rl_approach_state import load_course_reference
+        approach_course=validate_approach_declaration(approach_course)
+        if (not effort_model or full_lift is None or
+                full_lift["version"]!="g1_contact_qualified_arm_home_lift_v5_32s"):
+            raise RLEnvironmentError("Arm-home approach requires its explicit diagnostic full-task version")
+        approach_resource,approach_home_fk=load_course_reference(config,config["rl_diagnostics"],effort_candidate)
+        initial=copy.deepcopy(initial)
+        initial["joint_positions_rad"]=copy.deepcopy(approach_resource["home_joint_positions_rad"])
+        initial["official_native_fk_reference"]=approach_home_fk
     actuator_specs = _actuator_specifications(initial)
     if effort_model:
         for name, cap in zip(RIGHT_HAND, effort_contract["actuation"]["total_torque_caps_nm"]):
@@ -1719,6 +1732,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                  self._control_probe_profile["name"] in ("compliant_pinch_pose_hold", "physics_pinch_pose_hold", "balanced_effort_pose_hold"))
                 eye_offset = [0.635, -0.262, 1.045] if pinch_closeup else [1.05, -0.65, 1.30]
                 target_offset = [0.32, 0.055, 0.82] if pinch_closeup else [0.35, 0.055, 0.80]
+                if approach_course is not None:
+                    eye_offset,target_offset=[.90,-.55,1.30],[.35,.03,.89]
                 eye = self.scene.env_origins[0] + torch.tensor(eye_offset, device=self.device)
                 target = self.scene.env_origins[0] + torch.tensor(target_offset, device=self.device)
                 self._evaluation_camera.set_world_poses_from_view(eye[None], target[None])
@@ -1731,6 +1746,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "compliant_pinch_pose_hold","physics_pinch_pose_hold","balanced_effort_pose_hold")
                 eye_offset=[.635,-.262,1.045] if pinch_closeup else [1.05,-.65,1.30]
                 target_offset=[.32,.055,.82] if pinch_closeup else [.35,.055,.80]
+                if approach_course is not None:
+                    eye_offset,target_offset=[.90,-.55,1.30],[.35,.03,.89]
                 for env_id in video_recording["env_ids"]:
                     eye=self.scene.env_origins[env_id]+torch.tensor(eye_offset,device=self.device)
                     target=self.scene.env_origins[env_id]+torch.tensor(target_offset,device=self.device)
@@ -1739,7 +1756,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "frame_directory":"video/env_"+str(env_id)+"/rgb_frames",
                         "frame_ledger":"video/env_"+str(env_id)+"/video_frames.jsonl",
                         "eye_world_m":eye.detach().cpu().tolist(),"target_world_m":target.detach().cpu().tolist(),
-                        "camera_view_protocol":"g1_pinch_closeup_declared_env_v1" if pinch_closeup else "g1_overview_declared_env_v1"})
+                        "camera_view_protocol":("g1_high_wait_vertical_approach_overview_v1" if approach_course is not None else
+                            "g1_pinch_closeup_declared_env_v1" if pinch_closeup else "g1_overview_declared_env_v1")})
                 self._video_status["enabled"]=True
             self._action_ids = [self.robot.joint_names.index(name) for name in ACTION_JOINT_NAMES]
             if len(self.robot.joint_names) != 43 or set(self.robot.joint_names) != set(initial["joint_positions_rad"]):
@@ -1797,7 +1815,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._effort_actual_domain_lower = (trajectory.amin(0)-.025)[None].expand(self.num_envs,-1).clone()
                 self._effort_actual_domain_upper = (trajectory.amax(0)+.025)[None].expand(self.num_envs,-1).clone()
             self._native_arm_interpolation = (full_lift is not None and
-                full_lift.get("arm_target_schedule")=="native_linear33_revalidated_v1")
+                full_lift.get("arm_target_schedule") in ("native_linear33_revalidated_v1",
+                    "home_and_lift_native_linear33_revalidated_v1"))
             self._keep_current_hand_force_on_full_failure = (full_lift is not None and
                 full_lift.get("full_lift_failure_response")=="stop_arm_keep_current_hand_force_feedback_v1")
             if self._native_arm_interpolation:
@@ -1813,6 +1832,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._arm_segment_cancelled = torch.zeros_like(self._support_qualified)
                 self._arm_segment_failure_hold = self._last_written_arm_target.clone()
             self._unsafe = torch.zeros_like(self._support_qualified)
+            if approach_course is not None:
+                from .rl_approach_state import NativeApproachAdmission
+                self._approach=NativeApproachAdmission(torch,approach_resource,approach_course["parameters"],
+                    self.num_envs,self.device)
+                self._approach_plan_complete=torch.zeros_like(self._support_qualified)
+                self._approach_planner_failed=torch.zeros_like(self._support_qualified)
+                self._approach_intent_episode_ids=self._episode_ids.clone()
+                self._approach_contact_last=None
+                self._approach_last=None
+                self._approach_measurement_unavailable=[None]*self.num_envs
             self._probe_overshoot = torch.zeros_like(self._support_qualified)
             self._grip_locked = torch.zeros_like(self._support_qualified)
             self._grip_reference = torch.zeros(self.num_envs, 3, device=self.device)
@@ -1852,6 +1881,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._native_self_pair_diagnostic = NativeSelfPairDiagnostics(
                     torch, tensor, PhysxManager.get_physics_sim_view(), get_current_stage(),
                     self._native_self_pair_paths, self.num_envs, self.physics_dt)
+                if approach_course is not None:
+                    from .rl_approach_contact import NativeApproachContactWitness
+                    self._approach_contact=NativeApproachContactWitness(torch,tensor,
+                        PhysxManager.get_physics_sim_view(),get_current_stage(),self.num_envs,self.physics_dt)
+                    if self._approach_contact.summary().get("available") is not True:
+                        raise RLEnvironmentError("Arm-home collision view cannot certify complete declared routing: "+
+                            str(self._approach_contact.summary()))
             if output:
                 output.mkdir(parents=True, exist_ok=True)
                 if self._control_probe_enabled:
@@ -2386,6 +2422,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 palm_height_limit = torch.where(self._full_lift.main_lift_authorized,
                     torch.full_like(palm_z, full_lift["palm_lift_request_max_m"]),
                     torch.full_like(palm_z, settings["probe_clearance_max_m"]))
+            if approach_course is not None:
+                approach_cap=approach_course["parameters"]["workspace_max_palm_z_m"]-float(
+                    approach_resource["pregrasp_palm_position_world_m"][2])
+                palm_height_limit=torch.where(~self._approach.admitted,
+                    torch.full_like(palm_z,approach_cap),palm_height_limit)
             allowance = (self._start_palm_z + palm_height_limit - previous_prediction).clamp_min(0)
             factor = torch.where(predicted_increment > allowance,
                                  allowance/predicted_increment.clamp_min(1e-12), torch.ones_like(allowance)).clamp(0, 1)
@@ -2441,7 +2482,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         getattr(self,"_native_arm_interpolation",False) else
                         "macro_arm_guard_and_unwritten_hand_reference_before_inner_feedback" if self._physics_pinch is not None else "macro_applied_target"),
                     "hand_target_execution": "2ms_feedback_after_completed_sample" if self._physics_pinch is not None else "macro_target_hold",
-                    "arm_target_execution": ("main_lift_native_linear33_revalidated" if
+                    "arm_target_execution": ("home_and_lift_native_linear33_revalidated" if approach_course is not None else "main_lift_native_linear33_revalidated" if
                         getattr(self,"_native_arm_interpolation",False) else "macro_target_hold"),
                     "point_jz": point_jz, "palm_position_world_m": tensor(self.robot.data.body_pos_w)[:, self._palm_id]+offset_w,
                     "palm_point_jacobian_w": offset_point_jacobian(torch, palm_jac, offset_w),
@@ -2457,7 +2498,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 self._arm_segment_native_index.zero_()
                 self._arm_segment_episode_ids = self._episode_ids.clone()
                 self._arm_segment_start_native = int(self.sim.get_physics_step_count())
-                self._arm_segment_enabled = (self._full_lift.main_lift_started & ~self._unsafe &
+                self._arm_segment_enabled = ((torch.ones_like(self._full_lift.main_lift_started) if
+                    approach_course is not None else self._full_lift.main_lift_started) & ~self._unsafe &
                                              ~self._arm_segment_cancelled)
 
         def _native_arm_substep_target(self):
@@ -2488,6 +2530,10 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             cap=torch.where(self._full_lift.main_lift_started,
                 torch.full_like(palm[:,2],full_lift["palm_lift_request_max_m"]),
                 torch.full_like(palm[:,2],settings["probe_clearance_max_m"]))
+            if approach_course is not None:
+                cap=torch.where(~self._approach.admitted,torch.full_like(cap,
+                    approach_course["parameters"]["workspace_max_palm_z_m"]-
+                    float(approach_resource["pregrasp_palm_position_world_m"][2])),cap)
             target,evidence=revalidated_native_arm_substep(torch,
                 segment_origin=self._arm_segment_origin,macro_endpoint=self._arm_segment_endpoint,
                 previous_written=self._last_written_arm_target,measured_arm=measured,
@@ -2721,6 +2767,21 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 raise RLEnvironmentError("effort grasp needs the exact declared macro reference fields")
             self._effort_reference = {k: v.detach().clone() for k, v in reference.items()}
             self._effort_reference["episode_id"] = self._episode_ids.clone()
+
+        def set_approach_plan_evidence(self, evidence):
+            """Macro intent only; native measurements own the admission latch."""
+            if approach_course is None or self._pending_physics_sample:
+                raise RLEnvironmentError("Approach intent requires its complete control boundary")
+            for key in ("kinematic_arrived","failed"):
+                value=evidence.get(key)
+                if (not torch.is_tensor(value) or value.dtype!=torch.bool or
+                        tuple(value.shape)!=(self.num_envs,) or value.device!=self._episode_ids.device):
+                    raise RLEnvironmentError("Approach intent must name per-env measured kinematics and planner status")
+            if not torch.is_tensor(evidence.get("episode_id")) or not torch.equal(evidence["episode_id"],self._episode_ids):
+                raise RLEnvironmentError("Approach intent has a stale episode")
+            self._approach_plan_complete=evidence["kinematic_arrived"].detach().clone()
+            self._approach_planner_failed=evidence["failed"].detach().clone()
+            self._approach_intent_episode_ids=self._episode_ids.clone()
 
         def _effort_contact_geometry(self, hand):
             """Current native points -> link-origin shifted Jacobians, no old normals.
@@ -2956,6 +3017,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             tracking = ((torch.linalg.vector_norm(palm-ref["palm_reference_world_m"], dim=-1) <= .003) &
                         (2*torch.acos(dot) <= .05))
             physical = metrics.get("group_physical_loaded_contact_count", torch.zeros(self.num_envs, 3, device=self.device)) > 0
+            hand_tracking=tracking
+            approach_hand_tracking=None
+            if approach_course is not None:
+                from .rl_approach import approach_hand_posture_tracking
+                hand_tracking,approach_hand_tracking=approach_hand_posture_tracking(torch,
+                    original_tracking=tracking,admitted=self._approach.admitted,
+                    approach_failed=self._approach.failed,fresh_valid=valid,
+                    current_normal_available=current,physical_group_loaded=physical,
+                    robot_cube_force_n=metrics.get("approach_robot_cube_contact_absolute_sum_n",
+                        torch.full_like(q[:,0],float("inf"))),unsafe=self._unsafe|self._full_lift.failed)
             gravity = tensor(self.robot.data.gravity_compensation_forces)[:, ids]
             support_torque, support_evidence = self._object_weight_support_torque(
                 valid=valid, tracking=tracking, geometry=geometry, current=current)
@@ -3001,7 +3072,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 inward_normal_jacobian=a, group_contact_valid=current,
                 group_physical_loaded=physical & fresh[:, None],
                 raw_group_force_n=metrics.get("group_normal_force_n", torch.zeros(self.num_envs, 3, device=self.device)),
-                contact_measurement_valid=valid, tracking=tracking, unsafe_latched=self._unsafe,
+                contact_measurement_valid=valid, tracking=hand_tracking, unsafe_latched=self._unsafe,
                 joint_lower_hand_rad=self._limits[:, ids, 0], joint_upper_hand_rad=self._limits[:, ids, 1],
                 geometry_lower_hand_rad=ref["geometry_lower_hand_rad"], geometry_upper_hand_rad=ref["geometry_upper_hand_rad"],
                 nominal_velocity_limit_hand_rad_s=self._velocity[7:][None].expand_as(q),
@@ -3037,6 +3108,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 "next_hand_effort_target_nm": effort, "current_normal_geometry": geometry,
                 "estimated_normal_only_object_wrench_before_torque_saturation": predicted_wrench,
                 "object_weight_support_request": support_evidence,
+                **({"approach_hand_posture_tracking":approach_hand_tracking} if approach_course is not None else {}),
                 "wrench_estimate_excludes_friction_and_is_not_verified_balance": True,
                 "evidence": evidence, "requires_unsafe": unsafe,
                 "hand_position_drive_disabled": True, "torque_command_cap_is_not_physical_force_cap": True})
@@ -3273,13 +3345,21 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                         "friction_force_on_sensor_w_n": hand["friction"][:min(8, self.num_envs), index],
                         "physical_loaded_count": hand["physical_loaded_count"][:min(8, self.num_envs), index]}
             other = self._cube_other_filter_indices
-            return {"cube_total_force": cube_normal+friction.sum(1),
+            contact_result={"cube_total_force": cube_normal+friction.sum(1),
                     "table_normal": normal[:, 0], "table_fn": fn[:, 0], "table_loaded_count": loaded[:, 0],
                     "robot_normal": normal[:, 1:].sum(dim=1), "robot_fn": fn[:, 1:].sum(dim=1),
                     "maximum_penetration_m": depth.amax(dim=1),
                     "other_fn": fn[:, other].sum(dim=1), "other_loaded_count": loaded[:, other].sum(dim=1),
                     "unfiltered_normal_residual_n": result["unfiltered_normal_residual_n"],
                     "hand": result["hand"]}
+            if approach_course is not None:
+                bucket=friction_raw["bucket"]
+                robot_patch=(bucket%width)!=0
+                friction_abs=torch.zeros(self.num_envs,device=self.device,dtype=normal.dtype)
+                friction_abs.index_add_(0,torch.div(bucket[robot_patch],width,rounding_mode="floor"),
+                    torch.linalg.vector_norm(friction_raw["force"][robot_patch],dim=-1))
+                contact_result["robot_raw_contact_absolute_sum_n"]=fn[:,1:].sum(1)+friction_abs
+            return contact_result
 
         def _crosscheck_hand_views(self, hand, object_up_world):
             audit = self._contact_crosscheck
@@ -3427,6 +3507,48 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 other_force = torch.full_like(depth, float("inf"))
                 table_loaded_count = torch.ones(self.num_envs, dtype=torch.int64, device=self.device)
                 other_loaded_count = torch.ones_like(table_loaded_count)
+            if approach_course is not None:
+                native=int(self.sim.get_physics_step_count())
+                self._approach_contact_last=self._approach_contact.sample_completed(native,self._episode_ids)
+                path_available=torch.tensor(self._approach_contact_last["per_env_available"],device=self.device,dtype=torch.bool)
+                path_clean=torch.tensor(self._approach_contact_last["per_env_clean"],device=self.device,dtype=torch.bool)
+                if not bool(path_available.all()):
+                    for i,available in enumerate(self._approach_contact_last["per_env_available"]):
+                        if not available and self._approach_measurement_unavailable[i] is None:
+                            self._approach_measurement_unavailable[i]=str(self._approach_contact_last["per_env_unavailable_reason"][i])
+                body_quat=tensor(self.robot.data.body_quat_w)[:,self._palm_id]
+                palm_offset=quat_apply(body_quat,self._palm_local)
+                q_all=tensor(self.robot.data.joint_pos)
+                hand=q_all[:,self._action_ids[7:]]
+                original_domain=((hand>=self._effort_actual_domain_lower)&(hand<=self._effort_actual_domain_upper)).all(-1)
+                whole_clean=(self._full_lift.whole_episode_force_clean & self._full_lift.whole_episode_original_domain_clean &
+                    ~self._full_lift.failed & original_domain & torch.isfinite(groups).all(-1) &
+                    (groups>=0).all(-1) & (groups<=1.5).all(-1))
+                from .rl_approach_state import current_object_height_unsafe
+                current_overshoot=current_object_height_unsafe(torch,clearance,position[:,2]-self._start_cube_z,
+                    self._full_lift.main_lift_started,local_cap_m=settings["probe_clearance_max_m"],
+                    local_tolerance_m=settings["probe_overshoot_tolerance_m"],full_cap_m=full_lift["actual_height_limit_m"])
+                stale_intent=self._approach_intent_episode_ids!=self._episode_ids
+                self._approach_last=self._approach.update(native_step=native,episode_ids=self._episode_ids,
+                    q_action=q_all[:,self._action_ids],qd_action=tensor(self.robot.data.joint_vel)[:,self._action_ids],
+                    palm_position=tensor(self.robot.data.body_pos_w)[:,self._palm_id]+palm_offset,
+                    palm_quaternion=quat_mul(body_quat,self._palm_local_rotation),cube_position=position,cube_quaternion=rotation,
+                    env_origins=self.scene.env_origins,measurement_valid=finite & bool(group_measurement_available) & path_available,
+                    path_collision_clean=path_clean,
+                    robot_cube_force_n=(cube_contacts["robot_raw_contact_absolute_sum_n"] if group_measurement_available else torch.full_like(depth,float("inf"))),
+                    mechanical_safe=joint_safe,unsafe=self._unsafe | self._probe_overshoot | current_overshoot |
+                        ~finite | (depth>settings["max_penetration_m"]),
+                    whole_task_clean=whole_clean,plan_complete_requested=self._approach_plan_complete & ~stale_intent,
+                    planner_failed=self._approach_planner_failed | stale_intent,full_success=self._full_lift.full_success)
+                if bool(self._approach_last["new_admission"].any()):
+                    self._write_control_probe({"event":"arm_home_measured_admission",**self._approach_last,
+                        "measured_joint_position_all43_rad":q_all,
+                        "measured_joint_velocity_all43_rad_s":tensor(self.robot.data.joint_vel),
+                        "palm_position_world_m":tensor(self.robot.data.body_pos_w)[:,self._palm_id]+palm_offset,
+                        "palm_quaternion_xyzw":quat_mul(body_quat,self._palm_local_rotation),
+                        "cube_position_world_m":position,"cube_quaternion_xyzw":rotation,
+                        "full_lift_state_before_current_sample_update":self._full_lift.metrics(),
+                        "no_physical_state_write_no_reset_no_history_clear":True})
             loaded = (groups > settings["group_force_min_n"]).all(dim=-1) & (group_physical > 0).all(dim=-1)
             loaded &= no_positive_gap_load & friction_manifold
             new_lock = loaded & ~self._grip_locked
@@ -3488,6 +3610,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                      "opposition_safe": reference_summary["opposition"] <= settings["opposition_dot_max"],
                      "upward_load_min": ref_upward >= 0.8*weight, "upward_load_max": ref_upward <= 1.2*weight,
                      "loaded": ref_loaded, "contact_safe": ref_safe, "support": ref_support})
+            if approach_course is not None:
+                support &= self._approach.admitted & ~self._approach.failed
             self._support_count = torch.where(support, self._support_count + 1, 0)
             self._max_support_samples = torch.maximum(self._max_support_samples, self._support_count)
             qualified_now = self._support_count >= consecutive_window_samples(settings["support_window_s"], self.physics_dt)
@@ -3520,7 +3644,8 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     measurement_valid=finite & bool(group_measurement_available),
                     group_force_n=groups, original_hand_domain=original_domain,
                     local_support_qualified=self._local_success, support_current=support,
-                    clearance_m=clearance, object_lift_m=lift_height, unsafe=self._unsafe)
+                    clearance_m=clearance, object_lift_m=lift_height, unsafe=(self._unsafe |
+                        self._approach.failed if approach_course is not None else self._unsafe))
                 newly_failed = self._full_lift.failed & ~was_failed
                 self._full_lift_failure_arm_target[newly_failed] = tensor(
                     self.robot.data.joint_pos)[newly_failed][:, self._action_ids[:7]]
@@ -3555,6 +3680,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if getattr(self, "_full_lift", None) is not None:
                 self._last_metrics.update(full_lift_metrics)
                 self._last_metrics["success"] = self._full_lift.full_success
+            if approach_course is not None:
+                self._last_metrics.update(approach_admitted=self._approach.admitted.clone(),
+                    approach_failed=self._approach.failed.clone(),
+                    approach_admission_native=self._approach.admission_native.clone(),
+                    approach_first_failure_native=self._approach.first_failure_native.clone(),
+                    approach_first_failure_code=self._approach.first_failure_code.clone(),
+                    approach_robot_cube_contact_absolute_sum_n=(cube_contacts["robot_raw_contact_absolute_sum_n"]
+                        if group_measurement_available else torch.full_like(depth,float("inf"))),
+                    whole_path_collision_clean=self._approach.collision_clean.clone(),
+                    whole_approach_object_clean=self._approach.object_clean.clone())
             self._last_contact_episode_ids = self._episode_ids.clone()
             self._last_contact_native_step = int(self.sim.get_physics_step_count())
             if self._physics_pinch is not None or active_effort:
@@ -3578,6 +3713,14 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     "cube_linear_velocity_world_m_s": velocity if active_effort else None,
                     "cube_contact_normal_plus_declared_partner_friction_world_n": cube_contacts.get("cube_total_force") if active_effort and contact_available else None,
                     "metrics": self._last_metrics, "unsafe_latched": self._unsafe,
+                    **({"approach_native":self._approach_last,"approach_contact_witness":self._approach_contact_last,
+                        "measured_joint_position_all43_rad":tensor(self.robot.data.joint_pos),
+                        "measured_joint_velocity_all43_rad_s":tensor(self.robot.data.joint_vel),
+                        "palm_position_world_m":tensor(self.robot.data.body_pos_w)[:,self._palm_id]+quat_apply(
+                            tensor(self.robot.data.body_quat_w)[:,self._palm_id],self._palm_local),
+                        "palm_quaternion_xyzw":quat_mul(tensor(self.robot.data.body_quat_w)[:,self._palm_id],self._palm_local_rotation),
+                        "cube_quaternion_xyzw":rotation,"environment_origins_world_m":self.scene.env_origins}
+                       if approach_course is not None else {}),
                     "sample_scope": "every_completed_2ms_sample_including_terminal_pre_reset_no_force_decimation"})
             self._physics_samples += 1
             if self._record and active_effort:
@@ -3628,6 +3771,12 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 reasons.append("physical_contact_loss_first_per_episode")
             if peak_trigger:
                 reasons.append("force_above_acceptance_cap_new_run_peak")
+            if approach_course is not None:
+                admission_event=bool(self._approach_last["new_admission"].any())
+                failure_event=bool((self._approach.first_failure_native==int(self.sim.get_physics_step_count())).any())
+                if admission_event:reasons.append("arm_home_measured_admission")
+                if failure_event:reasons.append("arm_home_first_failure")
+                trigger |= admission_event or failure_event
             self._effort_raw_loss_seen |= loss
             self._effort_raw_episode_ids = self._episode_ids.clone()
             self._effort_previous_physical = physical.clone()
@@ -3652,7 +3801,9 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 row["relative_contact_motion_raw_reconstruction"]=relative_raw
             if getattr(self,"_native_arm_interpolation",False):
                 row["actually_written_arm_position_target_rad"]=self._last_written_arm_target
-                row["arm_target_schedule"]="native_linear33_revalidated_v1"
+                row["arm_target_schedule"]=full_lift["arm_target_schedule"]
+            if approach_course is not None:
+                row.update(approach_native=self._approach_last,approach_contact_witness=self._approach_contact_last)
             def frozen(value):
                 if torch.is_tensor(value):
                     return value.detach().clone()
@@ -3864,8 +4015,11 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 fields.update(self._full_lift.metrics())
             field_batch = {name: value[terminal_ids].detach().cpu().tolist()
                            for name, value in fields.items()} if terminal_indices else {}
-            measurement_unavailable = self._force_unavailable or self._table_contact_channel.snapshot()["unavailable_reason"]
+            base_measurement_unavailable = self._force_unavailable or self._table_contact_channel.snapshot()["unavailable_reason"]
             for offset, index in enumerate(terminal_indices):
+                measurement_unavailable=base_measurement_unavailable
+                if approach_course is not None:
+                    measurement_unavailable=measurement_unavailable or self._approach_measurement_unavailable[index]
                 metrics = {name: _json_finite(values[offset]) for name, values in metric_batch.items()}
                 episode = {name: values[offset] for name, values in field_batch.items()}
                 gates = {name: value for name, value in metrics.items() if isinstance(value, bool)}
@@ -3892,14 +4046,19 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                             failure.append(reason)
                     if episode["main_lift_support_lost"]:
                         failure.append("main_lift_original_support_gate_lost")
+                if approach_course is not None:
+                    if not metrics.get("approach_admitted",False):failure.append("arm_home_measured_entry_not_admitted")
+                    if metrics.get("approach_failed",False):failure.append("arm_home_path_or_entry_failed")
+                    if self._approach_measurement_unavailable[index]:failure.append("arm_home_path_measurement_unavailable")
                 if not metrics.get("no_positive_gap_hand_load", False):
                     failure.append("positive_gap_hand_normal_load_or_measurement_unavailable")
                 if not metrics.get("friction_partner_manifold_certified", False):
                     failure.append("friction_partner_normal_manifold_uncertified")
                 self._outcomes.append({"env_id": index, "episode_id": int(episode["episode_id"]),
                                        "seed": int(self._evaluation_seed if self._eval_mode else train_seed),
-                                       "rollout_domain": "physx_precontact_validation" if self._eval_mode else "physx_precontact_training",
-                                       "layout_id": "contact_entry_seed_jitter",
+                                       "rollout_domain": ("physx_high_wait_vertical_approach_validation" if approach_course is not None else
+                                           "physx_precontact_validation" if self._eval_mode else "physx_precontact_training"),
+                                       "layout_id": ("high_wait_green15_settled_seed_jitter" if approach_course is not None else "contact_entry_seed_jitter"),
                                        "validation_offset_index": index % len(config["rl_teacher"]["validation_offsets_m"]) if self._eval_mode else None,
                                        "validation_offset_m": config["rl_teacher"]["validation_offsets_m"][index % len(config["rl_teacher"]["validation_offsets_m"])] if self._eval_mode else None,
                                        "elapsed_steps": int(episode["elapsed_steps"]),
@@ -3908,7 +4067,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                                        "success": None if measurement_unavailable else bool(episode[
                                            "local_success" if self._full_lift is None else "full_success"]),
                                        "local_success": False if measurement_unavailable else bool(episode["local_success"]),
-                                       "qualification_supported": self._qualification_supported,
+                                       "qualification_supported": self._qualification_supported and (approach_course is None or self._approach_measurement_unavailable[index] is None),
                                        "unavailable_reason": measurement_unavailable, "gates": gates, "metrics": metrics,
                                        "max_clearance_m": float(episode["max_clearance_m"]),
                                        "maximum_support_samples": int(episode["maximum_support_samples"]),
@@ -3971,6 +4130,16 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             self._start_cube_z[env_ids] = cube[:, 2]
             self._expected_reset_cube[env_ids] = cube
             self._start_palm_z[env_ids] = float("nan")
+            if approach_course is not None:
+                # Predeclared grasp target datum, never the high home palm and
+                # never recaptured to conceal an actual entry tracking error.
+                self._start_palm_z[env_ids]=float(approach_resource["pregrasp_palm_position_world_m"][2])+origins[:,2]
+                self._approach.reset(env_ids,self._episode_ids[env_ids],int(self.sim.get_physics_step_count()),cube)
+                self._approach_contact.reset(env_ids,self._episode_ids[env_ids],int(self.sim.get_physics_step_count()))
+                self._approach_plan_complete[env_ids]=False
+                self._approach_planner_failed[env_ids]=False
+                self._approach_intent_episode_ids[env_ids]=self._episode_ids[env_ids]
+                for i in env_ids.detach().cpu().tolist():self._approach_measurement_unavailable[i]=None
             self._max_clearance[env_ids] = -float("inf")
             self._max_support_samples[env_ids] = 0
             self._resets += n
@@ -4197,6 +4366,13 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                 result.update(control_preshape_contact_seen=self._control_preshape_contact_seen.clone(),
                     control_preshape_first_contact_native=self._control_preshape_first_contact_native.clone(),
                     control_preshape_contact_episode_ids=self._control_preshape_contact_episode_ids.clone())
+            if approach_course is not None:
+                result.update(approach_admitted=self._approach.admitted.clone(),
+                    env_origin_world_m=self.scene.env_origins.clone(),velocity_limits_arm_rad_s=self._velocity[:7].clone(),
+                    approach_pregrasp_palm_position_world_m=torch.as_tensor(approach_resource["pregrasp_palm_position_world_m"],
+                        device=self.device,dtype=self._targets.dtype)[None]+self.scene.env_origins,
+                    approach_pregrasp_palm_quaternion_xyzw=torch.as_tensor(approach_resource["pregrasp_palm_quaternion_xyzw"],
+                        device=self.device,dtype=self._targets.dtype)[None].expand(self.num_envs,-1).clone())
             return result
 
         def record_control_probe_transition(self):
@@ -4548,6 +4724,17 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
             if control_preshape is not None:
                 audit["policy_contract"]["control_preshape"]=control_preshape
                 audit["control_preshape_resolution"]=preshape_resolution
+            if approach_course is not None:
+                audit["policy_contract"].update(approach_course=copy.deepcopy(approach_course),
+                    explicit_reset_resource_sha256=approach_course["resource_sha256"],
+                    reset_protocol=approach_course["version"],
+                    pregrasp_target_resource_sha256=config["rl_diagnostics"]["candidate_sha256"],
+                    arm_lift_origin="pinned_pregrasp_FK_world_Z_not_home_or_recaptured_entry",
+                    whole_episode_original_hand_domain_preserved=True)
+                audit["approach_home_fk_reference"]=copy.deepcopy(approach_home_fk)
+                audit["approach_collision_readback"]=self._approach_contact.summary()
+                audit["approach_resource"]=copy.deepcopy(approach_resource)
+                audit["success_scope"]="high_wait_vertical_approach_with_task_preshaped_hand_then_original_grasp_lift; not side_home, original20 or pick_place"
             return _json_finite(_probe_payload(torch, audit))
 
         def step_audit(self):

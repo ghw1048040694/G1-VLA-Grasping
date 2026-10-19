@@ -26,6 +26,10 @@ def diagnostic_config(protocol=FULL_LIFT32_WALL7200_PROTOCOL):
     settings.update({name: evaluation[name] for name in
         ("num_envs", "episodes_per_env", "max_control_steps", "max_wall_time_s")})
     settings["full_lift"] = full_lift_protocol_contract("g1_contact_qualified_full_lift_v4_native_arm_16s")
+    # This fixture freezes the historical eight-env wall-budget protocol.
+    settings.pop("approach_course", None)
+    from g1_vla.rl_preshape import control_preshape_contract
+    settings["control_preshape"] = control_preshape_contract()
     return config
 
 

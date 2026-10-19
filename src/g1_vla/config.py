@@ -914,6 +914,9 @@ def load_config(path: Union[str, Path], project_root: Optional[Union[str, Path]]
     for section, keys in _PATH_FIELDS.items():
         for key in keys:
             result[section][key] = resolve(result[section][key])
+    if result["rl_diagnostics"].get("approach_course") is not None:
+        result["rl_diagnostics"]["approach_course"]["resource_path"] = resolve(
+            result["rl_diagnostics"]["approach_course"]["resource_path"])
     result["data"]["source_roots"] = [resolve(item) for item in result["data"]["source_roots"]]
     result["external_data"]["audit_report_paths"] = [resolve(item) for item in result["external_data"]["audit_report_paths"]]
     return result

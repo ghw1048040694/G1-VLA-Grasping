@@ -1,0 +1,184 @@
+{
+  "version": "g1_task_preshape_arm_home_approach_v1",
+  "original_candidate_sha256": "2daa38dafba243eae42cd1450d9a0030f7d0503e6073647309109f3cbc885a60",
+  "root_pose_xyzw": [
+    0.005995602712329634,
+    0.004629233246093502,
+    0.7931194348434304,
+    -0.0029182467633710545,
+    0.0037811366610237753,
+    6.324269557889628e-05,
+    0.9999885913557914
+  ],
+  "source_hand_rad": [
+    0.7099596659290596,
+    -0.017536920855550652,
+    -1.1354126790570211,
+    0.7567796996938183,
+    0.32547714133564853,
+    0.1379705190297836,
+    1.326038654680329
+  ],
+  "home_joint_positions_rad": {
+    "left_hip_pitch_joint": -0.0006418623626965955,
+    "left_hip_roll_joint": -3.2394292618588494e-05,
+    "left_hip_yaw_joint": -6.133253018584328e-05,
+    "left_knee_joint": -0.0009247913572923371,
+    "left_ankle_pitch_joint": -0.004266868949765445,
+    "left_ankle_roll_joint": 0.00028280703069484206,
+    "right_hip_pitch_joint": 2.1172110775143412e-05,
+    "right_hip_roll_joint": -3.5301240575251465e-05,
+    "right_hip_yaw_joint": 7.887493883917577e-06,
+    "right_knee_joint": 2.1952096388687057e-07,
+    "right_ankle_pitch_joint": -3.523809302574666e-07,
+    "right_ankle_roll_joint": -2.1813285100730873e-07,
+    "waist_yaw_joint": 0,
+    "waist_roll_joint": 0,
+    "waist_pitch_joint": 0,
+    "left_shoulder_pitch_joint": 0.3956755842413026,
+    "left_shoulder_roll_joint": 0.532214580766817,
+    "left_shoulder_yaw_joint": 0.7277394939258747,
+    "left_elbow_joint": -0.4968674943260441,
+    "left_wrist_roll_joint": -0.6949255915674071,
+    "left_wrist_pitch_joint": 0.5190110359192706,
+    "left_wrist_yaw_joint": -0.4084832594582234,
+    "left_hand_thumb_0_joint": 1.105334019152098e-06,
+    "left_hand_thumb_1_joint": -8.419040451144016e-06,
+    "left_hand_thumb_2_joint": 0.00999862612918647,
+    "left_hand_middle_0_joint": -0.010025299092521126,
+    "left_hand_middle_1_joint": -0.010004033714205081,
+    "left_hand_index_0_joint": -0.010026628750722605,
+    "left_hand_index_1_joint": -0.010004193808716774,
+    "right_shoulder_pitch_joint": -1.2226319647499375,
+    "right_shoulder_roll_joint": -0.10190991706131466,
+    "right_shoulder_yaw_joint": 0.7378709150148732,
+    "right_elbow_joint": 0.07540991877911551,
+    "right_wrist_roll_joint": 0.42979554546423293,
+    "right_wrist_pitch_joint": 1.517657847219092,
+    "right_wrist_yaw_joint": -0.32868095232598304,
+    "right_hand_thumb_0_joint": 0.7099596659290596,
+    "right_hand_thumb_1_joint": -0.017536920855550652,
+    "right_hand_thumb_2_joint": -1.1354126790570211,
+    "right_hand_index_0_joint": 0.7567796996938183,
+    "right_hand_index_1_joint": 0.32547714133564853,
+    "right_hand_middle_0_joint": 0.1379705190297836,
+    "right_hand_middle_1_joint": 1.326038654680329
+  },
+  "home_palm_position_world_m": [
+    0.38782849926386626,
+    0.0330412494915613,
+    0.9999999999970373
+  ],
+  "home_palm_quaternion_xyzw": [
+    -0.4496228691707878,
+    0.18758414276809862,
+    0.16082212737652551,
+    0.8583633893909238
+  ],
+  "waypoints": [
+    {
+      "name": "preapproach",
+      "arm_target_rad": [
+        -0.8975183420033548,
+        -0.038071326729494176,
+        0.9585885626788602,
+        0.40438995724560384,
+        0.28234635804172165,
+        0.9847061269108368,
+        -0.4274525111541898
+      ],
+      "duration_s": 1.98,
+      "palm_position_world_m": [
+        0.3878284992642922,
+        0.033041249491852935,
+        0.8745887376628212
+      ],
+      "palm_quaternion_xyzw": [
+        -0.4496228691734574,
+        0.18758414277963167,
+        0.16082212736747328,
+        0.8583633893887012
+      ]
+    },
+    {
+      "name": "pregrasp",
+      "arm_target_rad": [
+        -0.8417976702332476,
+        0.06593865933550563,
+        1.010678311152665,
+        0.7754818797825681,
+        0.22300153176719134,
+        0.6593659245685349,
+        -0.43587958056087706
+      ],
+      "duration_s": 1.98,
+      "palm_position_world_m": [
+        0.38782849925889384,
+        0.033041249489980565,
+        0.8245887376672051
+      ],
+      "palm_quaternion_xyzw": [
+        -0.4496228691740382,
+        0.18758414278761307,
+        0.16082212738259258,
+        0.8583633893838201
+      ]
+    }
+  ],
+  "pregrasp_joint_positions_rad": {
+    "left_hip_pitch_joint": -0.0006418623626965955,
+    "left_hip_roll_joint": -3.2394292618588494e-05,
+    "left_hip_yaw_joint": -6.133253018584328e-05,
+    "left_knee_joint": -0.0009247913572923371,
+    "left_ankle_pitch_joint": -0.004266868949765445,
+    "left_ankle_roll_joint": 0.00028280703069484206,
+    "right_hip_pitch_joint": 2.1172110775143412e-05,
+    "right_hip_roll_joint": -3.5301240575251465e-05,
+    "right_hip_yaw_joint": 7.887493883917577e-06,
+    "right_knee_joint": 2.1952096388687057e-07,
+    "right_ankle_pitch_joint": -3.523809302574666e-07,
+    "right_ankle_roll_joint": -2.1813285100730873e-07,
+    "waist_yaw_joint": 0,
+    "waist_roll_joint": 0,
+    "waist_pitch_joint": 0,
+    "left_shoulder_pitch_joint": 0.3956755842413026,
+    "left_shoulder_roll_joint": 0.532214580766817,
+    "left_shoulder_yaw_joint": 0.7277394939258747,
+    "left_elbow_joint": -0.4968674943260441,
+    "left_wrist_roll_joint": -0.6949255915674071,
+    "left_wrist_pitch_joint": 0.5190110359192706,
+    "left_wrist_yaw_joint": -0.4084832594582234,
+    "left_hand_thumb_0_joint": 1.105334019152098e-06,
+    "left_hand_thumb_1_joint": -8.419040451144016e-06,
+    "left_hand_thumb_2_joint": 0.00999862612918647,
+    "left_hand_middle_0_joint": -0.010025299092521126,
+    "left_hand_middle_1_joint": -0.010004033714205081,
+    "left_hand_index_0_joint": -0.010026628750722605,
+    "left_hand_index_1_joint": -0.010004193808716774,
+    "right_shoulder_pitch_joint": -0.8417976702332476,
+    "right_shoulder_roll_joint": 0.06593865933550563,
+    "right_shoulder_yaw_joint": 1.010678311152665,
+    "right_elbow_joint": 0.7754818797825681,
+    "right_wrist_roll_joint": 0.22300153176719134,
+    "right_wrist_pitch_joint": 0.6593659245685349,
+    "right_wrist_yaw_joint": -0.43587958056087706,
+    "right_hand_thumb_0_joint": 0.7099596659290596,
+    "right_hand_thumb_1_joint": -0.017536920855550652,
+    "right_hand_thumb_2_joint": -1.1354126790570211,
+    "right_hand_index_0_joint": 0.7567796996938183,
+    "right_hand_index_1_joint": 0.32547714133564853,
+    "right_hand_middle_0_joint": 0.1379705190297836,
+    "right_hand_middle_1_joint": 1.326038654680329
+  },
+  "pregrasp_palm_position_world_m": [
+    0.38782849925889384,
+    0.033041249489980565,
+    0.8245887376672051
+  ],
+  "pregrasp_palm_quaternion_xyzw": [
+    -0.4496228691740382,
+    0.18758414278761307,
+    0.16082212738259258,
+    0.8583633893838201
+  ]
+}

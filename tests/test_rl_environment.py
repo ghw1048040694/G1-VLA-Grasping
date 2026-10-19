@@ -308,7 +308,7 @@ class ControllerDiagnosticTensorTest(unittest.TestCase):
         environment = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "Environment")
         method = next(node for node in environment.body if isinstance(node, ast.FunctionDef) and node.name == name)
         scope = {"torch": self.torch, "tensor": lambda value: value, "RLEnvironmentError": RLEnvironmentError,
-                 "__package__": "g1_vla", **extra}
+                 "__package__": "g1_vla", "approach_course": None, **extra}
         exec(compile(ast.Module(body=[method], type_ignores=[]), "<actual-environment-method>", "exec"), scope)
         return scope[name]
 
@@ -584,7 +584,7 @@ class NativeArmTargetScheduleTests(unittest.TestCase):
         owner=next(node for node in ast.walk(tree) if isinstance(node,ast.ClassDef) and node.name=="Environment")
         node=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name==name)
         scope={"torch":self.t,"tensor":lambda v:v,"RLEnvironmentError":RLEnvironmentError,
-            "__package__":"g1_vla","math":math,"json":json,
+            "__package__":"g1_vla","math":math,"json":json,"approach_course":None,
             "revalidated_native_arm_substep":revalidated_native_arm_substep,
             "offset_point_jacobian":offset_point_jacobian,"quat_apply":lambda q,v:v,**extra}
         exec(compile(ast.Module(body=[node],type_ignores=[]),"<actual-native-arm-schedule>","exec"),scope)
@@ -682,7 +682,7 @@ class NativeArmTargetScheduleTests(unittest.TestCase):
             _last_written_arm_target_next_native_step=t.tensor([101,101]),
             _last_written_hand_target=t.zeros(2,7),_last_written_hand_effort=t.zeros(2,7),
             _last_metrics={},_unsafe=t.tensor([False,False]),_write_control_probe=rows.append)
-        scope={"self":fake,"tensor":lambda value:value,"active_effort":False}
+        scope={"self":fake,"tensor":lambda value:value,"active_effort":False,"approach_course":None}
         eval(code,scope)
         row=rows[-1]
         self.assertTrue(t.equal(row["measured_arm_rad"],q[:,:7]))
@@ -1078,7 +1078,7 @@ class RelativeContactMotionTests(unittest.TestCase):
         owner=next(node for node in ast.walk(tree) if isinstance(node,ast.ClassDef) and node.name=="Environment")
         node=next(node for node in owner.body if isinstance(node,ast.FunctionDef) and node.name=="_update_effort_grasp")
         scope={"torch":t,"tensor":lambda value:value,"RLEnvironmentError":RLEnvironmentError,
-            "quat_apply":lambda q,v:v,"quat_mul":lambda q,r:q}
+            "quat_apply":lambda q,v:v,"quat_mul":lambda q,r:q,"approach_course":None}
         exec(compile(ast.Module(body=[node],type_ignores=[]),"<actual-relative-motion-forward>","exec"),scope)
         def update(**values):
             calls.append(values)

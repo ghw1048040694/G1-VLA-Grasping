@@ -318,10 +318,18 @@ _FULL_LIFT_PROTOCOL_V4 = {
     "version": "g1_contact_qualified_full_lift_v4_native_arm_16s",
     "episode_length_s": 16.0,
 }
+_FULL_LIFT_PROTOCOL_V5_HOME = {
+    **_FULL_LIFT_PROTOCOL_V4,
+    "version": "g1_contact_qualified_arm_home_lift_v5_32s",
+    "episode_length_s": 32.0,
+    "arm_target_schedule": "home_and_lift_native_linear33_revalidated_v1",
+}
 _FULL_LIFT_EVALUATION_QUOTAS = {
     "full_lift8_v1": (1, 213, 14.0), "full_lift32_v1": (4, 852, 14.0),
     "full_lift8_v2": (1, 243, 16.0), "full_lift32_v2": (4, 972, 16.0),
     "full_lift32_v3_wall7200": (4, 972, 16.0),
+    "home_lift1_v1": (1, 486, 32.0),
+    "home_lift8_v1": (1, 486, 32.0),
 }
 FULL_LIFT32_WALL7200_PROTOCOL = "full_lift32_v3_wall7200"
 
@@ -355,6 +363,8 @@ def full_lift_protocol_contract(version=None):
         return deepcopy(_FULL_LIFT_PROTOCOL_V3)
     if version == _FULL_LIFT_PROTOCOL_V4["version"]:
         return deepcopy(_FULL_LIFT_PROTOCOL_V4)
+    if version == _FULL_LIFT_PROTOCOL_V5_HOME["version"]:
+        return deepcopy(_FULL_LIFT_PROTOCOL_V5_HOME)
     raise ValueError("Unknown full-lift task version")
 
 
@@ -369,6 +379,8 @@ def full_lift_effort_grasp_contract(protocol="full_lift8_v1"):
     value["acceptance"].update(main_lift_authorized=True, actual_height_limit_m=.115)
     value["evaluation"].update(protocol=protocol, episodes_per_env=episodes,
         max_control_steps=steps, nominal_episode_budget_s=duration)
+    if protocol == "home_lift1_v1":
+        value["evaluation"]["num_envs"] = 1
     if protocol == FULL_LIFT32_WALL7200_PROTOCOL:
         value["evaluation"]["max_wall_time_s"] = effort_evaluation_wall_time_limit_s(value)
     return value
@@ -446,7 +458,7 @@ def validate_full_lift_protocol(value):
         return None
     versions = {v["version"]: v for v in
                 (_FULL_LIFT_PROTOCOL_V1, _FULL_LIFT_PROTOCOL,
-                 _FULL_LIFT_PROTOCOL_V3, _FULL_LIFT_PROTOCOL_V4)}
+                 _FULL_LIFT_PROTOCOL_V3, _FULL_LIFT_PROTOCOL_V4, _FULL_LIFT_PROTOCOL_V5_HOME)}
     version = value.get("version") if isinstance(value, dict) else None
     expected = versions.get(version, _FULL_LIFT_PROTOCOL) if type(version) is str else _FULL_LIFT_PROTOCOL
     _exact(value, expected, "full_lift")
@@ -578,9 +590,10 @@ def validate_effort_grasp_contract(value):
     if type(name) is not str or name not in quota:
         raise ValueError("unknown effort evaluation protocol")
     for key in evaluation:
-        if key not in ("protocol", "episodes_per_env", "max_control_steps", "max_wall_time_s",
+        if key not in ("protocol", "num_envs", "episodes_per_env", "max_control_steps", "max_wall_time_s",
                        "nominal_episode_budget_s"):
             _exact(evaluation[key], expected["evaluation"][key], "evaluation." + key)
+    _exact(evaluation["num_envs"], 1 if name == "home_lift1_v1" else expected["evaluation"]["num_envs"], "evaluation.num_envs")
     episodes, steps, duration = quota[name]
     _exact(evaluation["nominal_episode_budget_s"], duration, "evaluation.nominal_episode_budget_s")
     if type(evaluation["episodes_per_env"]) is not int or evaluation["episodes_per_env"] != episodes:

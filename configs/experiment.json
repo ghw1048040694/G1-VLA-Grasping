@@ -956,10 +956,10 @@
   "rl_diagnostics": {
     "enabled": true,
     "backend": "g1_control_physics_diagnostics_v6",
-    "num_envs": 8,
-    "episodes_per_env": 4,
-    "max_control_steps": 972,
-    "max_wall_time_s": 7200.0,
+    "num_envs": 1,
+    "episodes_per_env": 1,
+    "max_control_steps": 486,
+    "max_wall_time_s": 3600,
     "optimizer_steps": 0,
     "training_allowed": false,
     "profiles": [
@@ -1176,14 +1176,14 @@
         "native_binding_readback_required": true
       },
       "evaluation": {
-        "protocol": "full_lift32_v3_wall7200",
-        "num_envs": 8,
-        "episodes_per_env": 4,
-        "max_control_steps": 972,
-        "nominal_episode_budget_s": 16.0,
+        "protocol": "home_lift1_v1",
+        "num_envs": 1,
+        "episodes_per_env": 1,
+        "max_control_steps": 486,
+        "nominal_episode_budget_s": 32.0,
         "physics_dt_s": 0.002,
         "control_period_s": 0.066,
-        "max_wall_time_s": 7200.0,
+        "max_wall_time_s": 3600.0,
         "validation_offsets": "original_eight_offsets_unchanged",
         "randomization_expanded": false,
         "training_allowed": false,
@@ -1288,7 +1288,7 @@
       "relative_damping_partial_blend": "one_minus_full_force_ramp_fraction"
     },
     "full_lift": {
-      "version": "g1_contact_qualified_full_lift_v4_native_arm_16s",
+      "version": "g1_contact_qualified_arm_home_lift_v5_32s",
       "target_corner_clearance_m": 0.1,
       "palm_total_lift_request_m": 0.105,
       "palm_lift_request_max_m": 0.11,
@@ -1298,7 +1298,7 @@
       "hold_duration_s": 0.5,
       "hold_consecutive_samples": 251,
       "actual_height_limit_m": 0.115,
-      "episode_length_s": 16.0,
+      "episode_length_s": 32.0,
       "physics_dt_s": 0.002,
       "local_support_consecutive_samples": 100,
       "local_support_first_to_last_s": 0.198,
@@ -1311,25 +1311,18 @@
       "training_allowed": false,
       "optimizer_steps": 0,
       "palm_servo_speed_limit_m_s": 0.018,
-      "arm_target_schedule": "native_linear33_revalidated_v1",
+      "arm_target_schedule": "home_and_lift_native_linear33_revalidated_v1",
       "arm_target_interpolation_substeps": 33,
       "full_lift_failure_response": "stop_arm_keep_current_hand_force_feedback_v1"
     },
     "video_recording": {
       "version": "g1_declared_multienv_native_rgb_v1",
       "env_ids": [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7
+        0
       ]
     },
     "control_preshape": {
-      "version": "g1_pinned_precontact_control_preshape_v1",
+      "version": "g1_pinned_precontact_control_preshape_v2_arm_home",
       "acceptance_candidate_sha256": "2daa38dafba243eae42cd1450d9a0030f7d0503e6073647309109f3cbc885a60",
       "acceptance_frames_sha256": "3e107979a990e65a1996481bc237621db1787ecaf5541dbf0dceff577eafcc19",
       "static_geometry_evidence_sha256": "97f7afb5c1fed93bbd5a582530a576fde6c0072dd4daec54c671f9062df2b10a",
@@ -1339,7 +1332,7 @@
         0,
         0
       ],
-      "palm_offset_schedule": "smoothstep_existing_first_stage_then_hold_v1",
+      "palm_offset_schedule": "smoothstep_first_grasp_stage_after_measured_arm_approach_then_hold_v2",
       "palm_offset_freezes_on_first_fresh_physical_contact": true,
       "contact_latch_cadence_s": 0.002,
       "palm_reference_freeze_boundary": "next_macro_after_first_same_episode_native_loaded_point_v1",
@@ -1403,8 +1396,31 @@
       "first_stage_duration_s": 0.9,
       "original_actual_geometry_tolerance_rad": 0.025,
       "all_environments_same_preshape": true,
-      "original_reset_and_episode_budget_unchanged": true,
-      "training_allowed": false
+      "original_reset_and_episode_budget_unchanged": false,
+      "training_allowed": false,
+      "original_hand_frames_and_physical_grasp_gates_unchanged": true,
+      "arm_home_reset_and_budget_owned_by": "g1_task_preshape_arm_home_approach_v1"
+    },
+    "approach_course": {
+      "version": "g1_task_preshape_arm_home_approach_v1",
+      "resource_path": "resources/rl_approach/high_wait_vertical_entry_v1.json",
+      "resource_sha256": "f30475fb2593e5dcf9691aba0df82ea77b86f28a3858cbd109e9f42976e2ed3e",
+      "parameters": {
+        "control_period_s": 0.066,
+        "joint_arrival_tolerance_rad": 0.015,
+        "joint_velocity_arrival_tolerance_rad_s": 0.05,
+        "palm_position_arrival_tolerance_m": 0.003,
+        "palm_rotation_arrival_tolerance_rad": 0.05,
+        "hand_seed_arrival_tolerance_rad": 0.015,
+        "approach_timeout_s": 16.0,
+        "handoff_required_consecutive_native_samples": 25,
+        "grasp_budget_s": 16.0,
+        "total_episode_budget_s": 32.0,
+        "workspace_min_palm_z_m": 0.78,
+        "workspace_max_palm_z_m": 1.1,
+        "maximum_object_xy_drift_m": 0.002,
+        "maximum_object_rotation_rad": 0.05
+      }
     }
   }
 }

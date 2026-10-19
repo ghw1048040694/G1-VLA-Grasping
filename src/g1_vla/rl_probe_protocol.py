@@ -120,6 +120,7 @@ RL_PROBE_DEFAULTS = {
     "full_lift": None,
     "video_recording": None,
     "control_preshape": None,
+    "approach_course": None,
     "num_envs": 8,
     "episodes_per_env": 4,
     "max_control_steps": 364,
@@ -327,6 +328,23 @@ def validate_probe_settings(value):
         if plan!="balanced_effort_v6":
             raise ValueError("Control preshape is an explicit standalone effort diagnostic only")
         result["control_preshape"]=validate_control_preshape(preshape)
+    approach=result.get("approach_course")
+    if approach is None:
+        result.pop("approach_course",None)
+        if preshape is not None and result["control_preshape"]["version"]=="g1_pinned_precontact_control_preshape_v2_arm_home":
+            raise ValueError("Arm-home preshape requires the declared arm-home course")
+        if full_lift is not None and result["full_lift"]["version"]=="g1_contact_qualified_arm_home_lift_v5_32s":
+            raise ValueError("The arm-home full task requires its explicit approach course")
+    else:
+        from .rl_approach import validate_approach_declaration
+        result["approach_course"]=validate_approach_declaration(approach)
+        if (plan!="balanced_effort_v6" or preshape is None or full_lift is None or
+                result["full_lift"]["version"]!="g1_contact_qualified_arm_home_lift_v5_32s" or
+                result["control_preshape"]["version"]!="g1_pinned_precontact_control_preshape_v2_arm_home" or
+                effort["evaluation"]["protocol"] not in ("home_lift1_v1","home_lift8_v1")):
+            raise ValueError("Arm-home course requires its separately named task, quota and original preshape")
+    if effort is not None and effort["evaluation"]["protocol"] in ("home_lift1_v1","home_lift8_v1") and approach is None:
+        raise ValueError("Arm-home evaluation cannot run without the declared approach course")
     lead = result["guided_target_lead_max_rad"]
     if ((plan in ("four_way_v1", "compliant_pinch_v4", "physics_pinch_v5", "balanced_effort_v6") and lead is not None) or
             (plan in ("geometry_pose_only_v2", "geometry_pose_fixed_cluster_v3") and (type(lead) not in (int, float) or lead != .006))):
@@ -703,6 +721,10 @@ def _verify_effort_probe_reference(config, settings, current_audit):
     if _file_hash(candidate_path) != settings["candidate_sha256"]:
         raise ValueError("Effort grasp geometry changed after explicit selection")
     candidate = json.loads(candidate_path.read_text())
+    approach_resource,approach_home_fk=None,None
+    if settings.get("approach_course") is not None:
+        from .rl_approach_state import load_course_reference
+        approach_resource,approach_home_fk=load_course_reference(config,settings,candidate)
     preshape_resolution=None
     if settings.get("control_preshape") is not None:
         from .rl_preshape import resolve_preshape_frames
@@ -743,7 +765,7 @@ def _verify_effort_probe_reference(config, settings, current_audit):
                 actual.get("contact_generation") != contract["contact_generation"] or
                 current_audit.get("policy_contract_sha256") != _canonical(actual)):
             raise ValueError("Native effort/material/source readback differs from the explicit new model")
-        for key in ("contact_transition_control", "full_lift", "control_preshape"):
+        for key in ("contact_transition_control", "full_lift", "control_preshape", "approach_course"):
             if actual.get(key) != settings.get(key):
                 raise ValueError("Native control/task declaration differs from the selected " + key)
         if preshape_resolution is not None and current_audit.get("control_preshape_resolution")!=preshape_resolution:
@@ -751,11 +773,15 @@ def _verify_effort_probe_reference(config, settings, current_audit):
         filters = current_audit.get("fixed_cluster_collision_filter_override", {}).get("current_stage_readback", {})
         n = contract["evaluation"]["num_envs"]
         self_collisions = filters.get("global_self_collision_readback", {})
-        if (actual.get("reset_protocol") != candidate.get("reset_protocol") or
-                current_audit.get("initial_state", {}).get("joint_positions_rad") != reset or
+        expected_reset=reset if approach_resource is None else approach_resource["home_joint_positions_rad"]
+        expected_fk=candidate.get("reset_native_fk_reference") if approach_resource is None else approach_home_fk
+        expected_protocol=candidate.get("reset_protocol") if approach_resource is None else settings["approach_course"]["version"]
+        expected_reset_sha=settings["candidate_sha256"] if approach_resource is None else settings["approach_course"]["resource_sha256"]
+        if (actual.get("reset_protocol") != expected_protocol or
+                current_audit.get("initial_state", {}).get("joint_positions_rad") != expected_reset or
                 current_audit.get("initial_state", {}).get("root_pose_xyzw") != candidate.get("reset_root_pose_xyzw") or
-                actual.get("official_native_fk_reference") != candidate.get("reset_native_fk_reference") or
-                actual.get("explicit_reset_resource_sha256") != settings["candidate_sha256"] or
+                actual.get("official_native_fk_reference") != expected_fk or
+                actual.get("explicit_reset_resource_sha256") != expected_reset_sha or
                 filters.get("available") is not True or filters.get("num_envs") != n or
                 filters.get("excluded_pair_count_per_env") != 30 or
                 filters.get("excluded_pair_count_total") != 30*n or
@@ -763,6 +789,13 @@ def _verify_effort_probe_reference(config, settings, current_audit):
                 len(self_collisions) != n or
                 any(v.get("enabled_self_collisions") is not True for v in self_collisions.values())):
             raise ValueError("Native explicit reset or bilateral collision model differs from its declaration")
+        if approach_resource is not None:
+            if (current_audit.get("approach_resource")!=approach_resource or
+                    current_audit.get("approach_collision_readback",{}).get("available") is not True or
+                    actual.get("pregrasp_target_resource_sha256")!=settings["candidate_sha256"] or
+                    actual.get("arm_lift_origin")!="pinned_pregrasp_FK_world_Z_not_home_or_recaptured_entry" or
+                    actual.get("whole_episode_original_hand_domain_preserved") is not True):
+                raise ValueError("Arm-home reset, path coverage and preserved original grasp contract differ")
         original = old["policy_contract"]
         expected_settings = dict(original["resolved_settings"])
         expected_settings.update(contact_offset_m=contract["contact_generation"]["contact_offset_m"],
@@ -794,7 +827,8 @@ def _verify_effort_probe_reference(config, settings, current_audit):
         "current_source_tree_sha256": _current_source_identity(),
         "candidate_reference": {"candidate_id": settings["candidate_id"],
             "candidate_sha256": settings["candidate_sha256"], "physical_qualification": False},
-        "reference_files": [str(manifest_path), str(audit_path), str(candidate_path)],
+        "reference_files": [str(manifest_path), str(audit_path), str(candidate_path)]+
+            ([str(_path(config,settings["approach_course"]["resource_path"]))] if approach_resource is not None else []),
         "scope": "new explicit effort/material/reset engineering probe; no learned actor, training or original20 claim"}
 
 

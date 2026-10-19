@@ -56,11 +56,24 @@ _CONTROL_PRESHAPE = {
     "original_reset_and_episode_budget_unchanged": True,
     "training_allowed": False,
 }
+ARM_HOME_CONTROL_PRESHAPE_VERSION = "g1_pinned_precontact_control_preshape_v2_arm_home"
+_ARM_HOME_CONTROL_PRESHAPE = {
+    **deepcopy(_CONTROL_PRESHAPE),
+    "version": ARM_HOME_CONTROL_PRESHAPE_VERSION,
+    "palm_offset_schedule": "smoothstep_first_grasp_stage_after_measured_arm_approach_then_hold_v2",
+    "original_reset_and_episode_budget_unchanged": False,
+    "original_hand_frames_and_physical_grasp_gates_unchanged": True,
+    "arm_home_reset_and_budget_owned_by": "g1_task_preshape_arm_home_approach_v1",
+}
 
 
-def control_preshape_contract():
+def control_preshape_contract(version=None):
     """Return a fresh exact v1 declaration; it is not a physical qualification."""
-    return deepcopy(_CONTROL_PRESHAPE)
+    if version is None or version==CONTROL_PRESHAPE_VERSION:
+        return deepcopy(_CONTROL_PRESHAPE)
+    if version==ARM_HOME_CONTROL_PRESHAPE_VERSION:
+        return deepcopy(_ARM_HOME_CONTROL_PRESHAPE)
+    raise ValueError("Unknown control preshape version")
 
 
 def _finite_number(value):
@@ -83,7 +96,9 @@ def validate_control_preshape(value):
     """Validate the exact optional v1 declaration without importing a backend."""
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != set(_CONTROL_PRESHAPE):
+    expected=(_ARM_HOME_CONTROL_PRESHAPE if isinstance(value,dict) and
+              value.get("version")==ARM_HOME_CONTROL_PRESHAPE_VERSION else _CONTROL_PRESHAPE)
+    if not isinstance(value, dict) or set(value) != set(expected):
         raise ValueError("Control preshape requires the exact v1 declaration keys")
     _finite_vector(value["palm_offset_world_m"], 3, "Preshape world palm offset")
     offsets = value["execution_frame_hand_offsets_rad"]
@@ -99,7 +114,9 @@ def validate_control_preshape(value):
                 "palm_offset_freezes_on_first_fresh_physical_contact", "force_mode_hand_position_springs_remain_zero"):
         if type(value[key]) is not bool:
             raise ValueError("Control preshape requires an explicit boolean " + key)
-    if value != _CONTROL_PRESHAPE:
+    if expected is _ARM_HOME_CONTROL_PRESHAPE and type(value["original_hand_frames_and_physical_grasp_gates_unchanged"]) is not bool:
+        raise ValueError("Arm-home preshape must preserve the original physical grasp gates")
+    if value != expected:
         raise ValueError("Control preshape differs from the pinned v1 geometry, timing, or provenance")
     return deepcopy(value)
 

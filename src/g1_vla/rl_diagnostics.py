@@ -131,6 +131,10 @@ class EffortGraspGuide:
         self.start = self.seed.clone()
         self.palm = state["palm_position_world_m"].clone()
         self.rotation = state["palm_quaternion_xyzw"].clone()
+        self.approach_course=settings.get("approach_course")
+        if self.approach_course is not None:
+            self.palm=state["approach_pregrasp_palm_position_world_m"].clone()
+            self.rotation=state["approach_pregrasp_palm_quaternion_xyzw"].clone()
         self.ready_count = torch.zeros_like(self.ids)
         self.probe = torch.zeros_like(q[:, 0])
         self.full_lift = settings.get("full_lift")
@@ -179,6 +183,9 @@ class EffortGraspGuide:
         self.start[changed] = self.seed[changed]
         self.palm[changed] = state["palm_position_world_m"][changed]
         self.rotation[changed] = state["palm_quaternion_xyzw"][changed]
+        if self.approach_course is not None:
+            self.palm[changed]=state["approach_pregrasp_palm_position_world_m"][changed]
+            self.rotation[changed]=state["approach_pregrasp_palm_quaternion_xyzw"][changed]
         self.ready_count[changed] = 0
         self.probe[changed] = 0
         self.main_lift_velocity[changed] = 0
@@ -194,6 +201,8 @@ class EffortGraspGuide:
         metrics = state.get("metrics", {})
         overforce = (state["group_normal_force_n"] > force_limit).any(-1)
         progress = tracking & ~overforce & ~state["unsafe_latched"]
+        if self.approach_course is not None:
+            progress &= state["approach_admitted"]
         index = self.stage.clone()
         goal = self.goals[index]
         self.elapsed += t.where(progress, dt, 0.)
@@ -589,6 +598,11 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
         candidate = json.loads(payload)
     guide_type = EffortGraspGuide if effort_mode else GuidedClosure
     guided = guide_type(torch, settings, initial_hand, native.control_diagnostic_state(), candidate)
+    approach_planner=None
+    if settings.get("approach_course") is not None:
+        from .rl_approach import HomeApproachPlanner
+        approach_planner=HomeApproachPlanner(torch,audit["approach_resource"],
+            parameters=settings["approach_course"]["parameters"])
     if settings["profile_plan"] == "physics_pinch_v5":
         native.configure_physics_pinch(settings["compliant_pinch_controller"])
     if effort_mode:
@@ -616,8 +630,15 @@ def _profile_summary(environment, actor, torch, cfg, settings, streams, deadline
                     "native_physics_step_count": state["native_physics_step_count"],
                     "action_pipeline": "actor -> intervention -> wrapper[-1,1] -> shared bounds -> probe guard; control_commands.raw_action is wrapper output"}
         if profile["action_source"] != "frozen_actor":
+            if approach_planner is not None:
+                approach_request,approach_evidence=approach_planner.actions(state,.066)
+                native.set_approach_plan_evidence(approach_evidence)
             requested, extra = guided.actions(requested, state,
                 profile["action_source"], .066, audit["policy_contract"]["resolved_settings"]["group_force_max_n"])
+            if approach_planner is not None:
+                requested[:,:7]=torch.where(state["approach_admitted"][:,None],requested[:,:7],approach_request)
+                extra["arm_home_approach"]=approach_evidence
+                extra["arm_request_selected_from_measured_admission"]=state["approach_admitted"].clone()
             evidence.update(extra)
             if settings["profile_plan"] == "physics_pinch_v5":
                 native.set_physics_pinch_reference(
@@ -742,7 +763,8 @@ def run_native_diagnostics(config, run_dir):
             environment = build_environment(config, num_envs=settings["num_envs"],
                 device=config["rl_teacher"]["device"], asset_path=config["rl_teacher"]["asset_path"],
                 train_seed=config["rl_teacher"]["seed"], eval_mode=True,
-                output_dir=str(run_dir / "environment_8"), control_probe=settings["profiles"][0])
+                output_dir=str(run_dir / ("environment_"+str(settings["num_envs"]))),
+                control_probe=settings["profiles"][0])
             environment = RslRlVecEnvWrapper(environment, clip_actions=1.0)
             memory = _gpu_memory(torch, config["rl_teacher"]["device"])
             result["memory_after_build"] = memory
@@ -772,7 +794,7 @@ def run_native_diagnostics(config, run_dir):
             except BaseException as exc:
                 result["environment_close_error"] = str(exc)
                 result["passed"] = False
-        video_status = run_dir / "environment_8/evaluation_video_status.json"
+        video_status = run_dir / ("environment_"+str(settings["num_envs"])) / "evaluation_video_status.json"
         result["evaluation_video_status"] = json.loads(video_status.read_text()) if video_status.is_file() else None
         result["video_evidence_complete"] = bool(result["evaluation_video_status"] and
             result["evaluation_video_status"].get("all_control_frames_recorded") is True and
