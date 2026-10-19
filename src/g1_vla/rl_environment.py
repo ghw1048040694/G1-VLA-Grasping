@@ -4368,6 +4368,7 @@ def build_environment(config, *, num_envs, device, asset_path, train_seed, eval_
                     control_preshape_contact_episode_ids=self._control_preshape_contact_episode_ids.clone())
             if approach_course is not None:
                 result.update(approach_admitted=self._approach.admitted.clone(),
+                    per_step_action_rad=per_step[None].expand(self.num_envs,-1).clone(),
                     env_origin_world_m=self.scene.env_origins.clone(),velocity_limits_arm_rad_s=self._velocity[:7].clone(),
                     approach_pregrasp_palm_position_world_m=torch.as_tensor(approach_resource["pregrasp_palm_position_world_m"],
                         device=self.device,dtype=self._targets.dtype)[None]+self.scene.env_origins,

@@ -283,5 +283,117 @@ class ActualGuideAndResetIntegrationTests(unittest.TestCase):
         self.assertTrue(t.equal(calls[0][1][3],cube))
 
 
+@unittest.skipUnless(HAS_TORCH, "real Torch CPU is required for producer/consumer interface math")
+class ActualDiagnosticStatePlannerInterfaceTests(unittest.TestCase):
+    def producer(self, population, dtype, *, course_selected=True):
+        """Fake native buffers only; the complete state producer is real AST."""
+        import torch as t
+        from g1_vla.rl_environment import ACTION_JOINT_NAMES, offset_point_jacobian, preload_contact_ready
+        resource = json.loads(COURSE_PATH.read_text())
+        # A non-action-first native DOF order also tests the real index mapping.
+        names = sorted(resource["home_joint_positions_rad"], reverse=True)
+        action_ids = [names.index(name) for name in ACTION_JOINT_NAMES]
+        q = t.tensor([[resource["home_joint_positions_rad"][name] for name in names]],
+                     dtype=dtype).repeat(population,1)
+        origins = t.tensor([[2.*i,0.,.25*i] for i in range(population)],dtype=dtype)
+        home = t.tensor(resource["home_palm_position_world_m"],dtype=dtype)[None]+origins
+        home_quat = t.tensor(resource["home_palm_quaternion_xyzw"],dtype=dtype)[None].repeat(population,1)
+        body_positions = t.zeros(population,2,3,dtype=dtype);body_positions[:,1] = home
+        body_rotations = home_quat[:,None].repeat(1,2,1)
+        data = SimpleNamespace(joint_pos=q, joint_vel=t.zeros_like(q),
+            body_link_jacobian_w=t.zeros(population,1,6,43,dtype=dtype),
+            body_quat_w=body_rotations,body_pos_w=body_positions)
+        clock = SimpleNamespace(native=0)
+        epochs = t.arange(7,7+population,dtype=t.int64)
+        env = SimpleNamespace(_control_probe_enabled=True,num_envs=population,device="cpu",_palm_id=1,
+            _palm_local=t.zeros(population,3,dtype=dtype),
+            _palm_local_rotation=t.tensor([[0.,0.,0.,1.]],dtype=dtype).repeat(population,1),
+            robot=SimpleNamespace(data=data,num_bodies=2,joint_names=names),
+            cube=SimpleNamespace(data=SimpleNamespace(root_pos_w=origins+t.tensor([.35,.055,.775],dtype=dtype),
+                root_quat_w=t.tensor([[0.,0.,0.,1.]],dtype=dtype).repeat(population,1))),
+            _action_ids=action_ids,_tip_ids=[0,1,0],_velocity=t.linspace(.3,1.2,14,dtype=dtype),step_dt=.066,
+            _targets=q.clone(),_limits=t.tensor([[[-2.,2.]]*43]*population,dtype=dtype),_last_metrics={},
+            episode_length_buf=t.zeros(population,dtype=t.int64),_episode_ids=epochs,
+            _grip_locked=t.zeros(population,dtype=t.bool),_unsafe=t.zeros(population,dtype=t.bool),
+            _probe_overshoot=t.zeros(population,dtype=t.bool),_control_probe_profile={"name":"interface_fixture"},
+            _control_preshape_contact_seen=t.zeros(population,dtype=t.bool),
+            _control_preshape_first_contact_native=t.full((population,),-1,dtype=t.int64),
+            _control_preshape_contact_episode_ids=epochs.clone(),
+            _approach=SimpleNamespace(admitted=t.zeros(population,dtype=t.bool)),
+            scene=SimpleNamespace(env_origins=origins),sim=SimpleNamespace(get_physics_step_count=lambda:clock.native))
+        env._control_probe_joint_load = lambda phase:{"available":False,"sample_phase":phase}
+        env._control_probe_self_pair = lambda phase:{"available":False,"sample_phase":phase}
+        tree = ast.parse((ROOT/"src/g1_vla/rl_environment.py").read_text())
+        cls = next(x for x in ast.walk(tree) if isinstance(x,ast.ClassDef) and x.name=="Environment")
+        method = next(x for x in cls.body if isinstance(x,ast.FunctionDef) and x.name=="control_diagnostic_state")
+        scope = {"__package__":"g1_vla","torch":t,"tensor":lambda value:value,"RLEnvironmentError":RuntimeError,
+            # Local point offset is exactly zero and local rotation is identity;
+            # these providers cannot alter shape, dtype or device of any state.
+            "quat_apply":lambda quat,offset:offset,"quat_mul":lambda quat,local:quat,
+            "offset_point_jacobian":offset_point_jacobian,"preload_contact_ready":preload_contact_ready,
+            "ACTION_JOINT_NAMES":ACTION_JOINT_NAMES,"config":configuration(),
+            "approach_course":diagnostic_settings()["approach_course"] if course_selected else None,
+            "approach_resource":resource}
+        exec(compile(ast.Module(body=[method],type_ignores=[]),"<actual-control_diagnostic_state>","exec"),scope)
+        return env, scope["control_diagnostic_state"], resource, clock
+
+    def test_actual_course_state_feeds_real_planner_for_one_and_two_envs_without_shape_repair(self):
+        import torch as t
+        from g1_vla.rl_approach import HomeApproachPlanner
+        for population in (1,2):
+            for dtype in (t.float32,t.float64):
+                with self.subTest(population=population,dtype=dtype):
+                    env, producer, resource, clock = self.producer(population,dtype)
+                    planner = HomeApproachPlanner(t,resource)
+                    native_velocity = env._velocity.clone()
+                    for boundary in (0,1):
+                        clock.native = boundary*33;env.episode_length_buf[:] = boundary
+                        state = producer(env)
+                        # All values below are produced by the real method; no
+                        # test-side N x14 expansion or consumer field patching.
+                        for key, shape in (("q_action_rad",(population,14)),("qd_action_rad_s",(population,14)),
+                                ("target_action_rad",(population,14)),("per_step_action_rad",(population,14)),
+                                ("joint_limits_action_rad",(population,14,2)),("env_origin_world_m",(population,3)),
+                                ("palm_position_world_m",(population,3)),("palm_quaternion_xyzw",(population,4)),
+                                ("velocity_limits_arm_rad_s",(7,))):
+                            self.assertEqual(tuple(state[key].shape),shape,key)
+                            self.assertEqual(state[key].dtype,dtype,key)
+                            self.assertEqual(state[key].device,env.robot.data.joint_pos.device,key)
+                        for key, kind in (("unsafe_latched",t.bool),("approach_admitted",t.bool),
+                                          ("episode_id",t.int64),("episode_control_steps",t.int64)):
+                            self.assertEqual(tuple(state[key].shape),(population,),key)
+                            self.assertEqual(state[key].dtype,kind,key)
+                            self.assertEqual(state[key].device,env.robot.data.joint_pos.device,key)
+                        self.assertIs(type(state["native_physics_step_count"]),int)
+                        expected_step = t.minimum(native_velocity*.066,t.full_like(native_velocity,
+                            configuration()["rl_teacher"]["action_scale_rad"]))
+                        self.assertTrue(t.equal(state["per_step_action_rad"],expected_step[None].expand(population,-1)))
+                        before = state["q_all_rad"].clone()
+                        request,evidence = planner.actions(state,.066)
+                        self.assertEqual(tuple(request.shape),(population,7))
+                        self.assertEqual(request.dtype,dtype)
+                        self.assertTrue(bool(t.isfinite(request).all()))
+                        self.assertTrue(bool((request.abs()<=1).all()))
+                        self.assertFalse(bool(evidence["failed"].any()))
+                        self.assertTrue(t.equal(state["q_all_rad"],before))
+                        state["per_step_action_rad"][0,0] = 99.
+                        self.assertTrue(t.equal(env._velocity,native_velocity))
+                        if population==2:
+                            self.assertEqual(state["per_step_action_rad"][1,0],expected_step[0],
+                                             "expanded rows need independent cloned storage")
+
+    def test_actual_none_course_state_preserves_legacy_shared_limits_shape(self):
+        import torch as t
+        for population in (1,2):
+            with self.subTest(population=population):
+                env, producer, _, _ = self.producer(population,t.float32,course_selected=False)
+                state = producer(env)
+                self.assertEqual(tuple(state["per_step_action_rad"].shape),(14,))
+                self.assertEqual(tuple(state["q_action_rad"].shape),(population,14))
+                self.assertNotIn("approach_admitted",state)
+                self.assertNotIn("env_origin_world_m",state)
+                self.assertNotIn("velocity_limits_arm_rad_s",state)
+
+
 if __name__ == "__main__":
     unittest.main()
